@@ -29,7 +29,7 @@ TIERS = [
         "model": "qwen3.5-122b-a10b:Q4_K_M",
         "num_ctx_answer": 131072,
         "num_ctx_synth": 131072,
-        "retrieval_chars": 100_000,
+        "retrieval_chars": 80_000,   # ~22K tokens, leaves 109K for history+system+response
     },
     {
         "name": "xl-48",
@@ -38,7 +38,7 @@ TIERS = [
         "model": "qwen3.5-122b-a10b:IQ3_S",
         "num_ctx_answer": 131072,
         "num_ctx_synth": 131072,
-        "retrieval_chars": 100_000,
+        "retrieval_chars": 80_000,
     },
     {
         "name": "xl-32",
@@ -47,7 +47,7 @@ TIERS = [
         "model": "qwen3.5-122b-a10b:IQ2_M",
         "num_ctx_answer": 65536,
         "num_ctx_synth": 65536,
-        "retrieval_chars": 100_000,
+        "retrieval_chars": 40_000,   # ~11K tokens, leaves 54K for history+system+response
     },
     {
         "name": "large",
@@ -56,7 +56,7 @@ TIERS = [
         "model": "qwen3.6:27b",
         "num_ctx_answer": 65536,
         "num_ctx_synth": 65536,
-        "retrieval_chars": 100_000,
+        "retrieval_chars": 40_000,
     },
     {
         "name": "mid",
@@ -65,7 +65,7 @@ TIERS = [
         "model": "qwen3.5:9b",
         "num_ctx_answer": 32768,
         "num_ctx_synth": 32768,
-        "retrieval_chars": 100_000,
+        "retrieval_chars": 16_000,   # ~4.5K tokens, leaves 28K for history+system+response
     },
     {
         "name": "small",
@@ -74,7 +74,7 @@ TIERS = [
         "model": "qwen3.5:4b",
         "num_ctx_answer": 32768,
         "num_ctx_synth": 32768,
-        "retrieval_chars": 100_000,
+        "retrieval_chars": 16_000,
     },
     {
         "name": "micro",
@@ -83,7 +83,7 @@ TIERS = [
         "model": "qwen3.5:2b",
         "num_ctx_answer": 32768,
         "num_ctx_synth": 32768,
-        "retrieval_chars": 100_000,
+        "retrieval_chars": 16_000,
     },
 ]
 

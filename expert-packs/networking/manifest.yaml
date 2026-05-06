@@ -1,0 +1,11 @@
+name: networking
+version: 1.0.0
+domains:
+- networking
+language: it
+sources:
+- url: file:///C:/Users/vicky/AppData/Local/Temp/gradio/ae70969f2ff27d2be4cb56f484063233f82205fd7dbaab3fbf762baad36faf3c/%23%20Computer%20Networking%20Basics.txt
+  fetched: '2026-05-06'
+  hash: bedd889b560683ad8a3171b4eb3776c4b92fd23490e40b76319660f2843d4404
+signature: null
+min_node_version: 0.1.0

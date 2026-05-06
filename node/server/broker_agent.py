@@ -43,7 +43,9 @@ def _handle_query(query_text: str) -> str:
     prompt = (
         f"{context_block}"
         f"Question: {query_text}\n\n"
-        "Answer thoroughly using the knowledge base context."
+        "Answer using the knowledge base context above. "
+        "Be proportional: a precise question deserves a precise answer, "
+        "a broad question can have a broader answer. No padding, no repetition."
     )
     response = ollama.chat(
         model=_MODEL,

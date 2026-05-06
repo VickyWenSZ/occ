@@ -76,9 +76,18 @@ class DeliberationEngine:
         self._ctx_limit: int = num_ctx_answer
 
     def _update_ctx(self, response):
-        used = (getattr(response, "prompt_eval_count", 0) or 0) + (getattr(response, "eval_count", 0) or 0)
-        self._last_ctx_used = max(self._last_ctx_used, used)
-        self._peak_ctx_used = max(self._peak_ctx_used, used)
+        prompt_tokens = getattr(response, "prompt_eval_count", 0) or 0
+        output_tokens = getattr(response, "eval_count", 0) or 0
+        self._last_ctx_used = prompt_tokens + output_tokens
+        self._peak_ctx_used += prompt_tokens + output_tokens
+
+    def _measure_ctx(self, messages: list) -> int:
+        """Estimate total tokens from the actual messages array being sent to Ollama.
+        More accurate than accumulation — measures exactly what enters the context window.
+        ~3.5 chars per token for technical mixed-language content.
+        """
+        total_chars = sum(len(m.get("content", "") or "") for m in messages)
+        return int(total_chars / 3.5)
 
     def add_to_history(self, user_msg: str, assistant_msg: str):
         self._history.append({"role": "user", "content": user_msg})
@@ -161,7 +170,8 @@ class DeliberationEngine:
                 f"[Knowledge base context]\n{context}\n\n"
                 f"Question: {query}\n\n"
                 "Answer using the knowledge base context above. "
-                "Include relevant technical details, examples, and precise sequences where applicable."
+                "Be proportional: a precise question deserves a precise answer, "
+                "a broad question can have a broader answer. No padding, no repetition."
             )
         else:
             prompt = f"Question: {query}\n\nAnswer helpfully and concisely."
@@ -216,7 +226,9 @@ class DeliberationEngine:
         local_prompt = (
             f"[Knowledge base context]\n{context}\n\n"
             f"Question: {query}\n\n"
-            "Answer thoroughly based on the knowledge base context above."
+            "Answer using the knowledge base context above. "
+            "Be proportional: a precise question deserves a precise answer, "
+            "a broad question can have a broader answer. No padding, no repetition."
         )
         local_answer = self._generate_answer(local_prompt)
 
@@ -258,6 +270,7 @@ class DeliberationEngine:
         ]
 
         while True:
+            self._peak_ctx_used = self._measure_ctx(messages)
             response = ollama.chat(
                 model=self.model,
                 messages=messages,
@@ -425,8 +438,8 @@ def _build_hybrid_synthesis_prompt(query: str, local_answer: str, peer_answers: 
         if ans:
             parts.append(f"[Peer node {i} knowledge]\n{ans}\n\n")
     parts.append(
-        "Synthesize all knowledge sources into a single, comprehensive, well-organized answer. "
-        "Each source covers different aspects — combine them coherently, without repetition."
+        "Synthesize all knowledge sources into a single, well-organized answer. "
+        "Combine coherently, eliminate repetition. Be proportional to the original question."
     )
     return "".join(parts)
 

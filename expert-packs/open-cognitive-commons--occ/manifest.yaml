@@ -1,0 +1,11 @@
+name: open-cognitive-commons--occ
+version: 1.0.0
+domains:
+- open-cognitive-commons--occ
+language: it
+sources:
+- url: file:///C:/Users/vicky/AppData/Local/Temp/gradio/f45c5cce18d512d29df02bddedc424749ef625a6b065f366560f6f772aec1350/OCC.txt
+  fetched: '2026-05-06'
+  hash: f642d5a0888b9cba7231264ea048909f6547f7f5c1dca17f6b2520608a3b9c21
+signature: null
+min_node_version: 0.1.0

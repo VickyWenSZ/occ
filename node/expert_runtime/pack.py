@@ -36,9 +36,37 @@ class MultiPackRetriever:
     def retrieve(self, query: str, max_chars: int = 8000) -> str:
         if not self.packs:
             return ""
-        per_pack = max_chars // len(self.packs)
-        results = []
+
+        # First pass: find which packs have relevant content via their index.
+        # Only packs with index matches get budget — avoids splitting budget across irrelevant packs.
+        from node.retrieval.search import _parse_index, _STOP_WORDS
+        import re
+
+        terms = [
+            t for t in re.findall(r'\w+', query.lower())
+            if len(t) > 2 and t not in _STOP_WORDS
+        ]
+
+        relevant_packs = []
         for pack in self.packs:
+            index_path = pack.wiki_dir / "index.md"
+            entries = _parse_index(index_path)
+            if entries:
+                for entry in entries:
+                    searchable = (entry["title"] + " " + entry["summary"]).lower()
+                    if any(t in searchable for t in terms):
+                        relevant_packs.append(pack)
+                        break
+            else:
+                # No index — include as fallback candidate
+                relevant_packs.append(pack)
+
+        if not relevant_packs:
+            return ""
+
+        per_pack = max_chars // len(relevant_packs)
+        results = []
+        for pack in relevant_packs:
             r = pack.retrieve(query, max_chars=per_pack)
             if r:
                 results.append(f"=== [{pack.name}] ===\n{r}")
