@@ -108,12 +108,16 @@ def load_embeddings(wiki_dir: Path) -> dict | None:
         return None
 
 
-def build_embeddings(wiki_dir: Path) -> bool:
-    """Build embeddings.json from index.md entries. Returns True on success."""
+_BUILD_SKIP = "skip"   # sentinel: no index.md, skip silently (not an error)
+
+def build_embeddings(wiki_dir: Path) -> bool | str:
+    """Build embeddings.json from index.md entries.
+    Returns True on success, False if nomic failed, _BUILD_SKIP if no index.md.
+    """
     index_path = wiki_dir / "index.md"
     entries = _parse_index(index_path)
     if not entries:
-        return False
+        return _BUILD_SKIP
 
     embedded = []
     for entry in entries:

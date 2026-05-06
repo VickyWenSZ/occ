@@ -253,9 +253,11 @@ def _build_pack_embeddings(retriever: MultiPackRetriever):
         return
     for pack in needs:
         with console.status(f"[dim]Building embeddings: [bold]{pack.name}[/bold]...[/dim]"):
-            ok = build_embeddings(pack.wiki_dir)
-        if ok:
+            result = build_embeddings(pack.wiki_dir)
+        if result is True:
             console.print(f"  [dim green]Embeddings ready: {pack.name}[/dim green]")
+        elif result == "skip":
+            console.print(f"  [dim]Embeddings skipped: {pack.name} (no index.md — rebuild pack with Forge)[/dim]")
         else:
             console.print(f"  [dim yellow]Embeddings skipped: {pack.name} (nomic unavailable)[/dim yellow]")
     console.print()
