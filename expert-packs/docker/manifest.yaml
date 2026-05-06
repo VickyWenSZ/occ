@@ -1,0 +1,17 @@
+name: docker
+version: 1.0.0
+domains:
+- docker
+language: it
+sources:
+- url: https://en.wikipedia.org/wiki/Docker_(software)
+  fetched: '2026-05-04'
+  hash: 4225adb31d270f0663a73132ac710d4545c751da37d823af343a981ce8a423a2
+- url: https://docs.docker.com/compose/intro/compose-application-model/
+  fetched: '2026-05-04'
+  hash: a65e5edf60fe1c19a37a53a504a93994d1addaf652c3adb3d61fa14ad475bb8f
+- url: https://docs.docker.com/network/
+  fetched: '2026-05-04'
+  hash: 235f6cf0ce7ef1c20750bcb9e9453af55225b1ace7e98840cf2598914a216007
+signature: null
+min_node_version: 0.1.0
