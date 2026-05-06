@@ -1,6 +1,6 @@
 from pathlib import Path
 import yaml
-from node.retrieval.search import keyword_search
+from node.retrieval.search import retrieve as _retrieve, relevant_pack_dirs
 
 
 class ExpertPack:
@@ -16,7 +16,7 @@ class ExpertPack:
         return {}
 
     def retrieve(self, query: str, max_chars: int = 8000) -> str:
-        return keyword_search(self.wiki_dir, query, max_chars=max_chars)
+        return _retrieve(self.wiki_dir, query, max_chars=max_chars)
 
     @property
     def name(self) -> str:
@@ -37,36 +37,14 @@ class MultiPackRetriever:
         if not self.packs:
             return ""
 
-        # First pass: find which packs have relevant content via their index.
-        # Only packs with index matches get budget — avoids splitting budget across irrelevant packs.
-        from node.retrieval.search import _parse_index, _STOP_WORDS
-        import re
-
-        terms = [
-            t for t in re.findall(r'\w+', query.lower())
-            if len(t) > 2 and t not in _STOP_WORDS
-        ]
-
-        relevant_packs = []
-        for pack in self.packs:
-            index_path = pack.wiki_dir / "index.md"
-            entries = _parse_index(index_path)
-            if entries:
-                for entry in entries:
-                    searchable = (entry["title"] + " " + entry["summary"]).lower()
-                    if any(t in searchable for t in terms):
-                        relevant_packs.append(pack)
-                        break
-            else:
-                # No index — include as fallback candidate
-                relevant_packs.append(pack)
-
-        if not relevant_packs:
+        rel_dirs = relevant_pack_dirs([p.wiki_dir for p in self.packs], query)
+        if not rel_dirs:
             return ""
 
-        per_pack = max_chars // len(relevant_packs)
+        rel_packs = [p for p in self.packs if p.wiki_dir in rel_dirs]
+        per_pack = max_chars // len(rel_packs)
         results = []
-        for pack in relevant_packs:
+        for pack in rel_packs:
             r = pack.retrieve(query, max_chars=per_pack)
             if r:
                 results.append(f"=== [{pack.name}] ===\n{r}")

@@ -16,5 +16,6 @@ workspace/*
 !workspace/.gitkeep
 .claude/
 deliberation_log.md
+**/embeddings.json
 bash.exe.stackdump
 fix_nginx.py
