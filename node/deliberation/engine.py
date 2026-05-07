@@ -31,7 +31,7 @@ _OCC_IDENTITY = (
     "Only mention what domains or packs you have loaded if the user explicitly asks."
 )
 
-_LOCAL_RELEVANCE_THRESHOLD = 1500
+_LOCAL_RELEVANCE_THRESHOLD = 300
 
 
 class DeliberationEngine:
