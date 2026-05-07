@@ -633,12 +633,15 @@ function addLoadingMessage(msgId) {
   row.querySelector('.assistant-body').appendChild(statusLine);
   container.appendChild(row);
   scrollToBottom();
+  _startWordCycle(msgId, 'Thinking');
 }
 
 const _OCC_WORDS = [
-  'combombulating', 'noodling', 'percolating', 'cogitating', 'ruminating',
-  'reticulating', 'deliberating', 'crystallizing', 'triangulating', 'distilling',
-  'extrapolating', 'marinating', 'oscillating', 'synthesizing', 'perambulating',
+  'combombulating', 'hoolaballooing', 'noodling', 'percolating', 'cogitating',
+  'ruminating', 'reticulating', 'deliberating', 'crystallizing', 'triangulating',
+  'distilling', 'extrapolating', 'marinating', 'oscillating', 'synthesizing',
+  'perambulating', 'discombobulating', 'flibbertigibeting', 'kerplunking',
+  'bamboozling', 'hornswoggling', 'skedaddling', 'lollygagging', 'whiffling',
 ];
 let _wordTimer = null;
 let _wordIdx = 0;
@@ -654,7 +657,7 @@ function _startWordCycle(msgId, label) {
     const el = document.getElementById('status-text-' + _wordMsgId);
     if (el) el.textContent = `${_statusLabel} ${_OCC_WORDS[_wordIdx % _OCC_WORDS.length]}...`;
     _wordIdx++;
-    _wordTimer = setTimeout(tick, 2200);
+    _wordTimer = setTimeout(tick, 5000);
   }
   tick();
 }
