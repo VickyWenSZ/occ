@@ -32,29 +32,32 @@ Three routing modes happen automatically:
 
 ## Getting started
 
-**Requirements:** Python 3.11+, [Ollama](https://ollama.com/download).
+**Requirements:** [Python 3.11+](https://www.python.org/downloads), [Ollama](https://ollama.com/download), Git.
 
 ```bash
 git clone https://github.com/VikFinlay/occ.git
 cd occ
+```
+
+**Windows**
+```
+start.bat
+```
+
+**Mac / Linux**
+```bash
+bash start.sh
+```
+
+The launcher checks for Python and Ollama, installs dependencies, detects your hardware, downloads the right model, and starts the GUI at `http://localhost:7891`. On subsequent runs it skips what's already set up and starts in seconds.
+
+**Manual start (advanced)**
+
+```bash
 pip install -r node/requirements.txt
+python node/apps/gui/server.py   # GUI
+python node/apps/cli/main.py     # CLI
 ```
-
-**GUI (recommended)**
-
-```bash
-python node/apps/gui/server.py
-```
-
-Opens at `http://localhost:7891`. On first launch, OCC checks that Ollama is installed, detects your hardware, and downloads the right model automatically. Subsequent launches start in seconds.
-
-**CLI**
-
-```bash
-python node/apps/cli/main.py
-```
-
-Same setup flow, interactive terminal interface.
 
 Once running, your node connects to the network broker and becomes part of the collective. You can ask anything — questions within your expert packs get answered locally, questions that match other nodes get routed automatically.
 
