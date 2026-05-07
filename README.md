@@ -32,32 +32,60 @@ Three routing modes happen automatically:
 
 ## Getting started
 
-**Requirements:** [Python 3.11+](https://www.python.org/downloads), [Ollama](https://ollama.com/download), Git.
+### Requirements
+
+- [Git](https://git-scm.com/downloads)
+- [Python 3.11+](https://www.python.org/downloads) — on Windows, check *Add Python to PATH* during installation
+- [Ollama](https://ollama.com/download)
+
+Clone the repository:
 
 ```bash
 git clone https://github.com/VikFinlay/occ.git
 cd occ
 ```
 
-**Windows**
+### First launch
+
+On the first run, a launcher script handles everything: it verifies that Python and Ollama are present, installs Python dependencies, detects your hardware, downloads the appropriate model, and starts the node.
+
+**Windows** — double-click `start.bat`, or run it from a terminal:
 ```
 start.bat
 ```
 
-**Mac / Linux**
+**macOS / Linux** — run from a terminal:
 ```bash
 bash start.sh
 ```
 
-The launcher checks for Python and Ollama, installs dependencies, detects your hardware, downloads the right model, and starts the GUI at `http://localhost:7891`. On subsequent runs it skips what's already set up and starts in seconds.
+The GUI opens automatically at `http://localhost:7891`.
 
-**Manual start (advanced)**
+### Subsequent launches
+
+Once the setup is complete, you can start the node directly:
+
+```bash
+python node/apps/gui/server.py
+```
+
+Or use the CLI:
+
+```bash
+python node/apps/cli/main.py
+```
+
+### Manual setup (advanced)
+
+If you prefer to manage the environment yourself, the only hard requirements are Python 3.11+, Ollama running locally, and the Python dependencies:
 
 ```bash
 pip install -r node/requirements.txt
-python node/apps/gui/server.py   # GUI
-python node/apps/cli/main.py     # CLI
 ```
+
+OCC selects the model automatically based on your hardware. You can override it with the `OCC_MODEL` environment variable.
+
+---
 
 Once running, your node connects to the network broker and becomes part of the collective. You can ask anything — questions within your expert packs get answered locally, questions that match other nodes get routed automatically.
 
