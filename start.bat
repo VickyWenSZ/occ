@@ -35,7 +35,7 @@ echo  [OK] Ollama found.
 
 :: ── 3. Python dependencies ───────────────────────────────────────────────────
 echo  Installing dependencies ^(skipped if already up to date^)...
-pip install -r node/requirements.txt -q
+python -m pip install -r node/requirements.txt -q
 if %errorlevel% neq 0 (
     echo  [!] Failed to install dependencies. Check your internet connection.
     pause
@@ -57,10 +57,11 @@ echo  [OK] Model: %OCC_MODEL%
 
 :: ── 5. Start Ollama (needed for pull) ────────────────────────────────────────
 echo  Starting Ollama...
-taskkill /F /IM ollama.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
-start /B ollama serve
-timeout /t 4 /nobreak >nul
+ollama list >nul 2>&1
+if %errorlevel% neq 0 (
+    start /B ollama serve
+    timeout /t 4 /nobreak >nul
+)
 echo  [OK] Ollama running.
 
 :: ── 6. Pull model if needed ──────────────────────────────────────────────────
