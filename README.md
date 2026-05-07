@@ -32,16 +32,29 @@ Three routing modes happen automatically:
 
 ## Getting started
 
-**Requirements:** Python 3.11+, [Ollama](https://ollama.com) installed and running.
+**Requirements:** Python 3.11+, [Ollama](https://ollama.com/download).
 
 ```bash
 git clone https://github.com/VikFinlay/occ.git
 cd occ
 pip install -r node/requirements.txt
+```
+
+**GUI (recommended)**
+
+```bash
+python node/apps/gui/server.py
+```
+
+Opens at `http://localhost:7891`. On first launch, OCC checks that Ollama is installed, detects your hardware, and downloads the right model automatically. Subsequent launches start in seconds.
+
+**CLI**
+
+```bash
 python node/apps/cli/main.py
 ```
 
-On first run, OCC detects your hardware and selects the right model automatically. If the model isn't installed, it offers to download it.
+Same setup flow, interactive terminal interface.
 
 Once running, your node connects to the network broker and becomes part of the collective. You can ask anything — questions within your expert packs get answered locally, questions that match other nodes get routed automatically.
 
@@ -80,10 +93,12 @@ The broker is open source and federatable. Anyone can run a compatible broker. N
 ```
 occ/
   node/               ← OCC Node (what you run)
-    apps/cli/         ← chat interface
+    apps/
+      cli/            ← terminal chat interface
+      gui/            ← web GUI (http://localhost:7891)
     deliberation/     ← engine, classifier, roles, tools
     expert_runtime/   ← pack loading and retrieval
-    server/           ← broker agent, HTTP client (legacy)
+    server/           ← broker agent, HTTP client
   forge/              ← OCC Forge (knowledge builder, uses GPT-4o/5)
   expert-packs/       ← knowledge bases
 ```
@@ -94,7 +109,7 @@ occ/
 
 OCC is early and experimental. The core loop works: local retrieval, distributed deliberation, synthesis. The network layer is functional. Expert packs are small but real.
 
-What's missing: more packs, a desktop GUI, pack signing, a public pack catalog. These are next.
+What's missing: more packs, pack signing, a public pack catalog. These are next.
 
 ---
 
