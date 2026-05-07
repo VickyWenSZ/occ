@@ -655,7 +655,7 @@ function _startWordCycle(msgId, label) {
   _wordIdx = Math.floor(Math.random() * _OCC_WORDS.length);
   function tick() {
     const el = document.getElementById('status-text-' + _wordMsgId);
-    if (el) el.textContent = `${_statusLabel} ${_OCC_WORDS[_wordIdx % _OCC_WORDS.length]}...`;
+    if (el) el.textContent = `${_OCC_WORDS[_wordIdx % _OCC_WORDS.length]}...`;
     _wordIdx++;
     _wordTimer = setTimeout(tick, 5000);
   }
