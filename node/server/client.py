@@ -2,6 +2,7 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass
+from node.server.node_id import NODE_ID as _LOCAL_NODE_ID
 
 import httpx
 from node.retrieval.search import _embed as _embed_text
@@ -56,6 +57,7 @@ async def _query_via_broker(
                 "text": query,
                 "domains": domains,
                 "query_embedding": query_embedding,
+                "from_node": _LOCAL_NODE_ID,
             }))
             async for raw in ws:
                 msg = json.loads(raw)

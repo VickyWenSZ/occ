@@ -9,9 +9,7 @@ Usage:
 import asyncio
 import json
 import os
-import socket
 import sys
-import uuid
 from pathlib import Path
 
 import ollama
@@ -20,6 +18,7 @@ import websockets
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+from node.server.node_id import NODE_ID as _NODE_ID
 from node.deliberation.roles import ROLES
 from node.expert_runtime.pack import load_all_packs
 from node.retrieval.search import load_embeddings
@@ -33,7 +32,6 @@ except ImportError:
 _MODEL = os.getenv("OCC_MODEL", "qwen3.5:9b")
 _BROKER_WS = os.getenv("OCC_BROKER_URL", "wss://broker.opencognitivecommons.org/ws")
 _retriever = load_all_packs(ROOT / "expert-packs")
-_NODE_ID = f"{socket.gethostname()}-{str(uuid.uuid4())[:8]}"
 
 
 def _load_manifest() -> dict:
