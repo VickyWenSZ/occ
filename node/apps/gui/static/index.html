@@ -220,19 +220,27 @@
       <div>
         <div class="settings-section-label">OpenRouter</div>
         <p style="font-size:0.8125rem;color:var(--text-faint);margin-bottom:0.75rem;">
-          Use a cloud model for your queries. Network responses always stay local.
+          Use a cloud model for your queries. Network responses always stay local.<br>
+          Get a free API key at <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--accent);text-decoration:none;">openrouter.ai/keys</a>.
         </p>
         <div id="or-status-line"></div>
         <div class="form-group" style="margin-top:0.625rem;">
           <label class="form-label">API Key</label>
           <input class="form-input" type="password" id="or-key" placeholder="sk-or-...">
+          <div id="or-key-hint" style="display:none;font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Key saved — leave blank to keep it, or enter a new one to replace.</div>
         </div>
         <div class="form-group" style="margin-top:0.625rem;">
           <label class="form-label">Model</label>
           <select class="form-select" id="or-model">
-            <option value="qwen/qwen3.5-9b">qwen3.5-9b — Budget</option>
+            <option value="qwen/qwen3.5-9b">qwen3.5-9b — Budget · <a href="https://openrouter.ai/qwen/qwen3.5-9b/pricing" target="_blank">pricing</a></option>
             <option value="qwen/qwen3.5-35b-a3b">qwen3.5-35b-a3b — Strong</option>
           </select>
+          <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">
+            Pricing:
+            <a href="https://openrouter.ai/qwen/qwen3.5-9b/pricing" target="_blank" style="color:var(--accent);text-decoration:none;">qwen3.5-9b</a>
+            &nbsp;·&nbsp;
+            <a href="https://openrouter.ai/qwen/qwen3.5-35b-a3b/pricing" target="_blank" style="color:var(--accent);text-decoration:none;">qwen3.5-35b-a3b</a>
+          </div>
         </div>
         <div class="form-actions" style="margin-top:0.875rem;">
           <button class="btn-primary" id="btn-save-or">Save</button>
@@ -273,6 +281,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.3/purify.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="/static/app.js?v=16"></script>
+<script src="/static/app.js?v=17"></script>
 </body>
 </html>

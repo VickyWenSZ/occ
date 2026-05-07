@@ -914,16 +914,27 @@ async function openSettings() {
   }
 
   document.getElementById('or-model').value = cfg.openrouter_model || 'qwen/qwen3.5-9b';
+  const hint = document.getElementById('or-key-hint');
+  if (hint) hint.style.display = cfg.openrouter_configured ? 'block' : 'none';
   document.getElementById('settings-modal').classList.remove('hidden');
 }
 
 async function saveOpenRouter() {
-  const key = document.getElementById('or-key').value.trim();
+  const keyInput = document.getElementById('or-key').value.trim();
   const model = document.getElementById('or-model').value;
+  const alreadyConfigured = config?.openrouter_configured;
+
+  // If no key entered and one is already saved, only update the model
+  const key = keyInput || (alreadyConfigured ? '__keep__' : '');
   if (!key) { alert('Enter an API key.'); return; }
+
+  const payload = key === '__keep__'
+    ? { api_key: null, model }
+    : { api_key: key, model };
+
   const r = await apiFetch('/api/config/openrouter', {
     method: 'POST',
-    body: JSON.stringify({ api_key: key, model }),
+    body: JSON.stringify(payload),
   });
   if (r?.ok) {
     document.getElementById('or-key').value = '';

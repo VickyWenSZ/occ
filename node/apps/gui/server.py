@@ -266,17 +266,24 @@ async def get_config():
 
 
 class OpenRouterBody(BaseModel):
-    api_key: str
+    api_key: str | None = None
     model: str
 
 
 @app.post("/api/config/openrouter")
 async def set_openrouter(body: OpenRouterBody):
     global _cfg
-    save_openrouter_config(body.api_key, body.model)
+    # api_key=None means "keep existing key, only update model"
+    if body.api_key is None:
+        existing_key = _cfg.openrouter_api_key if _cfg else ""
+        save_openrouter_config(existing_key, body.model)
+        effective_key = existing_key
+    else:
+        save_openrouter_config(body.api_key, body.model)
+        effective_key = body.api_key
     _cfg = Config()
     if _engine:
-        _engine.or_key = body.api_key
+        _engine.or_key = effective_key
         _engine.or_model = body.model
     return {"ok": True}
 
