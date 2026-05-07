@@ -112,11 +112,6 @@ class DeliberationEngine:
         )
         local_relevant = len(context) >= _LOCAL_RELEVANCE_THRESHOLD
 
-        if not self.peers:
-            yield ("routing", "local")
-            yield from self._deliberate_local(query, context, images=images)
-            return
-
         yield from self._route_with_peers(query, context, local_relevant, images=images)
 
     # ─── Routing logic ────────────────────────────────────────────────────────
