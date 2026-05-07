@@ -132,18 +132,13 @@ class DeliberationEngine:
 
         if local_relevant and peer_domain_match:
             yield ("routing", "hybrid")
-            pack_name = self.expert_pack.name if self.expert_pack else "local"
-            roles_desc = ", ".join(
-                f"{r}({manifests[u].get('pack', u)})" for u, r in peer_assignments
-            )
-            yield ("status", f"Hybrid — {pack_name} + {roles_desc}...")
+            roles_desc = ", ".join(r for u, r in peer_assignments)
+            yield ("status", f"Hybrid — {roles_desc}...")
             yield from self._deliberate_hybrid(query, context, peer_assignments, additive, images=images)
 
         elif peer_domain_match:
             yield ("routing", "delegate")
-            roles_desc = ", ".join(
-                f"{r}({manifests[u].get('pack', u)})" for u, r in peer_assignments
-            )
+            roles_desc = ", ".join(r for u, r in peer_assignments)
             yield ("status", f"Delegating to peers: {roles_desc}...")
             yield from self._deliberate_distributed(query, peer_assignments, additive)
 

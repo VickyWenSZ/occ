@@ -635,9 +635,39 @@ function addLoadingMessage(msgId) {
   scrollToBottom();
 }
 
+const _OCC_WORDS = [
+  'combombulating', 'noodling', 'percolating', 'cogitating', 'ruminating',
+  'reticulating', 'deliberating', 'crystallizing', 'triangulating', 'distilling',
+  'extrapolating', 'marinating', 'oscillating', 'synthesizing', 'perambulating',
+];
+let _wordTimer = null;
+let _wordIdx = 0;
+let _wordMsgId = null;
+let _statusLabel = '';
+
+function _startWordCycle(msgId, label) {
+  _stopWordCycle();
+  _wordMsgId = msgId;
+  _statusLabel = label;
+  _wordIdx = Math.floor(Math.random() * _OCC_WORDS.length);
+  function tick() {
+    const el = document.getElementById('status-text-' + _wordMsgId);
+    if (el) el.textContent = `${_statusLabel} ${_OCC_WORDS[_wordIdx % _OCC_WORDS.length]}...`;
+    _wordIdx++;
+    _wordTimer = setTimeout(tick, 2200);
+  }
+  tick();
+}
+
+function _stopWordCycle() {
+  if (_wordTimer) { clearTimeout(_wordTimer); _wordTimer = null; }
+  _wordMsgId = null;
+}
+
 function updateStatusText(msgId, text) {
   const el = document.getElementById('status-text-' + msgId);
   if (el) el.textContent = text;
+  _startWordCycle(msgId, text.replace(/\.*$/, '').trim());
 }
 
 function updateRoutingBadgeUI(msgId, routing) {
@@ -782,6 +812,7 @@ async function sendMessage() {
         } else if (data.type === 'status') {
           updateStatusText(msgId, data.value);
         } else if (data.type === 'token') {
+          _stopWordCycle();
           tokens += data.value;
           scheduleRender();
         } else if (data.type === 'done') {
