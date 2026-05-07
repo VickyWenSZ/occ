@@ -72,11 +72,36 @@ async function init() {
 
 async function pollUntilReady() {
   const statusEl = document.getElementById('loading-status');
+  const errorDiv  = document.getElementById('loading-error');
+  const errorMsg  = document.getElementById('loading-error-msg');
+  const errorLink = document.getElementById('loading-error-link');
+  const bar       = document.getElementById('loading-bar');
+
+  const ERROR_MESSAGES = {
+    ollama_missing: 'Ollama is not installed.\nOCC requires Ollama to run local models.',
+    ollama_start_failed: 'Ollama is installed but could not start.\nTry running "ollama serve" in a terminal, then refresh.',
+    model_download_failed: 'Model download failed.\nCheck your internet connection and try restarting OCC.',
+  };
+
   while (true) {
     try {
       const r = await fetch('/api/status');
       const data = await r.json();
       statusEl.textContent = data.status || 'starting...';
+
+      if (data.error) {
+        bar.style.display = 'none';
+        errorMsg.textContent = ERROR_MESSAGES[data.error] || data.error;
+        if (data.error === 'ollama_missing' && data.ollama_download_url) {
+          errorLink.href = data.ollama_download_url;
+          errorLink.style.display = 'inline-block';
+        } else {
+          errorLink.style.display = 'none';
+        }
+        errorDiv.style.display = 'block';
+        return;
+      }
+
       if (data.ready) return;
     } catch (_) {}
     await sleep(800);

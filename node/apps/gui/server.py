@@ -106,10 +106,39 @@ def _init():
     _model = _cfg.model
 
     _init_status = "checking Ollama"
-    from node.hardware import is_ollama_running, start_ollama
+    from node.hardware import (
+        is_ollama_installed, is_ollama_running, start_ollama,
+        is_model_installed, pull_model_stream, OLLAMA_DOWNLOAD_URL,
+    )
+
+    if not is_ollama_installed():
+        _init_status = "ollama_missing"
+        log_bus.write(f"[GUI] Ollama not found. Download: {OLLAMA_DOWNLOAD_URL}")
+        return
+
     if not is_ollama_running():
         log_bus.write("[GUI] Starting Ollama...")
-        start_ollama()
+        ok = start_ollama()
+        if not ok:
+            _init_status = "ollama_start_failed"
+            log_bus.write("[GUI] Could not start Ollama. Run 'ollama serve' manually.")
+            return
+
+    if not is_model_installed(_model):
+        log_bus.write(f"[GUI] Model {_model} not found — downloading...")
+        _init_status = f"downloading {_model}"
+        try:
+            for status, completed, total in pull_model_stream(_model):
+                if total and total > 0:
+                    pct = int(completed / total * 100)
+                    _init_status = f"downloading {_model} — {pct}%"
+                elif status:
+                    _init_status = f"downloading {_model} — {status}"
+        except Exception as e:
+            _init_status = "model_download_failed"
+            log_bus.write(f"[GUI] Download failed: {e}")
+            return
+        log_bus.write(f"[GUI] Model {_model} ready.")
 
     _init_status = "loading packs"
     log_bus.write("[GUI] Loading expert packs...")
@@ -209,7 +238,15 @@ async def index():
 
 @app.get("/api/status")
 async def get_status():
-    return {"ready": _ready, "status": _init_status, "model": _model}
+    from node.hardware import OLLAMA_DOWNLOAD_URL
+    error_states = {"ollama_missing", "ollama_start_failed", "model_download_failed"}
+    return {
+        "ready": _ready,
+        "status": _init_status,
+        "model": _model,
+        "error": _init_status if _init_status in error_states else None,
+        "ollama_download_url": OLLAMA_DOWNLOAD_URL,
+    }
 
 
 @app.get("/api/config")
