@@ -256,7 +256,7 @@ class DeliberationEngine:
 
     def _stream_with_tools(self, system: str, prompt: str, temperature: float = 0.7, images: list | None = None):
         from node.deliberation.tools import TOOL_SCHEMA, TOOL_FUNCTIONS
-        from node.provider import call as _provider_call
+        from node.provider import call as _provider_call, stream_with_tools as _stream_tools
 
         user_msg: dict = {"role": "user", "content": prompt}
         if images:
@@ -269,18 +269,38 @@ class DeliberationEngine:
 
         while True:
             self._peak_ctx_used = self._measure_ctx(messages)
-            resp = _provider_call(
-                messages, self.model, self.or_key, self.or_model,
-                TOOL_SCHEMA, temperature, self.num_ctx_answer,
-            )
-            self._update_ctx(resp.prompt_tokens, resp.completion_tokens)
-            messages.append(resp.assistant_message())
 
-            if not resp.tool_calls:
-                yield ("token", resp.content)
-                return
+            if self.or_key:
+                # OpenRouter: non-streaming (streaming+tools format differs)
+                resp = _provider_call(
+                    messages, self.model, self.or_key, self.or_model,
+                    TOOL_SCHEMA, temperature, self.num_ctx_answer,
+                )
+                self._update_ctx(resp.prompt_tokens, resp.completion_tokens)
+                messages.append(resp.assistant_message())
+                if not resp.tool_calls:
+                    yield ("token", resp.content)
+                    return
+                tool_calls = resp.tool_calls
+                def _tool_result(tc, result):
+                    return resp.tool_result(tc, result)
+            else:
+                # Ollama: real streaming, tool calls arrive in final chunk
+                done = None
+                for event, val in _stream_tools(messages, self.model, TOOL_SCHEMA, temperature, self.num_ctx_answer):
+                    if event == "token":
+                        yield ("token", val)
+                    elif event == "done":
+                        done = val
+                content = done["content"] if done else ""
+                tool_calls = done["tool_calls"] if done else None
+                messages.append({"role": "assistant", "content": content, "tool_calls": done["raw_tcs"] if done else None})
+                if not tool_calls:
+                    return
+                def _tool_result(tc, result):
+                    return {"role": "tool", "content": result}
 
-            for tc in resp.tool_calls:
+            for tc in tool_calls:
                 fn_name = tc.function.name
                 fn_args = tc.function.arguments or {}
                 fn = TOOL_FUNCTIONS.get(fn_name)
@@ -289,7 +309,7 @@ class DeliberationEngine:
                     result = fn(**fn_args)
                 else:
                     result = f"Unknown tool: {fn_name}"
-                messages.append(resp.tool_result(tc, result))
+                messages.append(_tool_result(tc, result))
 
     # ─── Non-streaming helpers (hybrid/synthesis) ─────────────────────────────
 
