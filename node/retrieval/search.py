@@ -150,35 +150,54 @@ def pack_max_similarity(wiki_dir: Path, query_vec: list[float]) -> float | None:
 # ── Pack-level relevance (used by MultiPackRetriever) ────────────────────────
 
 def _keyword_relevant(wiki_dir: Path, query: str) -> bool:
-    """Does this pack's index mention any meaningful query term?"""
+    """Does this pack contain any meaningful query term?
+    Checks index.md entries first; if no index, scans concept files directly."""
     terms = [t for t in re.findall(r'\w+', query.lower()) if len(t) > 2 and t not in _STOP_WORDS]
     if not terms:
         return False
-    for entry in _parse_index(wiki_dir / "index.md"):
-        searchable = (entry["title"] + " " + entry["summary"]).lower()
-        if any(t in searchable for t in terms):
-            return True
-    return False
+    entries = _parse_index(wiki_dir / "index.md")
+    if entries:
+        for entry in entries:
+            searchable = (entry["title"] + " " + entry["summary"]).lower()
+            if any(t in searchable for t in terms):
+                return True
+        return False
+    # No index.md — scan concept files directly (old-format packs).
+    # Require at least 2 distinct term matches to avoid single-word false positives.
+    required = min(2, len(terms))
+    best_score = 0
+    for md_file in wiki_dir.rglob("*.md"):
+        if md_file.name in ("index.md", "_index.md", "log.md", "schema.md"):
+            continue
+        try:
+            text = md_file.read_text(encoding="utf-8").lower()
+            score = sum(1 for t in terms if t in text)
+            best_score = max(best_score, score)
+        except Exception:
+            continue
+    return best_score >= required
 
 
 def relevant_pack_dirs(wiki_dirs: list[Path], query: str) -> list[Path]:
     """Return which wiki dirs are semantically relevant to query.
-    Uses embeddings if available, keyword match as fallback per-pack."""
+    Uses embeddings if available, keyword match as fallback per-pack.
+    If embeddings find nothing at all, retries with keyword as last resort."""
     query_vec = _embed(query)
     result = []
     for wd in wiki_dirs:
         if query_vec is not None:
             sim = pack_max_similarity(wd, query_vec)
             if sim is None:
-                # No embeddings for this pack — keyword fallback
                 if _keyword_relevant(wd, query):
                     result.append(wd)
             elif sim >= _PACK_SIMILARITY_THRESHOLD:
                 result.append(wd)
         else:
-            # nomic unavailable — keyword for all packs
             if _keyword_relevant(wd, query):
                 result.append(wd)
+    # Last resort: if embeddings selected nothing, fall back to keyword for all packs
+    if not result and query_vec is not None:
+        result = [wd for wd in wiki_dirs if _keyword_relevant(wd, query)]
     return result
 
 
