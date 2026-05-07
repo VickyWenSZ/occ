@@ -256,7 +256,7 @@ class DeliberationEngine:
 
     def _stream_with_tools(self, system: str, prompt: str, temperature: float = 0.7, images: list | None = None):
         from node.deliberation.tools import TOOL_SCHEMA, TOOL_FUNCTIONS
-        from node.provider import call as _provider_call, stream as _stream
+        from node.provider import call as _provider_call
 
         user_msg: dict = {"role": "user", "content": prompt}
         if images:
@@ -274,19 +274,12 @@ class DeliberationEngine:
                 TOOL_SCHEMA, temperature, self.num_ctx_answer,
             )
             self._update_ctx(resp.prompt_tokens, resp.completion_tokens)
+            messages.append(resp.assistant_message())
 
             if not resp.tool_calls:
-                # Final answer — stream it token by token
-                messages.append({"role": "assistant", "content": resp.content})
-                if not self.or_key:
-                    yield from (("token", tok) for tok in _stream(
-                        messages[:-1], self.model, "", "", temperature, self.num_ctx_answer
-                    ))
-                else:
-                    yield ("token", resp.content)
+                yield ("token", resp.content)
                 return
 
-            messages.append(resp.assistant_message())
             for tc in resp.tool_calls:
                 fn_name = tc.function.name
                 fn_args = tc.function.arguments or {}

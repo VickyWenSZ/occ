@@ -160,38 +160,6 @@ def _ollama_call(messages, model, tools, temperature, num_ctx) -> ProviderRespon
     return ProviderResponse(content, normalized, "ollama", raw_tcs, prompt_tokens, completion_tokens)
 
 
-def stream_with_tools(messages, model_local, tools, temperature, num_ctx):
-    """Yields ("token", str) events then a final ("done", dict) with content+tool_calls."""
-    yield from _ollama_stream_with_tools(messages, model_local, tools, temperature, num_ctx)
-
-
-def _ollama_stream_with_tools(messages, model, tools, temperature, num_ctx):
-    import ollama as _ollama
-    content_parts: list[str] = []
-    last_msg = None
-    for chunk in _ollama.chat(
-        model=model,
-        messages=messages,
-        tools=tools,
-        think=False,
-        keep_alive=-1,
-        options={"temperature": temperature, "num_ctx": num_ctx, "stop": _STOP},
-        stream=True,
-    ):
-        last_msg = chunk.message
-        token = chunk.message.content or ""
-        if token:
-            content_parts.append(token)
-            yield ("token", token)
-    raw_tcs = (last_msg.tool_calls or []) if last_msg else []
-    normalized = [
-        _TC(str(uuid.uuid4()), tc.function.name,
-            tc.function.arguments if isinstance(tc.function.arguments, dict) else {})
-        for tc in raw_tcs
-    ] if raw_tcs else None
-    yield ("done", {"content": "".join(content_parts), "tool_calls": normalized, "raw_tcs": raw_tcs or None})
-
-
 def _ollama_stream(messages, model, temperature, num_ctx) -> Iterator[str]:
     import ollama as _ollama
     for chunk in _ollama.chat(
