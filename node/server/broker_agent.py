@@ -22,6 +22,13 @@ sys.path.insert(0, str(ROOT))
 
 from node.deliberation.roles import ROLES
 from node.expert_runtime.pack import load_all_packs
+from node.retrieval.search import load_embeddings
+
+try:
+    from node.apps.gui import log_bus as _log_bus
+    _log = _log_bus.write
+except ImportError:
+    _log = print
 
 _MODEL = os.getenv("OCC_MODEL", "qwen3.5:9b")
 _BROKER_WS = os.getenv("OCC_BROKER_URL", "wss://broker.opencognitivecommons.org/ws")
@@ -34,6 +41,20 @@ def _load_manifest() -> dict:
         "pack": _retriever.name,
         "domains": _retriever.domains,
     }
+
+
+def _compute_pack_centroid() -> list[float] | None:
+    """Average of all page embedding vectors across all loaded packs."""
+    all_vectors: list[list[float]] = []
+    for pack in _retriever.packs:
+        emb = load_embeddings(pack.wiki_dir)
+        if emb and emb.get("entries"):
+            for entry in emb["entries"]:
+                all_vectors.append(entry["vector"])
+    if not all_vectors:
+        return None
+    dim = len(all_vectors[0])
+    return [sum(v[i] for v in all_vectors) / len(all_vectors) for i in range(dim)]
 
 
 def _handle_query(query_text: str) -> str:
@@ -67,10 +88,12 @@ def _handle_query(query_text: str) -> str:
 
 async def run():
     manifest = _load_manifest()
-    print(f"[OCC Node] ID     : {_NODE_ID}")
-    print(f"[OCC Node] Packs  : {_retriever.name}")
-    print(f"[OCC Node] Domains: {manifest['domains']}")
-    print(f"[OCC Node] Broker : {_BROKER_WS}")
+    pack_embedding = _compute_pack_centroid()
+    _log(f"[OCC Node] ID        : {_NODE_ID}")
+    _log(f"[OCC Node] Packs     : {_retriever.name}")
+    _log(f"[OCC Node] Domains   : {manifest['domains']}")
+    _log(f"[OCC Node] Embedding : {'yes' if pack_embedding else 'no (nomic unavailable)'}")
+    _log(f"[OCC Node] Broker    : {_BROKER_WS}")
 
     while True:
         try:
@@ -79,10 +102,11 @@ async def run():
                     "type": "register",
                     "node_id": _NODE_ID,
                     "manifest": manifest,
+                    "pack_embedding": pack_embedding,
                 }))
                 msg = json.loads(await ws.recv())
                 if msg.get("type") == "registered":
-                    print(f"[OCC Node] Registered with broker. Ready.")
+                    _log(f"[OCC Node] Registered with broker. Ready.")
 
                 async def heartbeat():
                     while True:
@@ -99,7 +123,7 @@ async def run():
                     if msg.get("type") == "query":
                         query_id = msg["query_id"]
                         query_text = msg.get("text", "")
-                        print(f"[OCC Node] Query: {query_text[:80]}...")
+                        _log(f"[OCC Node] Query: {query_text[:80]}...")
                         loop = asyncio.get_event_loop()
                         answer = await loop.run_in_executor(None, _handle_query, query_text)
                         await ws.send(json.dumps({
@@ -108,12 +132,12 @@ async def run():
                             "pack": _retriever.name,
                             "text": answer,
                         }))
-                        print(f"[OCC Node] Response sent ({len(answer)} chars)")
+                        _log(f"[OCC Node] Response sent ({len(answer)} chars)")
                     elif msg.get("type") == "pong":
                         pass
 
         except Exception as e:
-            print(f"[OCC Node] Disconnected: {e}. Reconnecting in 5s...")
+            _log(f"[OCC Node] Disconnected: {e}. Reconnecting in 5s...")
             await asyncio.sleep(5)
 
 

@@ -1,6 +1,5 @@
 import re
 from datetime import datetime
-import ollama
 from .roles import ROLES
 
 
@@ -46,8 +45,12 @@ class DeliberationEngine:
         retrieval_chars: int = 8000,
         domains: list[str] | None = None,
         workspace=None,
+        openrouter_key: str = "",
+        openrouter_model: str = "",
     ):
         self.model = model
+        self.or_key = openrouter_key
+        self.or_model = openrouter_model
         self.expert_pack = expert_pack
         self.peers = peers or []
         self.num_ctx_answer = num_ctx_answer
@@ -75,11 +78,9 @@ class DeliberationEngine:
         self._peak_ctx_used: int = 0
         self._ctx_limit: int = num_ctx_answer
 
-    def _update_ctx(self, response):
-        prompt_tokens = getattr(response, "prompt_eval_count", 0) or 0
-        output_tokens = getattr(response, "eval_count", 0) or 0
-        self._last_ctx_used = prompt_tokens + output_tokens
-        self._peak_ctx_used += prompt_tokens + output_tokens
+    def _update_ctx(self, prompt_tokens: int, completion_tokens: int):
+        self._last_ctx_used = prompt_tokens + completion_tokens
+        self._peak_ctx_used += prompt_tokens + completion_tokens
 
     def _measure_ctx(self, messages: list) -> int:
         """Estimate total tokens from the actual messages array being sent to Ollama.
@@ -97,10 +98,10 @@ class DeliberationEngine:
 
     # ─── Public entry point ───────────────────────────────────────────────────
 
-    def route_stream(self, query: str, mode: str = "deliberate"):
+    def route_stream(self, query: str, mode: str = "deliberate", images: list | None = None):
         if mode == "chat":
             yield ("routing", "chat")
-            yield from self._stream_with_tools(self._chat_system, query, temperature=0.7)
+            yield from self._stream_with_tools(self._chat_system, query, temperature=0.7, images=images)
             return
 
         # DELIBERATE — retrieval + knowledge answer
@@ -113,14 +114,14 @@ class DeliberationEngine:
 
         if not self.peers:
             yield ("routing", "local")
-            yield from self._deliberate_local(query, context)
+            yield from self._deliberate_local(query, context, images=images)
             return
 
-        yield from self._route_with_peers(query, context, local_relevant)
+        yield from self._route_with_peers(query, context, local_relevant, images=images)
 
     # ─── Routing logic ────────────────────────────────────────────────────────
 
-    def _route_with_peers(self, query: str, context: str, local_relevant: bool):
+    def _route_with_peers(self, query: str, context: str, local_relevant: bool, images: list | None = None):
         from node.server.client import fetch_peer_manifests
 
         yield ("status", "Checking peer capabilities...")
@@ -128,7 +129,7 @@ class DeliberationEngine:
         if not manifests:
             yield ("routing", "local")
             yield ("status", "No peers available — answering locally...")
-            yield from self._deliberate_local(query, context)
+            yield from self._deliberate_local(query, context, images=images)
             return
         node_ids = list(manifests.keys())
         peer_assignments, additive = _assign_roles(query, node_ids, manifests)
@@ -141,7 +142,7 @@ class DeliberationEngine:
                 f"{r}({manifests[u].get('pack', u)})" for u, r in peer_assignments
             )
             yield ("status", f"Hybrid — {pack_name} + {roles_desc}...")
-            yield from self._deliberate_hybrid(query, context, peer_assignments, additive)
+            yield from self._deliberate_hybrid(query, context, peer_assignments, additive, images=images)
 
         elif peer_domain_match:
             yield ("routing", "delegate")
@@ -154,11 +155,11 @@ class DeliberationEngine:
         else:
             yield ("routing", "local")
             yield ("status", "Answering from local knowledge...")
-            yield from self._deliberate_local(query, context)
+            yield from self._deliberate_local(query, context, images=images)
 
     # ─── Mode: LOCAL ──────────────────────────────────────────────────────────
 
-    def _deliberate_local(self, query: str, context: str | None = None):
+    def _deliberate_local(self, query: str, context: str | None = None, images: list | None = None):
         if context is None:
             context = (
                 self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
@@ -176,8 +177,11 @@ class DeliberationEngine:
         else:
             prompt = f"Question: {query}\n\nAnswer helpfully and concisely."
         yield ("status", "Thinking...")
-        yield from self._stream_with_tools(ROLES["answerer"]["system"], prompt,
-                                           temperature=ROLES["answerer"]["temperature"])
+        yield from self._stream_with_tools(
+            ROLES["answerer"]["system"], prompt,
+            temperature=ROLES["answerer"]["temperature"],
+            images=images,
+        )
 
     # ─── Mode: DELEGATE ───────────────────────────────────────────────────────
 
@@ -216,7 +220,7 @@ class DeliberationEngine:
 
     # ─── Mode: HYBRID ─────────────────────────────────────────────────────────
 
-    def _deliberate_hybrid(self, query: str, context: str, peer_assignments: list, additive: bool):
+    def _deliberate_hybrid(self, query: str, context: str, peer_assignments: list, additive: bool, images: list | None = None):
         from node.server.client import call_peers_parallel
 
         yield ("status", "Calling peers...")
@@ -260,43 +264,33 @@ class DeliberationEngine:
 
     # ─── Core LLM call — tools always available ───────────────────────────────
 
-    def _stream_with_tools(self, system: str, prompt: str, temperature: float = 0.7):
+    def _stream_with_tools(self, system: str, prompt: str, temperature: float = 0.7, images: list | None = None):
         from node.deliberation.tools import TOOL_SCHEMA, TOOL_FUNCTIONS
+        from node.provider import call as _provider_call
 
+        user_msg: dict = {"role": "user", "content": prompt}
+        if images:
+            user_msg["images"] = images
         messages = [
             {"role": "system", "content": system},
             *self._history,
-            {"role": "user", "content": prompt},
+            user_msg,
         ]
 
         while True:
             self._peak_ctx_used = self._measure_ctx(messages)
-            response = ollama.chat(
-                model=self.model,
-                messages=messages,
-                tools=TOOL_SCHEMA,
-                think=False,
-                keep_alive=-1,
-                options={
-                    "temperature": temperature,
-                    "num_ctx": self.num_ctx_answer,
-                    "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
-                },
-                stream=False,
+            resp = _provider_call(
+                messages, self.model, self.or_key, self.or_model,
+                TOOL_SCHEMA, temperature, self.num_ctx_answer,
             )
-            self._update_ctx(response)
-            msg = response.message
-            messages.append({
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": msg.tool_calls,
-            })
+            self._update_ctx(resp.prompt_tokens, resp.completion_tokens)
+            messages.append(resp.assistant_message())
 
-            if not msg.tool_calls:
-                yield ("token", msg.content or "")
+            if not resp.tool_calls:
+                yield ("token", resp.content)
                 return
 
-            for tc in msg.tool_calls:
+            for tc in resp.tool_calls:
                 fn_name = tc.function.name
                 fn_args = tc.function.arguments or {}
                 fn = TOOL_FUNCTIONS.get(fn_name)
@@ -305,49 +299,42 @@ class DeliberationEngine:
                     result = fn(**fn_args)
                 else:
                     result = f"Unknown tool: {fn_name}"
-                messages.append({"role": "tool", "content": result})
+                messages.append(resp.tool_result(tc, result))
 
     # ─── Non-streaming helpers (hybrid/synthesis) ─────────────────────────────
 
     def _generate_answer(self, prompt: str) -> str:
+        from node.provider import call as _provider_call
         cfg = ROLES["answerer"]
-        response = ollama.chat(
-            model=self.model,
+        resp = _provider_call(
             messages=[
                 {"role": "system", "content": cfg["system"]},
                 *self._history,
                 {"role": "user", "content": prompt},
             ],
-            think=False,
-            keep_alive=-1,
-            options={
-                "temperature": cfg["temperature"],
-                "num_ctx": self.num_ctx_answer,
-                "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
-            },
-            stream=False,
+            model_local=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+            tools=None,
+            temperature=cfg["temperature"],
+            num_ctx=self.num_ctx_answer,
         )
-        return response.message.content or ""
+        return resp.content
 
     def _stream_synthesis(self, prompt: str):
+        from node.provider import stream as _provider_stream
         cfg = ROLES["synthesizer"]
-        for chunk in ollama.chat(
-            model=self.model,
+        yield from _provider_stream(
             messages=[
                 {"role": "system", "content": cfg["system"]},
                 {"role": "user", "content": prompt},
             ],
-            think=False,
-            options={
-                "temperature": cfg["temperature"],
-                "num_ctx": self.num_ctx_synth,
-                "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
-            },
-            stream=True,
-        ):
-            token = _extract_token(chunk)
-            if token:
-                yield token
+            model_local=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+            temperature=cfg["temperature"],
+            num_ctx=self.num_ctx_synth,
+        )
 
     # ─── Backward compat ──────────────────────────────────────────────────────
 
@@ -444,8 +431,3 @@ def _build_hybrid_synthesis_prompt(query: str, local_answer: str, peer_answers: 
     return "".join(parts)
 
 
-def _extract_token(chunk) -> str:
-    try:
-        return chunk.message.content or ""
-    except AttributeError:
-        return chunk.get("message", {}).get("content", "") or ""

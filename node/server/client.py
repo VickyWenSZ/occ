@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 
 import httpx
+from node.retrieval.search import _embed as _embed_text
 
 BROKER_HTTP = "https://broker.opencognitivecommons.org"
 BROKER_WS = "wss://broker.opencognitivecommons.org/ws"
@@ -42,6 +43,7 @@ async def _query_via_broker(
     roles: dict[str, str],
     query: str,
     domains: list[str],
+    query_embedding: list[float] | None = None,
 ) -> list[PeerResponse]:
     import websockets
 
@@ -53,6 +55,7 @@ async def _query_via_broker(
                 "query_id": query_id,
                 "text": query,
                 "domains": domains,
+                "query_embedding": query_embedding,
             }))
             async for raw in ws:
                 msg = json.loads(raw)
@@ -85,4 +88,5 @@ def call_peers_parallel(
     domains = []
     for nid in target_ids:
         domains.extend(_manifests_cache.get(nid, {}).get("domains", []))
-    return asyncio.run(_query_via_broker(target_ids, roles, query, domains))
+    query_embedding = _embed_text(query)
+    return asyncio.run(_query_via_broker(target_ids, roles, query, domains, query_embedding))

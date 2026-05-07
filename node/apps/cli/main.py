@@ -21,7 +21,7 @@ from node.deliberation.engine import DeliberationEngine
 from node.deliberation.classifier import classify
 from node.deliberation.tools import set_workspace
 from node.expert_runtime.pack import load_pack, load_all_packs, MultiPackRetriever
-from node.apps.cli.config import Config
+from node.apps.cli.config import Config, save_openrouter_config
 from node.hardware import (
     is_ollama_installed, is_ollama_running, start_ollama,
     install_ollama_linux, is_model_installed, pull_model_stream,
@@ -31,7 +31,7 @@ from node.hardware import (
 console = Console()
 
 
-def setup_check() -> bool:
+def setup_check(force: bool = False) -> bool:
     """
     First-run setup: verify Ollama is present and the recommended model is installed.
     Returns False if setup cannot complete and the node should not start.
@@ -123,8 +123,64 @@ def setup_check() -> bool:
         console.print()
         _pull_with_progress(model)
 
+    # --- OpenRouter setup ---
+    _setup_openrouter(tier["name"], force)
+
     console.print()
     return True
+
+
+def _setup_openrouter(tier_name: str, force: bool = False):
+    from node.provider import BUDGET_MODEL, STRONG_MODEL
+
+    cfg = Config()
+    already = bool(cfg.openrouter_api_key)
+
+    if already and not force:
+        console.print(
+            f"  OpenRouter : [green]configured[/green] "
+            f"[dim]({cfg.openrouter_model})[/dim]"
+        )
+        return
+
+    console.print()
+    if tier_name == "micro":
+        console.print(
+            "  [yellow]Tip: CPU-only mode is slow (5–30s/reply).[/yellow]\n"
+            "  [dim]OpenRouter lets you use a cloud model for your own queries.\n"
+            "  Your local qwen3.5:2b still handles network contributions.[/dim]"
+        )
+    else:
+        console.print(
+            "  [dim]OpenRouter (optional): use a cloud model for your own queries.\n"
+            "  Network responses always stay local.[/dim]"
+        )
+
+    console.print()
+    console.print(f"  [dim][1] Budget — {BUDGET_MODEL}[/dim]")
+    console.print(f"  [dim][2] Strong — {STRONG_MODEL}[/dim]")
+    console.print(f"  [dim][n] Skip   — use local model only[/dim]")
+    console.print()
+
+    try:
+        choice = Prompt.ask("  Use OpenRouter?", choices=["1", "2", "n"], default="n")
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if choice in ("1", "2"):
+        or_model = BUDGET_MODEL if choice == "1" else STRONG_MODEL
+        try:
+            api_key = Prompt.ask("  API key (sk-or-...)")
+        except (KeyboardInterrupt, EOFError):
+            return
+        api_key = api_key.strip()
+        if api_key:
+            save_openrouter_config(api_key, or_model)
+            console.print(f"  [green]OK OpenRouter configured: {or_model}[/green]")
+        else:
+            console.print("  [dim yellow]No key entered — skipped.[/dim yellow]")
+    else:
+        console.print("  [dim]Using local model only.[/dim]")
 
 
 def _pull_with_progress(model: str):
@@ -175,10 +231,18 @@ def print_banner(cfg: Config, retriever: MultiPackRetriever | None, workspace):
     else:
         pack_str = "no packs loaded"
 
+    if cfg.openrouter_api_key:
+        model_str = (
+            f"[bold]{cfg.model}[/bold] [dim](network)[/dim] · "
+            f"[bold]{cfg.openrouter_model}[/bold] [dim](you · OpenRouter)[/dim]"
+        )
+    else:
+        model_str = f"[bold]{cfg.model}[/bold]"
+
     console.print(
         Panel(
             "[bold cyan]OCC — Open Cognitive Commons[/bold cyan]\n"
-            f"[dim]model: [bold]{cfg.model}[/bold] · {profile_str}[/dim]\n"
+            f"[dim]model: {model_str} · {profile_str}[/dim]\n"
             f"[dim]knowledge: {pack_str}[/dim]\n"
             f"[dim]workspace: {workspace}[/dim]",
             border_style="cyan",
@@ -202,6 +266,8 @@ def print_help(model: str, retriever):
     table.add_row("/status", "show current config")
     table.add_row("/unload", "unload model from VRAM")
     table.add_row("/load", "reload model into VRAM")
+    table.add_row("/openrouter off", "switch to local model for your queries")
+    table.add_row("/openrouter on", "switch back to OpenRouter (if configured)")
     table.add_row("exit / quit / q", "quit")
     console.print(table)
     console.print()
@@ -218,6 +284,8 @@ def build_engine(cfg: Config, retriever, model: str, peers: list[str], workspace
         retrieval_chars=cfg.retrieval_chars,
         domains=domains,
         workspace=workspace,
+        openrouter_key=cfg.openrouter_api_key,
+        openrouter_model=cfg.openrouter_model,
     )
 
 
@@ -280,7 +348,7 @@ def run():
     cfg = Config()
 
     if force_setup or not is_model_installed(cfg.model):
-        ok = setup_check()
+        ok = setup_check(force=force_setup)
         if not ok:
             sys.exit(1)
         # Reload config after potential tier change
@@ -339,9 +407,14 @@ def run():
         if query == "/status":
             domains = ", ".join(retriever.domains) if retriever and retriever.packs else "none"
             peer_info = f"   peers: [bold]{len(peers)}[/bold]" if peers else ""
+            if cfg.openrouter_api_key:
+                provider_info = f"\n  provider: [bold cyan]OpenRouter[/bold cyan] · {cfg.openrouter_model}   network: [dim]{model}[/dim] (local)"
+            else:
+                provider_info = f"\n  provider: [dim]local[/dim] · {model}"
             console.print(
                 f"\n  model: [bold]{model}[/bold]   profile: [bold]{cfg.hardware_profile}[/bold]"
                 f"   ctx: [bold]{cfg.num_ctx_answer}[/bold]   retrieval: [bold]{cfg.retrieval_chars}[/bold] chars"
+                f"{provider_info}"
                 f"\n  domains: [bold]{domains}[/bold]{peer_info}\n"
             )
             continue
@@ -417,6 +490,24 @@ def run():
             console.print()
             continue
 
+        if query == "/openrouter off":
+            from node.apps.cli.config import save_openrouter_config
+            save_openrouter_config("", cfg.openrouter_model)
+            cfg = Config()
+            engine.or_key = ""
+            console.print("[dim]OpenRouter disabled — using local model.[/dim]\n")
+            continue
+
+        if query == "/openrouter on":
+            cfg = Config()
+            if cfg.openrouter_api_key:
+                engine.or_key = cfg.openrouter_api_key
+                engine.or_model = cfg.openrouter_model
+                console.print(f"[dim]OpenRouter enabled — {cfg.openrouter_model}[/dim]\n")
+            else:
+                console.print("[yellow]No OpenRouter key configured. Run --setup to add one.[/yellow]\n")
+            continue
+
         if query.startswith("/"):
             console.print("[red]Unknown command. Type /? for help.[/red]\n")
             continue
@@ -427,7 +518,7 @@ def run():
             mode = "deliberate"
         else:
             mode = classify(model, query)
-        answer = _stream_answer(engine, query, mode)
+        answer = _stream_answer(engine, query, mode, cfg)
         if answer:
             engine.add_to_history(query, answer)
         console.print()
@@ -447,15 +538,23 @@ def _print_ctx_usage(engine):
     )
 
 
-_ROUTING_LABELS = {
-    "chat":     "[dim cyan]chat[/dim cyan]",
-    "local":    "[dim green]local[/dim green]",
-    "delegate": "[dim magenta]distributed[/dim magenta]",
-    "hybrid":   "[dim blue]hybrid[/dim blue]",
-}
+def _routing_labels(cfg: Config) -> dict:
+    if cfg.openrouter_api_key:
+        return {
+            "chat":     "[dim cyan]chat · OpenRouter[/dim cyan]",
+            "local":    "[dim cyan]local · OpenRouter[/dim cyan]",
+            "delegate": "[dim cyan]distributed · OpenRouter[/dim cyan]",
+            "hybrid":   "[dim cyan]hybrid · OpenRouter[/dim cyan]",
+        }
+    return {
+        "chat":     "[dim cyan]chat[/dim cyan]",
+        "local":    "[dim green]local[/dim green]",
+        "delegate": "[dim magenta]distributed[/dim magenta]",
+        "hybrid":   "[dim blue]hybrid[/dim blue]",
+    }
 
 
-def _stream_answer(engine: DeliberationEngine, query: str, mode: str = "deliberate") -> str:
+def _stream_answer(engine: DeliberationEngine, query: str, mode: str = "deliberate", cfg: Config | None = None) -> str:
     tokens: list[str] = []
     peer_data: dict | None = None
     routing_mode: str = ""
@@ -475,7 +574,8 @@ def _stream_answer(engine: DeliberationEngine, query: str, mode: str = "delibera
 
     answer = "".join(tokens).strip()
     if answer:
-        subtitle = _ROUTING_LABELS.get(routing_mode) if routing_mode else None
+        labels = _routing_labels(cfg) if cfg else _routing_labels(Config())
+        subtitle = labels.get(routing_mode) if routing_mode else None
         console.print(
             Panel(
                 Markdown(answer),

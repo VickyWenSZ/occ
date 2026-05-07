@@ -19,3 +19,5 @@ deliberation_log.md
 **/embeddings.json
 bash.exe.stackdump
 fix_nginx.py
+.occ_config.json
+.occ_chats.json
