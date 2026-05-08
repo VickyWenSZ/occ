@@ -393,11 +393,9 @@ const SLASH_COMMANDS = [
   { cmd: '/clear',          desc: 'Clear conversation history' },
   { cmd: '/status',         desc: 'Show current config' },
   { cmd: '/packs',          desc: 'List all loaded packs' },
-  { cmd: '/peers',          desc: 'Show peer nodes' },
+  { cmd: '/peers',          desc: 'Show active peer nodes' },
   { cmd: '/load',           desc: 'Load model into VRAM' },
   { cmd: '/unload',         desc: 'Unload model from VRAM' },
-  { cmd: '/model ',         desc: 'Switch model  (e.g. deepseek-r1:14b)' },
-  { cmd: '/pack ',          desc: 'Load a specific pack  (e.g. docker)' },
   { cmd: '/openrouter on',  desc: 'Switch to OpenRouter' },
   { cmd: '/openrouter off', desc: 'Switch to local model' },
 ];

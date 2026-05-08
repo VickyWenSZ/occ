@@ -515,13 +515,10 @@ async def list_peers():
 # ── Routes — slash commands ────────────────────────────────────────────────────
 
 _HELP_TEXT = """\
-/?  /help          show this help
 /clear             clear conversation history and reset context
 ! <query>          force network mode — consult peers regardless of local knowledge
-/model <name>      switch model  (e.g. /model deepseek-r1:14b)
-/pack <name>       load a specific pack  (e.g. /pack docker)
 /packs             list all loaded packs and domains
-/peers             show nodes registered on the broker
+/peers             show active peer nodes on the broker
 /status            show current config
 /unload            unload model from VRAM
 /load              reload model into VRAM
