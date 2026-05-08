@@ -618,10 +618,10 @@ function appendMessageToUI(msg) {
         header.appendChild(badge);
       });
     }
+    container.appendChild(row);
     if (msg.peer_answers) {
       addSourcesButton(msg.id || 'msg-' + Date.now(), msg.peer_answers);
     }
-    container.appendChild(row);
   }
 }
 
