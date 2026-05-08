@@ -43,6 +43,7 @@ _OCC_IDENTITY = (
 )
 
 _LOCAL_RELEVANCE_THRESHOLD = 300
+_LOCAL_SUFFICIENT_THRESHOLD = 1500
 
 
 class DeliberationEngine:
@@ -122,6 +123,13 @@ class DeliberationEngine:
             else ""
         )
         local_relevant = len(context) >= _LOCAL_RELEVANCE_THRESHOLD
+        local_sufficient = len(context) >= _LOCAL_SUFFICIENT_THRESHOLD
+
+        if local_sufficient:
+            yield ("routing", "local")
+            yield ("status", "Answering from local knowledge...")
+            yield from self._deliberate_local(query, context, images=images)
+            return
 
         yield from self._route_with_peers(query, context, local_relevant, images=images)
 
