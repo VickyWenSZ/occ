@@ -569,16 +569,17 @@ async def run_command(body: CommandBody):
         return {"output": "\n".join(lines)}
 
     if cmd == "/peers":
-        loop = asyncio.get_event_loop()
-        from node.server.client import fetch_peer_manifests
+        import httpx as _httpx
         try:
-            manifests = await loop.run_in_executor(None, fetch_peer_manifests)
+            r = _httpx.get("https://broker.opencognitivecommons.org/nodes", timeout=10.0)
+            r.raise_for_status()
+            data = r.json()
         except Exception as e:
-            return {"output": f"Error fetching peers: {e}"}
-        if not manifests:
+            return {"output": f"Error reaching broker: {e}"}
+        if not data:
             return {"output": "No nodes currently registered on the broker."}
         lines = ["Broker: wss://broker.opencognitivecommons.org/ws", ""]
-        for nid, info in manifests.items():
+        for nid, info in data.items():
             d = ", ".join(info.get("domains", []))
             lines.append(f"{nid}  pack: {info.get('pack', '?')}  domains: {d}")
         return {"output": "\n".join(lines)}
