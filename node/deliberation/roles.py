@@ -43,9 +43,10 @@ ROLES = {
     "synthesizer": {
         "system": (
             "You are a synthesis expert. "
-            "Integrate the provided perspectives into a single coherent answer. "
-            "Keep technical precision, incorporate valid critiques, eliminate repetition. "
-            "Answer proportionally to the original question — no padding, no over-explanation. "
+            "You are given two perspectives: an initial answer and a critical review. "
+            "Neither is the final truth — weigh both and produce the most accurate, complete answer. "
+            "Cover all relevant aspects. Include specific details, examples, and commands where they add value. "
+            "Be efficient: say what needs to be said, no more. "
             "IMPORTANT: always respond in the same language as the user's original question, "
             "regardless of the language used in the provided perspectives."
         ),

@@ -167,6 +167,15 @@ def _or_stream(messages, model, api_key, temperature) -> Iterator[str]:
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
+_LEADING_FRAGMENT = re.compile(r'^[a-z]{1,8}\.\s+')
+
+
+def _strip_leading_fragment(text: str) -> str:
+    """Strip word-ending fragments that Qwen3 leaks before the actual response.
+    Matches patterns like 'it. ', 'dy. ', 'ady. ' at the very start of content."""
+    return _LEADING_FRAGMENT.sub("", text)
+
+
 def _ollama_call(messages, model, tools, temperature, num_ctx) -> ProviderResponse:
     import ollama as _ollama
     response = _ollama.chat(
@@ -179,7 +188,7 @@ def _ollama_call(messages, model, tools, temperature, num_ctx) -> ProviderRespon
         stream=False,
     )
     msg = response.message
-    content = msg.content or ""
+    content = _strip_leading_fragment(msg.content or "")
     raw_tcs = msg.tool_calls or []
     prompt_tokens = getattr(response, "prompt_eval_count", 0) or 0
     completion_tokens = getattr(response, "eval_count", 0) or 0
@@ -198,6 +207,8 @@ def _ollama_call(messages, model, tools, temperature, num_ctx) -> ProviderRespon
 
 def _ollama_stream(messages, model, temperature, num_ctx) -> Iterator[str]:
     import ollama as _ollama
+    buf = ""
+    header_stripped = False
     for chunk in _ollama.chat(
         model=model,
         messages=messages,
@@ -209,5 +220,19 @@ def _ollama_stream(messages, model, temperature, num_ctx) -> Iterator[str]:
             token = chunk.message.content or ""
         except AttributeError:
             token = chunk.get("message", {}).get("content", "") or ""
-        if token:
+        if not token:
+            continue
+        if header_stripped:
             yield token
+        else:
+            buf += token
+            # Buffer until we have enough to safely check for a leading fragment
+            if len(buf) >= 30 or "\n" in buf:
+                buf = _strip_leading_fragment(buf)
+                header_stripped = True
+                if buf:
+                    yield buf
+                buf = ""
+    # Flush any remaining buffer (short response that never hit the threshold)
+    if buf:
+        yield _strip_leading_fragment(buf)
