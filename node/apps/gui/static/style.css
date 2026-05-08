@@ -497,10 +497,14 @@ html, body {
 }
 .sources-panel.open { display: block; }
 .source-block {
-  padding: 0.625rem 0.875rem;
+  padding: 0.625rem 0.875rem 0.625rem 1rem;
   border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
 }
 .source-block:last-child { border-bottom: none; }
+.source-block.role-local      { border-left-color: var(--green-border); background: #030b05; }
+.source-block.role-expert     { border-left-color: #075985;             background: #00101a; }
+.source-block.role-contrarian { border-left-color: #92400e;             background: #100800; }
 .source-label {
   font-family: var(--font-mono);
   font-size: 0.625rem;
@@ -513,7 +517,6 @@ html, body {
   font-size: 0.8125rem;
   color: var(--text-muted);
   line-height: 1.6;
-  white-space: pre-wrap;
   word-break: break-word;
 }
 .assistant-header {

@@ -781,25 +781,25 @@ function buildSourcesPanel(data) {
 
   const blocks = [];
   if (data.local_answer) {
-    blocks.push({ label: `Local — ${data.local_pack || 'local'}`, text: data.local_answer });
+    blocks.push({ label: `Local — ${data.local_pack || 'local'}`, text: data.local_answer, role: 'local' });
   }
   if (data.expert_answer) {
-    blocks.push({ label: 'Peer — expert', text: data.expert_answer });
+    blocks.push({ label: 'Peer — expert', text: data.expert_answer, role: 'expert' });
   }
   if (data.contrarian_answer) {
     const label = data.mode === 'delegate' ? 'Peer — critical review' : 'Peer — expert 2';
-    blocks.push({ label, text: data.contrarian_answer });
+    blocks.push({ label, text: data.contrarian_answer, role: 'contrarian' });
   }
 
   blocks.forEach(b => {
     const block = document.createElement('div');
-    block.className = 'source-block';
+    block.className = `source-block role-${b.role}`;
     const lbl = document.createElement('div');
     lbl.className = 'source-label';
     lbl.textContent = b.label;
     const body = document.createElement('div');
-    body.className = 'source-body';
-    body.textContent = b.text;
+    body.className = 'source-body md-content';
+    body.innerHTML = renderMarkdown(b.text);
     block.appendChild(lbl);
     block.appendChild(body);
     panel.appendChild(block);
