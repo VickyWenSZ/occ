@@ -63,27 +63,30 @@ TIERS = [
         "vram_min_gb": 8,
         "vram_comfortable_gb": 10,
         "model": "qwen3.5:9b",
-        "num_ctx_answer": 32768,
-        "num_ctx_synth": 32768,
-        "retrieval_chars": 16_000,
+        # 9B Q4_K_M ≈ 6GB weights. KV cache for 16384 tokens ≈ 1.75GB → total ≈ 7.75GB, fits 8GB.
+        # 32768 tokens would require ~3.5GB KV → 9.5GB → OOM on 8GB cards.
+        "num_ctx_answer": 16384,
+        "num_ctx_synth": 16384,
+        "retrieval_chars": 12_000,
     },
     {
         "name": "small",
         "vram_min_gb": 4,
         "vram_comfortable_gb": 6,
         "model": "qwen3.5:4b",
-        "num_ctx_answer": 32768,
-        "num_ctx_synth": 32768,
-        "retrieval_chars": 16_000,
+        # 4B Q4_K_M ≈ 2.7GB weights. KV cache for 8192 tokens ≈ 0.9GB → total ≈ 3.6GB, fits 4GB.
+        "num_ctx_answer": 8192,
+        "num_ctx_synth": 8192,
+        "retrieval_chars": 8_000,
     },
     {
         "name": "micro",
         "vram_min_gb": 0,
         "vram_comfortable_gb": 0,
         "model": "qwen3.5:2b",
-        "num_ctx_answer": 32768,
-        "num_ctx_synth": 32768,
-        "retrieval_chars": 16_000,
+        "num_ctx_answer": 8192,
+        "num_ctx_synth": 8192,
+        "retrieval_chars": 8_000,
     },
 ]
 

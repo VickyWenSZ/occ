@@ -4,6 +4,7 @@ Used only for user-facing inference (DeliberationEngine).
 broker_agent.py always uses Ollama directly — never import this there.
 """
 import json
+import re
 import uuid
 from typing import Iterator
 
@@ -84,16 +85,34 @@ def stream(
 
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 
+def _extract_content(msg) -> str:
+    """Extract visible text from an OR message, stripping <think> blocks.
+    Falls back in order: reasoning_content → think block body → raw content."""
+    raw = msg.content or ""
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    if cleaned:
+        return cleaned
+    # Some OR providers expose reasoning separately
+    reasoning = getattr(msg, "reasoning_content", None) or ""
+    if reasoning.strip():
+        return reasoning.strip()
+    # Model produced only a <think> block with no visible output (common with Qwen3
+    # on analytical tasks like Critic). Use the think content rather than returning "".
+    think_match = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
+    if think_match:
+        return think_match.group(1).strip()
+    return raw.strip()
+
 def _or_call(messages, model, api_key, tools, temperature) -> ProviderResponse:
     from openai import OpenAI
-    client = OpenAI(api_key=api_key, base_url=_OR_BASE)
+    client = OpenAI(api_key=api_key, base_url=_OR_BASE, timeout=120.0)
     kw: dict = {"model": model, "messages": messages, "temperature": temperature, "stop": _STOP}
     if tools:
         kw["tools"] = tools
         kw["tool_choice"] = "auto"
     resp = client.chat.completions.create(**kw)
     msg = resp.choices[0].message
-    content = msg.content or ""
+    content = _extract_content(msg)
     raw_tcs = msg.tool_calls or []
     if not raw_tcs:
         return ProviderResponse(content, None, "openrouter")
@@ -120,13 +139,30 @@ def _or_call(messages, model, api_key, tools, temperature) -> ProviderResponse:
 
 def _or_stream(messages, model, api_key, temperature) -> Iterator[str]:
     from openai import OpenAI
-    client = OpenAI(api_key=api_key, base_url=_OR_BASE)
+    client = OpenAI(api_key=api_key, base_url=_OR_BASE, timeout=120.0)
+    in_think = False
+    buf = ""
     for chunk in client.chat.completions.create(
         model=model, messages=messages, temperature=temperature, stop=_STOP, stream=True
     ):
         token = chunk.choices[0].delta.content or ""
-        if token:
-            yield token
+        if not token:
+            continue
+        if in_think:
+            if "</think>" in token:
+                in_think = False
+            continue
+        buf += token
+        if "<think>" in buf:
+            in_think = True
+            buf = ""
+            continue
+        # Flush buffer once we have enough to be sure no <think> is coming
+        if len(buf) > 20:
+            yield buf
+            buf = ""
+    if buf and not in_think:
+        yield buf
 
 
 # ── Ollama ────────────────────────────────────────────────────────────────────

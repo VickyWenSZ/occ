@@ -125,12 +125,8 @@ class DeliberationEngine:
 
         if context is None:
             yield ("routing", "local_fallback")
-            yield ("status", "Server unavailable — using local packs...")
-            local_ctx = (
-                self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
-                if self.expert_pack else ""
-            )
-            yield from self._deliberate_multiagent(query, local_ctx)
+            yield ("status", "Server unavailable — answering from base model only...")
+            yield from self._deliberate_multiagent(query, "")
             return
 
         best_peer = self._select_best_peer(mode)
@@ -145,14 +141,102 @@ class DeliberationEngine:
 
     # ─── Retrieval ────────────────────────────────────────────────────────────
 
+    def _llm_select_packs(self, query: str, available_packs: list[str]) -> list[str]:
+        from node.provider import call as _provider_call
+
+        pack_list = "\n".join(f"- {p}" for p in available_packs)
+        prompt = (
+            f"Available knowledge packs:\n{pack_list}\n\n"
+            f"Question: {query}\n\n"
+            "List the pack names relevant to answer this question. "
+            "One pack name per line, exactly as written above. "
+            "If none are relevant, reply with: none"
+        )
+        try:
+            resp = _provider_call(
+                messages=[{"role": "user", "content": prompt}],
+                model_local=self.model,
+                or_key="",
+                or_model="",
+                tools=None,
+                temperature=0.0,
+                num_ctx=4096,
+            )
+            raw = resp.content or ""
+            selected = []
+            for line in raw.splitlines():
+                line = line.strip().lstrip("- ").strip()
+                if line in available_packs:
+                    selected.append(line)
+            return selected if selected else []
+        except Exception:
+            return []
+
+    def _llm_select_pages(self, query: str, indices: dict[str, str]) -> list[dict]:
+        from node.provider import call as _provider_call
+
+        index_text = ""
+        for pack_name, content in indices.items():
+            index_text += f"\n### Pack: {pack_name}\n{content}\n"
+
+        prompt = (
+            f"Question: {query}\n\n"
+            f"Knowledge base index:\n{index_text}\n"
+            "List the files to read to answer this question. "
+            "Format: pack_name/filename — one per line, max 6 files. "
+            "Use exact filenames from the index above."
+        )
+        try:
+            resp = _provider_call(
+                messages=[{"role": "user", "content": prompt}],
+                model_local=self.model,
+                or_key="",
+                or_model="",
+                tools=None,
+                temperature=0.0,
+                num_ctx=8192,
+            )
+            raw = resp.content or ""
+
+            valid_files: dict[str, set[str]] = {}
+            for pack_name, content in indices.items():
+                valid_files[pack_name] = set()
+                for line in content.splitlines():
+                    line = line.strip()
+                    if not line.startswith("|"):
+                        continue
+                    parts = [p.strip() for p in line.strip("|").split("|")]
+                    if parts and parts[0] and not parts[0].startswith("-") and parts[0].lower() != "file":
+                        valid_files[pack_name].add(parts[0])
+
+            refs = []
+            for line in raw.splitlines():
+                line = line.strip().lstrip("- ").strip()
+                if "/" not in line:
+                    continue
+                parts = line.split("/", 1)
+                if len(parts) != 2:
+                    continue
+                pack, filepath = parts[0].strip(), parts[1].strip()
+                if pack in valid_files and filepath in valid_files[pack]:
+                    refs.append({"pack": pack, "file": filepath})
+                elif pack not in valid_files:
+                    for pname, files in valid_files.items():
+                        if line in files:
+                            refs.append({"pack": pname, "file": line})
+                            break
+            return refs[:6]
+        except Exception:
+            return []
+
     def _retrieve_from_server(self, query: str) -> str | None:
         import asyncio
+        import concurrent.futures
         from node.retrieval.pack_cache import (
-            get_cached_wiki_dirs, fetch_pages, select_sections,
-            download_all_indices,
+            get_cached_wiki_dirs, fetch_pages, download_all_indices,
         )
-        from node.retrieval.search import get_relevant_page_refs, relevant_pack_dirs
 
+        # 1. Assicura che la cache degli indici sia disponibile
         wiki_dirs = get_cached_wiki_dirs()
         if not wiki_dirs:
             ok = download_all_indices()
@@ -162,27 +246,79 @@ class DeliberationEngine:
             if not wiki_dirs:
                 return None
 
-        relevant_dirs = relevant_pack_dirs(wiki_dirs, query)
-        if not relevant_dirs:
-            return ""
+        available_packs = [wd.parent.name for wd in wiki_dirs]
 
-        page_refs: list[dict] = []
-        for wiki_dir in relevant_dirs:
-            page_refs.extend(get_relevant_page_refs(wiki_dir, query, max_pages=6))
+        # 2. Call 0a — LLM sceglie pack rilevanti
+        selected_pack_names = self._llm_select_packs(query, available_packs)
+
+        # Fallback a embedding se LLM non sceglie nulla
+        if not selected_pack_names:
+            from node.retrieval.search import get_relevant_page_refs, relevant_pack_dirs
+            relevant_dirs = relevant_pack_dirs(wiki_dirs, query)
+            if not relevant_dirs:
+                return ""
+            page_refs: list[dict] = []
+            for wiki_dir in relevant_dirs:
+                page_refs.extend(get_relevant_page_refs(wiki_dir, query, max_pages=6))
+            if not page_refs:
+                return ""
+        else:
+            selected_wiki_dirs = [wd for wd in wiki_dirs if wd.parent.name in selected_pack_names]
+
+            # 3. Leggi indici dalla cache locale
+            indices: dict[str, str] = {}
+            for wd in selected_wiki_dirs:
+                index_path = wd / "index.md"
+                if index_path.exists():
+                    try:
+                        indices[wd.parent.name] = index_path.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+
+            if not indices:
+                return ""
+
+            # 4. Call 0b — LLM sceglie pagine specifiche
+            page_refs = self._llm_select_pages(query, indices)
+
+            # Fallback a embedding se LLM non trova pagine
+            if not page_refs:
+                from node.retrieval.search import get_relevant_page_refs
+                page_refs = []
+                for wd in selected_wiki_dirs:
+                    page_refs.extend(get_relevant_page_refs(wd, query, max_pages=6))
+
         if not page_refs:
             return ""
 
+        # 5. Fetch pagine dal server
         try:
             pages = asyncio.run(fetch_pages(page_refs))
         except RuntimeError:
-            return None
+            # GUI runs on asyncio — asyncio.run() fails inside a running loop.
+            # Use a fresh thread with its own event loop instead.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                try:
+                    pages = pool.submit(asyncio.run, fetch_pages(page_refs)).result(timeout=30)
+                except Exception:
+                    return None
 
         if pages is None:
             return None
         if not pages:
             return ""
 
-        return select_sections(query, pages, max_chars=self.retrieval_chars)
+        # 6. Assembla il contesto — pagine intere fino al cap retrieval_chars
+        parts = []
+        total = 0
+        for filename, content in pages.items():
+            remaining = self.retrieval_chars - total
+            if remaining <= 0:
+                break
+            chunk = content[:remaining]
+            parts.append(f"[{filename}]\n{chunk}")
+            total += len(chunk)
+        return "\n\n".join(parts)
 
     # ─── Peer routing ─────────────────────────────────────────────────────────
 
@@ -245,19 +381,22 @@ class DeliberationEngine:
                     f"[Proposed answer]\n{expert_answer}\n\n"
                     "Review this answer critically."
                 )
-            critic_resp = _provider_call(
-                messages=[
-                    {"role": "system", "content": ROLES["critic"]["system"]},
-                    {"role": "user", "content": critic_prompt},
-                ],
-                model_local=self.model,
-                or_key=self.or_key,
-                or_model=self.or_model,
-                tools=None,
-                temperature=ROLES["critic"]["temperature"],
-                num_ctx=self.num_ctx_answer,
-            )
-            critique = critic_resp.content or ""
+            try:
+                critic_resp = _provider_call(
+                    messages=[
+                        {"role": "system", "content": ROLES["critic"]["system"]},
+                        {"role": "user", "content": critic_prompt},
+                    ],
+                    model_local=self.model,
+                    or_key=self.or_key,
+                    or_model=self.or_model,
+                    tools=None,
+                    temperature=ROLES["critic"]["temperature"],
+                    num_ctx=self.num_ctx_answer,
+                )
+                critique = critic_resp.content or ""
+            except Exception:
+                critique = ""
 
         yield ("peer_answers", {
             "mode": "network",
@@ -303,74 +442,92 @@ class DeliberationEngine:
             )
         else:
             expert_prompt = f"Question: {query}\n\nAnswer helpfully."
-        expert_resp = _provider_call(
-            messages=[
-                {"role": "system", "content": ROLES["expert"]["system"]},
-                {"role": "user", "content": expert_prompt},
-            ],
-            model_local=self.model,
-            or_key=self.or_key,
-            or_model=self.or_model,
-            tools=None,
-            temperature=ROLES["expert"]["temperature"],
-            num_ctx=self.num_ctx_answer,
-        )
-        expert_answer = expert_resp.content or ""
+        try:
+            expert_resp = _provider_call(
+                messages=[
+                    {"role": "system", "content": ROLES["expert"]["system"]},
+                    {"role": "user", "content": expert_prompt},
+                ],
+                model_local=self.model,
+                or_key=self.or_key,
+                or_model=self.or_model,
+                tools=None,
+                temperature=ROLES["expert"]["temperature"],
+                num_ctx=self.num_ctx_answer,
+            )
+            expert_answer = expert_resp.content or ""
+        except Exception as e:
+            expert_answer = ""
+            yield ("peer_answers", {"mode": "local", "expert_draft": "", "critic_review": f"[Expert call failed: {e}]"})
+            yield ("token", f"*(Deliberation failed at Expert step: {e})*")
+            return
 
-        # Call 2 — Critic
+        # Call 2 — Critic (context capped to avoid overflow on local models)
         yield ("status", "Critic reviewing...")
-        if context:
+        _ctx_cap = 4000  # chars — keeps Critic input well within num_ctx_answer
+        critic_context = context[:_ctx_cap] if context else ""
+        _expert_cap = 3000
+        critic_expert = expert_answer[:_expert_cap]
+        if critic_context:
             critic_prompt = (
-                f"[Knowledge context]\n{context}\n\n"
-                f"[Proposed answer]\n{expert_answer}\n\n"
+                f"[Knowledge context]\n{critic_context}\n\n"
+                f"[Proposed answer]\n{critic_expert}\n\n"
                 "Review this answer critically."
             )
         else:
             critic_prompt = (
-                f"[Proposed answer]\n{expert_answer}\n\n"
+                f"[Proposed answer]\n{critic_expert}\n\n"
                 "Review this answer critically."
             )
-        critic_resp = _provider_call(
-            messages=[
-                {"role": "system", "content": ROLES["critic"]["system"]},
-                {"role": "user", "content": critic_prompt},
-            ],
-            model_local=self.model,
-            or_key=self.or_key,
-            or_model=self.or_model,
-            tools=None,
-            temperature=ROLES["critic"]["temperature"],
-            num_ctx=self.num_ctx_answer,
-        )
-        critique = critic_resp.content or ""
+        try:
+            critic_resp = _provider_call(
+                messages=[
+                    {"role": "system", "content": ROLES["critic"]["system"]},
+                    {"role": "user", "content": critic_prompt},
+                ],
+                model_local=self.model,
+                or_key=self.or_key,
+                or_model=self.or_model,
+                tools=None,
+                temperature=ROLES["critic"]["temperature"],
+                num_ctx=self.num_ctx_answer,
+            )
+            critique = critic_resp.content or ""
+        except Exception:
+            critique = ""
 
-        # Emit intermediate answers for Sources panel before streaming final answer
+        # Always emit peer_answers so Sources panel always appears in deliberate mode
         yield ("peer_answers", {
             "mode": "local",
             "expert_draft": expert_answer,
             "critic_review": critique,
         })
 
-        # Call 3 — Synthesis (streaming)
+        # Call 3 — Synthesis (streaming) — uses num_ctx_synth, capped inputs
         yield ("status", "Synthesizing...")
+        _synth_expert_cap = 4000
+        _synth_critique_cap = 2000
         synth_prompt = (
             f"Original question: {query}\n\n"
-            f"Initial answer:\n{expert_answer}\n\n"
-            f"Critical review:\n{critique}\n\n"
+            f"Initial answer:\n{expert_answer[:_synth_expert_cap]}\n\n"
+            f"Critical review:\n{critique[:_synth_critique_cap]}\n\n"
             "Produce the final improved answer."
         )
-        for token in _provider_stream(
-            messages=[
-                {"role": "system", "content": ROLES["synthesizer"]["system"]},
-                {"role": "user", "content": synth_prompt},
-            ],
-            model_local=self.model,
-            or_key=self.or_key,
-            or_model=self.or_model,
-            temperature=ROLES["synthesizer"]["temperature"],
-            num_ctx=self.num_ctx_synth,
-        ):
-            yield ("token", token)
+        try:
+            for token in _provider_stream(
+                messages=[
+                    {"role": "system", "content": ROLES["synthesizer"]["system"]},
+                    {"role": "user", "content": synth_prompt},
+                ],
+                model_local=self.model,
+                or_key=self.or_key,
+                or_model=self.or_model,
+                temperature=ROLES["synthesizer"]["temperature"],
+                num_ctx=self.num_ctx_synth,
+            ):
+                yield ("token", token)
+        except Exception as e:
+            yield ("token", f"\n\n*(Synthesis failed: {e} — showing Expert answer)*\n\n{expert_answer}")
 
     # ─── Chat (tools) ─────────────────────────────────────────────────────────
 

@@ -61,14 +61,6 @@ async def get_index(pack: str):
     return Response(f.read_text(encoding="utf-8"), media_type="text/markdown")
 
 
-@app.get("/packs/{pack}/embeddings.json")
-async def get_embeddings(pack: str):
-    f = PACKS_DIR / pack / "embeddings.json"
-    if not f.exists():
-        raise HTTPException(404)
-    return Response(f.read_text(encoding="utf-8"), media_type="application/json")
-
-
 @app.get("/packs/{pack}/wiki/{filename:path}")
 async def get_page(pack: str, filename: str):
     f = (PACKS_DIR / pack / "wiki" / filename).resolve()

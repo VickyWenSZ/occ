@@ -293,48 +293,6 @@ def build_engine(cfg: Config, retriever, model: str, workspace=None) -> Delibera
     )
 
 
-def _check_and_pull_embed_model():
-    """Ensure nomic-embed-text is installed. Prompt once if missing."""
-    embed_model = "nomic-embed-text"
-    if is_model_installed(embed_model):
-        return
-    console.print(
-        f"[dim]Semantic search requires [bold]{embed_model}[/bold] (~137MB).[/dim]"
-    )
-    try:
-        answer = Prompt.ask(
-            f"  Download [bold]{embed_model}[/bold]?",
-            choices=["y", "n"], default="y",
-        )
-    except (KeyboardInterrupt, EOFError):
-        return
-    if answer == "y":
-        _pull_with_progress(embed_model)
-        console.print(f"  [green]OK {embed_model} ready.[/green]")
-    else:
-        console.print("  [dim yellow]Skipped — keyword fallback active.[/dim yellow]")
-    console.print()
-
-
-def _build_pack_embeddings(retriever: MultiPackRetriever):
-    """Build embeddings.json for any pack that needs it."""
-    from node.retrieval.search import build_embeddings, load_embeddings
-
-    needs = [p for p in retriever.packs if load_embeddings(p.wiki_dir) is None]
-    if not needs:
-        return
-    for pack in needs:
-        with console.status(f"[dim]Building embeddings: [bold]{pack.name}[/bold]...[/dim]"):
-            result = build_embeddings(pack.wiki_dir)
-        if result is True:
-            console.print(f"  [dim green]Embeddings ready: {pack.name}[/dim green]")
-        elif result == "skip":
-            console.print(f"  [dim]Embeddings skipped: {pack.name} (no index.md — rebuild pack with Forge)[/dim]")
-        else:
-            console.print(f"  [dim yellow]Embeddings skipped: {pack.name} (nomic unavailable)[/dim yellow]")
-    console.print()
-
-
 def _start_broker_agent_background():
     import threading
     import asyncio
@@ -372,9 +330,6 @@ def run():
     workspace = ROOT / "workspace"
     workspace.mkdir(exist_ok=True)
     set_workspace(workspace)
-
-    _check_and_pull_embed_model()
-    _build_pack_embeddings(retriever)
 
     print_banner(cfg, retriever, workspace)
 

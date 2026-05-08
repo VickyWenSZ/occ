@@ -89,21 +89,7 @@ if %errorlevel% neq 0 (
     echo  [OK] Model already installed.
 )
 
-:: ── 8. Pull nomic-embed-text if needed ───────────────────────────────────────
-ollama show nomic-embed-text >nul 2>&1
-if %errorlevel% neq 0 (
-    echo  Downloading nomic-embed-text ^(needed for semantic search^)...
-    ollama pull nomic-embed-text
-    if %errorlevel% neq 0 (
-        echo  [!] nomic-embed-text download failed. Semantic search will be unavailable.
-    ) else (
-        echo  [OK] nomic-embed-text ready.
-    )
-) else (
-    echo  [OK] nomic-embed-text already installed.
-)
-
-:: ── 9. Start GUI ─────────────────────────────────────────────────────────────
+:: ── 8. Start GUI ─────────────────────────────────────────────────────────────
 echo.
 echo  Starting OCC Node...
 echo  Opening browser at http://localhost:7891

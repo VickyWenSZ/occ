@@ -395,6 +395,8 @@ const SLASH_COMMANDS = [
   { cmd: '/status',         desc: 'Show current config' },
   { cmd: '/packs',          desc: 'List all loaded packs' },
   { cmd: '/peers',          desc: 'Show active peer nodes' },
+  { cmd: '/local on',       desc: 'Use local packs only (Forge / private)' },
+  { cmd: '/local off',      desc: 'Use server packs (default)' },
   { cmd: '/load',           desc: 'Load model into VRAM' },
   { cmd: '/unload',         desc: 'Unload model from VRAM' },
   { cmd: '/openrouter on',  desc: 'Switch to OpenRouter' },
@@ -679,8 +681,8 @@ function buildRoutingBadge(routing) {
   const labels = {
     chat: 'chat',
     local: 'server + local',
-    local_private: 'local',
-    local_fallback: 'offline + local',
+    local_private: 'local · private',
+    local_fallback: 'offline · no knowledge',
     distributed: 'network',
   };
   badge.textContent = labels[routing] || routing;
@@ -799,21 +801,15 @@ function buildSourcesPanel(data) {
   const panel = document.createElement('div');
   panel.className = 'sources-panel';
 
-  const blocks = [];
-  if (data.expert_draft) {
-    const expertLabel = data.mode === 'network'
-      ? 'Expert — local'
-      : 'Expert — draft';
-    blocks.push({ label: expertLabel, text: data.expert_draft, role: 'local' });
-  }
-  if (data.critic_review) {
-    const criticLabel = data.mode === 'network'
-      ? `Critic — peer (${data.peer_tier || 'remote'})`
-      : 'Critic — review';
-    blocks.push({ label: criticLabel, text: data.critic_review, role: 'expert' });
-  }
+  const expertLabel = data.mode === 'network' ? 'Expert — local' : 'Expert — draft';
+  const criticLabel = data.mode === 'network'
+    ? `Critic — peer (${data.peer_tier || 'remote'})`
+    : 'Critic — review';
 
-  blocks.forEach(b => {
+  [
+    { label: expertLabel, text: data.expert_draft, role: 'local' },
+    { label: criticLabel, text: data.critic_review, role: 'expert' },
+  ].forEach(b => {
     const block = document.createElement('div');
     block.className = `source-block role-${b.role}`;
     const lbl = document.createElement('div');
@@ -821,7 +817,9 @@ function buildSourcesPanel(data) {
     lbl.textContent = b.label;
     const body = document.createElement('div');
     body.className = 'source-body md-content';
-    body.innerHTML = renderMarkdown(b.text);
+    body.innerHTML = b.text
+      ? renderMarkdown(b.text)
+      : '<em style="opacity:0.45;font-size:0.85em">No output generated.</em>';
     block.appendChild(lbl);
     block.appendChild(body);
     panel.appendChild(block);

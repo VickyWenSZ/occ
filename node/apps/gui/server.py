@@ -168,9 +168,6 @@ def _init():
     log_bus.write(f"[GUI] Warming up model: {_model}...")
     _warmup_model()
 
-    _init_status = "building embeddings"
-    _maybe_build_embeddings()
-
     _engine = DeliberationEngine(
         model=_model,
         expert_pack=_retriever,
@@ -203,16 +200,6 @@ def _warmup_model():
         log_bus.write(f"[GUI] Model loaded into memory.")
     except Exception as e:
         log_bus.write(f"[GUI] Warmup warning: {e}")
-
-
-def _maybe_build_embeddings():
-    if not _retriever:
-        return
-    from node.retrieval.search import build_embeddings, load_embeddings
-    for pack in _retriever.packs:
-        if load_embeddings(pack.wiki_dir) is None:
-            log_bus.write(f"[GUI] Building embeddings: {pack.name}...")
-            build_embeddings(pack.wiki_dir)
 
 
 def _start_broker_agent_background():
@@ -542,6 +529,8 @@ _HELP_TEXT = """\
 /packs             list all loaded packs and domains
 /peers             show active peer nodes on the broker
 /status            show current config
+/local on          use local packs only (no server contact) — for private Forge packs
+/local off         use server packs (default — community-signed, approved)
 /unload            unload model from VRAM
 /load              reload model into VRAM
 /openrouter on     switch to OpenRouter (if configured)
@@ -661,6 +650,16 @@ async def run_command(body: CommandBody):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _warmup_model)
         return {"output": f"Model {_model} loaded into VRAM."}
+
+    if cmd in ("/local on", "/local off"):
+        from node.apps.cli.config import save_local_mode
+        enabled = cmd == "/local on"
+        save_local_mode(enabled)
+        _cfg = Config()
+        if _engine:
+            _engine._local_mode = enabled
+        state = "ON — using local packs only" if enabled else "OFF — using server packs (default)"
+        return {"output": f"Local mode: {state}"}
 
     if cmd == "/openrouter off":
         save_openrouter_config("", _cfg.openrouter_model if _cfg else "")

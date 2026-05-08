@@ -1,7 +1,7 @@
 """
 Local cache for OCC server pack indices.
 
-Cache layout: ~/.occ_cache/{pack}/wiki/index.md + embeddings.json
+Cache layout: ~/.occ_cache/{pack}/wiki/index.md
 The wiki/ dir mirrors the structure search.py expects as wiki_dir.
 Page files are NOT stored locally — fetched on demand from the server.
 """
@@ -22,13 +22,9 @@ _REFRESH_INTERVAL_HOURS = 24
 
 
 def download_all_indices() -> bool:
-    """Download index.md for every pack and rebuild embeddings locally.
+    """Download index.md for every pack from the server.
     Returns True if at least one pack was cached successfully.
-    Server embeddings.json is ignored — local rebuild ensures query/doc vectors
-    use the same embedding call (nomic-embed-text without prefix mismatch).
     """
-    from .search import build_embeddings
-
     try:
         with urlopen(f"{SERVER_URL}/packs", timeout=10) as r:
             pack_names: list[str] = json.loads(r.read())
@@ -39,7 +35,7 @@ def download_all_indices() -> bool:
     for pack in pack_names:
         wiki_dir = CACHE_DIR / pack / "wiki"
         wiki_dir.mkdir(parents=True, exist_ok=True)
-        url = f"{SERVER_URL}/packs/{pack}/index.md"
+        url = f"{SERVER_URL}/packs/{pack}/wiki/index.md"
         dest = wiki_dir / "index.md"
         try:
             with urlopen(url, timeout=10) as r:
@@ -47,8 +43,6 @@ def download_all_indices() -> bool:
             ok = True
         except Exception:
             continue
-        # Rebuild embeddings locally so query and document vectors are consistent
-        build_embeddings(wiki_dir)
 
     if ok:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -115,57 +109,3 @@ async def fetch_pages(page_refs: list[dict]) -> dict[str, str] | None:
             return None
 
 
-def select_sections(query: str, pages: dict[str, str], max_chars: int = 8000) -> str:
-    """
-    From fetched page content, select the most relevant sections.
-    Splits on ## headings, scores by cosine similarity when nomic is available,
-    truncates proportionally otherwise.
-    """
-    from .search import _embed, _cosine  # noqa: PLC0415 — same package, no circular dep
-
-    _SECTION_THRESHOLD = 0.25
-    query_vec = _embed(query)
-    selected: list[str] = []
-
-    for _filename, content in pages.items():
-        sections = _split_sections(content)
-        if query_vec is not None:
-            scored = []
-            for heading, body in sections:
-                sec_vec = _embed(f"{heading}. {body[:200]}")
-                if sec_vec is not None:
-                    scored.append((_cosine(query_vec, sec_vec), heading, body))
-            scored.sort(reverse=True)
-            for score, heading, body in scored:
-                if score >= _SECTION_THRESHOLD:
-                    block = f"## {heading}\n{body}" if heading else body
-                    selected.append(block)
-        else:
-            per_section = max(1, max_chars // max(len(sections), 1))
-            for heading, body in sections:
-                block = f"## {heading}\n{body}" if heading else body
-                selected.append(block[:per_section])
-
-    result = "\n\n".join(selected)
-    return result[:max_chars]
-
-
-def _split_sections(content: str) -> list[tuple[str, str]]:
-    """Split markdown content into (heading, body) tuples on ## boundaries."""
-    sections: list[tuple[str, str]] = []
-    current_heading = ""
-    current_lines: list[str] = []
-
-    for line in content.splitlines():
-        if line.startswith("## "):
-            if current_heading or current_lines:
-                sections.append((current_heading, "\n".join(current_lines).strip()))
-            current_heading = line[3:].strip()
-            current_lines = []
-        else:
-            current_lines.append(line)
-
-    if current_heading or current_lines:
-        sections.append((current_heading, "\n".join(current_lines).strip()))
-
-    return sections or [("", content)]

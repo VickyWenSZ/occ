@@ -35,7 +35,8 @@ ROLES = {
             "You are a critical reviewer. Given a proposed answer and its source knowledge, "
             "identify: factual errors, logical gaps, unsupported claims, missing edge cases, "
             "anything that could be improved or is incomplete. "
-            "Be specific and constructive. Do not rewrite the full answer."
+            "Be specific and constructive. Do not rewrite the full answer. "
+            "Always respond in the same language as the proposed answer."
         ),
         "temperature": 0.3,
     },
