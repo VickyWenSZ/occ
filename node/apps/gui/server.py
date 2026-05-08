@@ -75,6 +75,7 @@ def _add_message_to_chat(
     routing: str = "",
     attachments: list | None = None,
     tools: list | None = None,
+    peer_answers: dict | None = None,
 ):
     chats = _load_chats()
     for c in chats:
@@ -91,6 +92,8 @@ def _add_message_to_chat(
                 msg["attachments"] = attachments
             if tools:
                 msg["tools"] = tools
+            if peer_answers:
+                msg["peer_answers"] = peer_answers
             c["messages"].append(msg)
             if role == "user" and len(c["messages"]) == 1:
                 c["title"] = content[:60].strip() or "New Chat"
@@ -453,7 +456,8 @@ async def chat_query(chat_id: str, body: QueryBody):
         answer = "".join(tokens).strip()
         if answer:
             _add_message_to_chat(chat_id, "assistant", answer, routing=routing_mode,
-                                  tools=tools_used or None)
+                                  tools=tools_used or None,
+                                  peer_answers=peer_data or None)
             _engine.add_to_history(full_query, answer)
             if peer_data:
                 _write_deliberation_log(body.message, peer_data, answer)

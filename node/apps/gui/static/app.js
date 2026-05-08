@@ -618,6 +618,9 @@ function appendMessageToUI(msg) {
         header.appendChild(badge);
       });
     }
+    if (msg.peer_answers) {
+      addSourcesButton(msg.id || 'msg-' + Date.now(), msg.peer_answers);
+    }
     container.appendChild(row);
   }
 }
@@ -648,8 +651,11 @@ function createAssistantRow(msgId, routing) {
   body.className = 'assistant-body md-content';
   body.id = 'body-' + msgId;
 
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+
   const copyBtn = document.createElement('button');
-  copyBtn.className = 'copy-msg-btn';
+  copyBtn.className = 'msg-action-btn';
   copyBtn.textContent = 'copy';
   copyBtn.addEventListener('click', () => {
     const bodyEl = content.querySelector('.assistant-body');
@@ -659,10 +665,11 @@ function createAssistantRow(msgId, routing) {
       setTimeout(() => { copyBtn.textContent = 'copy'; }, 1500);
     });
   });
+  actions.appendChild(copyBtn);
 
   content.appendChild(header);
   content.appendChild(body);
-  content.appendChild(copyBtn);
+  content.appendChild(actions);
   row.appendChild(content);
   return row;
 }
@@ -744,6 +751,61 @@ function updateRoutingBadgeUI(msgId, routing) {
       header.appendChild(buildRoutingBadge(routing));
     }
   }
+}
+
+function addSourcesButton(msgId, peerData) {
+  const row = document.getElementById('row-' + msgId);
+  if (!row) return;
+  const actions = row.querySelector('.msg-actions');
+  if (!actions || actions.querySelector('.sources-btn')) return;
+
+  const btn = document.createElement('button');
+  btn.className = 'msg-action-btn sources-btn';
+  btn.textContent = 'sources';
+  btn.addEventListener('click', () => {
+    const content = row.querySelector('.assistant-content');
+    let panel = content.querySelector('.sources-panel');
+    if (!panel) {
+      panel = buildSourcesPanel(peerData);
+      content.insertBefore(panel, actions);
+    }
+    const open = panel.classList.toggle('open');
+    btn.classList.toggle('active', open);
+  });
+  actions.insertBefore(btn, actions.firstChild);
+}
+
+function buildSourcesPanel(data) {
+  const panel = document.createElement('div');
+  panel.className = 'sources-panel';
+
+  const blocks = [];
+  if (data.local_answer) {
+    blocks.push({ label: `Local — ${data.local_pack || 'local'}`, text: data.local_answer });
+  }
+  if (data.expert_answer) {
+    blocks.push({ label: 'Peer — expert', text: data.expert_answer });
+  }
+  if (data.contrarian_answer) {
+    const label = data.mode === 'delegate' ? 'Peer — critical review' : 'Peer — expert 2';
+    blocks.push({ label, text: data.contrarian_answer });
+  }
+
+  blocks.forEach(b => {
+    const block = document.createElement('div');
+    block.className = 'source-block';
+    const lbl = document.createElement('div');
+    lbl.className = 'source-label';
+    lbl.textContent = b.label;
+    const body = document.createElement('div');
+    body.className = 'source-body';
+    body.textContent = b.text;
+    block.appendChild(lbl);
+    block.appendChild(body);
+    panel.appendChild(block);
+  });
+
+  return panel;
 }
 
 function addToolBadge(msgId, label) {
@@ -887,6 +949,8 @@ async function sendMessage() {
           updateRoutingBadgeUI(msgId, routingMode);
         } else if (data.type === 'tool_used') {
           addToolBadge(msgId, data.value);
+        } else if (data.type === 'peer_answers') {
+          addSourcesButton(msgId, data.value);
         } else if (data.type === 'status') {
           updateStatusText(msgId, data.value);
         } else if (data.type === 'token') {

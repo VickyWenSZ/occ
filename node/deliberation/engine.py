@@ -406,7 +406,7 @@ def _build_synthesis_prompt(query: str, perspective_a: str, perspective_b: str, 
         parts.append(
             "Integrate both expert perspectives into a single, complete, well-organized answer. "
             "Each perspective covers a different domain — combine them coherently. "
-            "Respond in the same language as the user's original question above."
+            f"Respond in the same language as this question: «{query}»"
         )
     else:
         if perspective_a:
@@ -416,7 +416,7 @@ def _build_synthesis_prompt(query: str, perspective_a: str, perspective_b: str, 
         parts.append(
             "Synthesize the above into a single, complete, well-organized answer. "
             "Resolve disagreements and keep the strongest points. "
-            "Respond in the same language as the user's original question above."
+            f"Respond in the same language as this question: «{query}»"
         )
     return "".join(parts)
 
@@ -431,7 +431,7 @@ def _build_hybrid_synthesis_prompt(query: str, local_answer: str, peer_answers: 
     parts.append(
         "Synthesize all knowledge sources into a single, well-organized answer. "
         "Combine coherently, eliminate repetition. Be proportional to the original question. "
-        "Respond in the same language as the user's original question above."
+        f"Respond in the same language as this question: «{query}»"
     )
     return "".join(parts)
 
