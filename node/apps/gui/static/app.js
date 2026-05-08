@@ -391,15 +391,15 @@ function startRename(id, currentTitle, titleSpan) {
 // ── Slash command tooltip ─────────────────────────────────────────────────────
 
 const SLASH_COMMANDS = [
-  { cmd: '/clear',          desc: 'Clear conversation history' },
+  { cmd: '/clear',          desc: 'Clear conversation history and reset context' },
   { cmd: '/status',         desc: 'Show current config' },
-  { cmd: '/packs',          desc: 'List all loaded packs' },
-  { cmd: '/peers',          desc: 'Show active peer nodes' },
-  { cmd: '/local on',       desc: 'Use local packs only (Forge / private)' },
+  { cmd: '/packs',          desc: 'List all loaded packs and domains' },
+  { cmd: '/peers',          desc: 'Show active peer nodes on the broker' },
+  { cmd: '/local on',       desc: 'Use local packs only — for private Forge packs' },
   { cmd: '/local off',      desc: 'Use server packs (default)' },
-  { cmd: '/load',           desc: 'Load model into VRAM' },
+  { cmd: '/load',           desc: 'Reload model into VRAM' },
   { cmd: '/unload',         desc: 'Unload model from VRAM' },
-  { cmd: '/openrouter on',  desc: 'Switch to OpenRouter' },
+  { cmd: '/openrouter on',  desc: 'Switch to OpenRouter (if configured)' },
   { cmd: '/openrouter off', desc: 'Switch to local model' },
 ];
 

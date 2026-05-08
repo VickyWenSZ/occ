@@ -529,12 +529,12 @@ _HELP_TEXT = """\
 /packs             list all loaded packs and domains
 /peers             show active peer nodes on the broker
 /status            show current config
-/local on          use local packs only (no server contact) — for private Forge packs
-/local off         use server packs (default — community-signed, approved)
+/local on          use local packs only — for private Forge packs
+/local off         use server packs (default)
 /unload            unload model from VRAM
 /load              reload model into VRAM
 /openrouter on     switch to OpenRouter (if configured)
-/openrouter off    switch to local model only"""
+/openrouter off    switch to local model"""
 
 
 class CommandBody(BaseModel):

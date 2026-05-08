@@ -448,15 +448,15 @@ html, body {
 .assistant-content {
   flex: 1;
   min-width: 0;
-  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .msg-actions {
-  position: absolute;
-  top: 0;
-  right: 0;
   display: flex;
+  justify-content: flex-end;
   gap: 4px;
+  margin-top: 0.375rem;
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--t-fast);
