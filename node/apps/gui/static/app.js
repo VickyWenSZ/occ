@@ -68,6 +68,31 @@ async function init() {
   if (cfg) { config = cfg; updateProviderBadge(!!cfg.openrouter_configured, cfg.openrouter_model); }
   await loadChats();
   showApp();
+  initGpuIndicator();
+}
+
+// ── GPU indicator ─────────────────────────────────────────────────────────
+
+let _gpuPollTimer = null;
+
+async function initGpuIndicator() {
+  const data = await apiFetch('/api/gpu_stats');
+  if (!data || data.gpu_pct === null || data.gpu_pct === undefined) return;
+  document.getElementById('gpu-indicator').classList.remove('hidden');
+  _updateGpuBar(data.gpu_pct);
+  _gpuPollTimer = setInterval(async () => {
+    const d = await apiFetch('/api/gpu_stats');
+    if (d && d.gpu_pct !== null && d.gpu_pct !== undefined) _updateGpuBar(d.gpu_pct);
+  }, 2000);
+}
+
+function _updateGpuBar(pct) {
+  const fill = document.getElementById('gpu-bar-fill');
+  const text = document.getElementById('gpu-pct-text');
+  if (!fill || !text) return;
+  fill.style.width = pct + '%';
+  fill.className = 'gpu-bar-fill' + (pct >= 85 ? ' crit' : pct >= 60 ? ' warn' : '');
+  text.textContent = pct + '%';
 }
 
 async function pollUntilReady() {
@@ -198,6 +223,13 @@ function updateSendButton() {
   btn.disabled = isStreaming || !hasContent;
 }
 
+function setStreamingState(active) {
+  isStreaming = active;
+  updateSendButton();
+  const sidebar = document.querySelector('.sidebar');
+  if (sidebar) sidebar.classList.toggle('is-streaming', active);
+}
+
 // ── File attachments ─────────────────────────────────────────────────────────
 
 function handleFiles(files) {
@@ -255,6 +287,7 @@ async function loadChats() {
 }
 
 async function newChat() {
+  if (isStreaming) return;
   const data = await apiFetch('/api/chats', { method: 'POST' });
   if (!data) return;
   await loadChats();
@@ -262,6 +295,7 @@ async function newChat() {
 }
 
 async function selectChat(id) {
+  if (isStreaming) return;
   currentChatId = id;
 
   // Update active state in sidebar
@@ -287,6 +321,7 @@ async function selectChat(id) {
 
 async function deleteChat(id, e) {
   e.stopPropagation();
+  if (isStreaming) return;
   await apiFetch(`/api/chats/${id}`, { method: 'DELETE' });
   if (currentChatId === id) {
     currentChatId = null;
@@ -573,6 +608,16 @@ function appendMessageToUI(msg) {
   } else if (msg.role === 'assistant') {
     const row = createAssistantRow(msg.id || 'msg-' + Date.now(), msg.routing || '');
     row.querySelector('.assistant-body').innerHTML = renderMarkdown(msg.content);
+    if (msg.tools?.length) {
+      const header = row.querySelector('.assistant-header');
+      msg.tools.forEach(label => {
+        const badge = document.createElement('span');
+        badge.className = 'tool-badge';
+        badge.dataset.tool = label;
+        badge.textContent = label;
+        header.appendChild(badge);
+      });
+    }
     container.appendChild(row);
   }
 }
@@ -603,8 +648,21 @@ function createAssistantRow(msgId, routing) {
   body.className = 'assistant-body md-content';
   body.id = 'body-' + msgId;
 
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'copy-msg-btn';
+  copyBtn.textContent = 'copy';
+  copyBtn.addEventListener('click', () => {
+    const bodyEl = content.querySelector('.assistant-body');
+    if (!bodyEl) return;
+    navigator.clipboard.writeText(bodyEl.innerText).then(() => {
+      copyBtn.textContent = 'copied!';
+      setTimeout(() => { copyBtn.textContent = 'copy'; }, 1500);
+    });
+  });
+
   content.appendChild(header);
   content.appendChild(body);
+  content.appendChild(copyBtn);
   row.appendChild(content);
   return row;
 }
@@ -679,8 +737,24 @@ function updateRoutingBadgeUI(msgId, routing) {
   const existing = header.querySelector('.routing-badge');
   if (existing) existing.remove();
   if (routing) {
-    header.appendChild(buildRoutingBadge(routing));
+    const firstToolBadge = header.querySelector('.tool-badge');
+    if (firstToolBadge) {
+      header.insertBefore(buildRoutingBadge(routing), firstToolBadge);
+    } else {
+      header.appendChild(buildRoutingBadge(routing));
+    }
   }
+}
+
+function addToolBadge(msgId, label) {
+  const header = document.getElementById('header-' + msgId);
+  if (!header) return;
+  if (header.querySelector(`.tool-badge[data-tool="${label}"]`)) return;
+  const badge = document.createElement('span');
+  badge.className = 'tool-badge';
+  badge.dataset.tool = label;
+  badge.textContent = label;
+  header.appendChild(badge);
 }
 
 function updateStreamingBody(msgId, tokens) {
@@ -765,8 +839,7 @@ async function sendMessage() {
   const msgId = 'streaming-' + Date.now();
   addLoadingMessage(msgId);
 
-  isStreaming = true;
-  updateSendButton();
+  setStreamingState(true);
 
   let tokens = '';
   let routingMode = '';
@@ -812,6 +885,8 @@ async function sendMessage() {
         if (data.type === 'routing') {
           routingMode = data.value;
           updateRoutingBadgeUI(msgId, routingMode);
+        } else if (data.type === 'tool_used') {
+          addToolBadge(msgId, data.value);
         } else if (data.type === 'status') {
           updateStatusText(msgId, data.value);
         } else if (data.type === 'token') {
@@ -839,8 +914,7 @@ async function sendMessage() {
     const body = document.getElementById('body-' + msgId);
     if (body) body.innerHTML = `<span style="color:var(--red)">Error: ${escapeHtml(err.message)}</span>`;
   } finally {
-    isStreaming = false;
-    updateSendButton();
+    setStreamingState(false);
     textarea.focus();
   }
 }

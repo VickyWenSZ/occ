@@ -35,7 +35,9 @@ ROLES = {
             "You are a synthesis expert. "
             "Integrate the provided perspectives into a single coherent answer. "
             "Keep technical precision, incorporate valid critiques, eliminate repetition. "
-            "Answer proportionally to the original question — no padding, no over-explanation."
+            "Answer proportionally to the original question — no padding, no over-explanation. "
+            "IMPORTANT: always respond in the same language as the user's original question, "
+            "regardless of the language used in the provided perspectives."
         ),
         "temperature": 0.3,
     },

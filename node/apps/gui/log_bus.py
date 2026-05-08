@@ -3,6 +3,7 @@ Thread-safe log bus: broker_agent writes here, GUI SSE endpoint streams from her
 """
 import asyncio
 from collections import deque
+from datetime import datetime
 
 _MAX = 2000
 _lines: deque = deque(maxlen=_MAX)
@@ -17,6 +18,8 @@ def set_loop(loop: asyncio.AbstractEventLoop):
 
 def write(msg: str):
     """Append a log line. Call from any thread."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    msg = f"[{ts}] {msg}"
     _lines.append(msg)
     if _loop and not _loop.is_closed():
         for q in _listeners:

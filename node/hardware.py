@@ -2,13 +2,13 @@
 Hardware detection and tier selection for OCC Node.
 
 Tiers (lowest to highest):
-  micro  — CPU only        — qwen3.5:2b
-  small  — 4GB  VRAM       — qwen3.5:4b
-  mid    — 8GB  VRAM       — qwen3.5:9b        (8GB is minimum, 10GB+ comfortable)
-  large  — 16GB VRAM       — qwen3.6:27b
-  xl-32  — 32GB VRAM       — qwen3.5-122b-a10b:IQ2_M
-  xl-48  — 48GB VRAM       — qwen3.5-122b-a10b:IQ3_S
-  server — 64GB VRAM       — qwen3.5-122b-a10b:Q4_K_M
+  micro    — CPU only        — qwen3.5:2b
+  small    — 4GB  VRAM       — qwen3.5:4b
+  mid      — 8GB  VRAM       — qwen3.5:9b          (Q4_K_M,  5.97 GB)
+  large    — 16GB VRAM       — qwen3.5:9b-q8_0     (Q8_0,    9.53 GB)
+  xl       — 24GB VRAM       — qwen3.5:9b-bf16      (BF16,   19    GB)
+  server-s — 32GB VRAM       — qwen3.6:27b           (Q4_K_M, 16.8  GB)
+  server-l — 80GB VRAM       — qwen3.6:27b-bf16     (BF16,   56    GB)
 """
 import subprocess
 import shutil
@@ -23,40 +23,40 @@ from urllib.error import URLError
 
 TIERS = [
     {
-        "name": "server",
-        "vram_min_gb": 64,
-        "vram_comfortable_gb": 72,
-        "model": "qwen3.5-122b-a10b:Q4_K_M",
+        "name": "server-l",
+        "vram_min_gb": 80,
+        "vram_comfortable_gb": 84,
+        "model": "qwen3.6:27b-bf16",
         "num_ctx_answer": 131072,
         "num_ctx_synth": 131072,
-        "retrieval_chars": 80_000,   # ~22K tokens, leaves 109K for history+system+response
+        "retrieval_chars": 65_000,
     },
     {
-        "name": "xl-48",
-        "vram_min_gb": 48,
-        "vram_comfortable_gb": 52,
-        "model": "qwen3.5-122b-a10b:IQ3_S",
-        "num_ctx_answer": 131072,
-        "num_ctx_synth": 131072,
-        "retrieval_chars": 80_000,
-    },
-    {
-        "name": "xl-32",
+        "name": "server-s",
         "vram_min_gb": 32,
         "vram_comfortable_gb": 36,
-        "model": "qwen3.5-122b-a10b:IQ2_M",
+        "model": "qwen3.6:27b",
+        "num_ctx_answer": 131072,
+        "num_ctx_synth": 131072,
+        "retrieval_chars": 65_000,
+    },
+    {
+        "name": "xl",
+        "vram_min_gb": 24,
+        "vram_comfortable_gb": 28,
+        "model": "qwen3.5:9b-bf16",
         "num_ctx_answer": 65536,
         "num_ctx_synth": 65536,
-        "retrieval_chars": 40_000,   # ~11K tokens, leaves 54K for history+system+response
+        "retrieval_chars": 32_000,
     },
     {
         "name": "large",
         "vram_min_gb": 16,
         "vram_comfortable_gb": 20,
-        "model": "qwen3.6:27b",
+        "model": "qwen3.5:9b-q8_0",
         "num_ctx_answer": 65536,
         "num_ctx_synth": 65536,
-        "retrieval_chars": 40_000,
+        "retrieval_chars": 32_000,
     },
     {
         "name": "mid",
@@ -65,7 +65,7 @@ TIERS = [
         "model": "qwen3.5:9b",
         "num_ctx_answer": 32768,
         "num_ctx_synth": 32768,
-        "retrieval_chars": 16_000,   # ~4.5K tokens, leaves 28K for history+system+response
+        "retrieval_chars": 16_000,
     },
     {
         "name": "small",
@@ -271,3 +271,42 @@ def pull_model_stream(model: str):
         completed = getattr(progress, "completed", 0) or 0
         total = getattr(progress, "total", 0) or 0
         yield status, completed, total
+
+
+# ---------------------------------------------------------------------------
+# GPU utilization (real-time, 0-100 or None)
+# ---------------------------------------------------------------------------
+
+def gpu_utilization_pct() -> int | None:
+    """Return GPU utilization % (0-100) or None if hardware not supported."""
+    pct = _gpu_util_nvidia()
+    if pct is not None:
+        return pct
+    return _gpu_util_amd_linux()
+
+
+def _gpu_util_nvidia() -> int | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            values = [int(l.strip()) for l in result.stdout.strip().splitlines() if l.strip().isdigit()]
+            if values:
+                return max(values)
+    except Exception:
+        pass
+    return None
+
+
+def _gpu_util_amd_linux() -> int | None:
+    if platform.system() != "Linux":
+        return None
+    try:
+        paths = sorted(Path("/sys/class/drm").glob("card*/device/gpu_busy_percent"))
+        if paths:
+            return int(paths[0].read_text().strip())
+    except Exception:
+        pass
+    return None

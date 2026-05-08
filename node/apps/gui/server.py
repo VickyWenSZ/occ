@@ -74,6 +74,7 @@ def _add_message_to_chat(
     content: str,
     routing: str = "",
     attachments: list | None = None,
+    tools: list | None = None,
 ):
     chats = _load_chats()
     for c in chats:
@@ -88,6 +89,8 @@ def _add_message_to_chat(
                 msg["routing"] = routing
             if attachments:
                 msg["attachments"] = attachments
+            if tools:
+                msg["tools"] = tools
             c["messages"].append(msg)
             if role == "user" and len(c["messages"]) == 1:
                 c["title"] = content[:60].strip() or "New Chat"
@@ -247,6 +250,14 @@ async def get_status():
         "error": _init_status if _init_status in error_states else None,
         "ollama_download_url": OLLAMA_DOWNLOAD_URL,
     }
+
+
+@app.get("/api/gpu_stats")
+async def get_gpu_stats():
+    from node.hardware import gpu_utilization_pct
+    loop = asyncio.get_event_loop()
+    pct = await loop.run_in_executor(None, gpu_utilization_pct)
+    return {"gpu_pct": pct}
 
 
 @app.get("/api/config")
@@ -421,6 +432,7 @@ async def chat_query(chat_id: str, body: QueryBody):
         tokens: list[str] = []
         routing_mode = ""
         peer_data: dict | None = None
+        tools_used: list[str] = []
 
         while True:
             item = await q.get()
@@ -433,12 +445,15 @@ async def chat_query(chat_id: str, body: QueryBody):
                 routing_mode = value
             elif kind == "peer_answers":
                 peer_data = value
+            elif kind == "tool_used" and value not in tools_used:
+                tools_used.append(value)
 
             yield f"data: {json.dumps({'type': kind, 'value': value})}\n\n"
 
         answer = "".join(tokens).strip()
         if answer:
-            _add_message_to_chat(chat_id, "assistant", answer, routing=routing_mode)
+            _add_message_to_chat(chat_id, "assistant", answer, routing=routing_mode,
+                                  tools=tools_used or None)
             _engine.add_to_history(full_query, answer)
             if peer_data:
                 _write_deliberation_log(body.message, peer_data, answer)

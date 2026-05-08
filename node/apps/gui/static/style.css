@@ -203,6 +203,16 @@ html, body {
   padding: 0.25rem 0.5rem;
 }
 
+.sidebar.is-streaming .chat-list {
+  pointer-events: none;
+  opacity: 0.4;
+  transition: opacity var(--t-fast);
+}
+.sidebar.is-streaming .btn-new-chat {
+  pointer-events: none;
+  opacity: 0.4;
+}
+
 .chat-group-label {
   font-family: var(--font-mono);
   font-size: 0.625rem;
@@ -438,6 +448,33 @@ html, body {
 .assistant-content {
   flex: 1;
   min-width: 0;
+  position: relative;
+}
+
+.copy-msg-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-ghost);
+  padding: 2px 7px;
+  font-size: 0.6875rem;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  line-height: 1.6;
+}
+.assistant-content:hover .copy-msg-btn {
+  opacity: 1;
+  pointer-events: auto;
+}
+.copy-msg-btn:hover {
+  color: var(--text-muted);
+  border-color: var(--border-subtle);
 }
 .assistant-header {
   display: flex;
@@ -467,6 +504,19 @@ html, body {
 .routing-badge.local    { color: #4ade80; border-color: var(--green-border); background: var(--green-bg); }
 .routing-badge.delegate { color: #c084fc; border-color: #7e22ce; background: #1a0030; }
 .routing-badge.hybrid   { color: var(--blue); border-color: #075985; background: #001a2e; }
+
+.tool-badge {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 0.125rem 0.375rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid #92400e;
+  color: var(--amber);
+  background: #1c0a00;
+}
 
 .assistant-body {
   color: var(--text-body);
@@ -788,6 +838,46 @@ html, body {
   color: var(--amber);
   border-color: #92400e;
   background: #1c0a00;
+}
+
+/* ── GPU indicator ──────────────────────────────────────────────────────── */
+
+.gpu-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  flex-shrink: 0;
+}
+.gpu-label {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  color: var(--text-ghost);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  user-select: none;
+}
+.gpu-bar-track {
+  width: 48px;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.gpu-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--green);
+  border-radius: 2px;
+  transition: width 0.8s ease, background 0.4s ease;
+}
+.gpu-bar-fill.warn { background: var(--amber); }
+.gpu-bar-fill.crit { background: var(--red); }
+.gpu-pct {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  color: var(--text-faint);
+  min-width: 2.5ch;
+  user-select: none;
 }
 
 /* ── Logs / Terminal panel ───────────────────────────────────────────────── */

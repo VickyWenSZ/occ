@@ -19,6 +19,17 @@ def _tool_status(fn_name: str, fn_args: dict) -> str:
     return f"Running {fn_name}..."
 
 
+def _tool_label(fn_name: str) -> str:
+    return {
+        "web_search": "WEB",
+        "fetch_url":  "URL",
+        "read_file":  "FILE",
+        "write_file": "FILE",
+        "list_files": "FILE",
+        "run_code":   "CODE",
+    }.get(fn_name, fn_name.upper())
+
+
 _OCC_IDENTITY = (
     "You are OCC (Open Cognitive Commons), a helpful and friendly AI assistant. "
     "You run locally on the user's machine as part of a distributed network of AI agents. "
@@ -286,6 +297,7 @@ class DeliberationEngine:
                 fn = TOOL_FUNCTIONS.get(fn_name)
                 if fn:
                     yield ("status", _tool_status(fn_name, fn_args))
+                    yield ("tool_used", _tool_label(fn_name))
                     result = fn(**fn_args)
                 else:
                     result = f"Unknown tool: {fn_name}"
@@ -393,7 +405,8 @@ def _build_synthesis_prompt(query: str, perspective_a: str, perspective_b: str, 
             parts.append(f"[Expert perspective 2]\n{perspective_b}\n\n")
         parts.append(
             "Integrate both expert perspectives into a single, complete, well-organized answer. "
-            "Each perspective covers a different domain — combine them coherently."
+            "Each perspective covers a different domain — combine them coherently. "
+            "Respond in the same language as the user's original question above."
         )
     else:
         if perspective_a:
@@ -402,7 +415,8 @@ def _build_synthesis_prompt(query: str, perspective_a: str, perspective_b: str, 
             parts.append(f"[Critical review]\n{perspective_b}\n\n")
         parts.append(
             "Synthesize the above into a single, complete, well-organized answer. "
-            "Resolve disagreements and keep the strongest points."
+            "Resolve disagreements and keep the strongest points. "
+            "Respond in the same language as the user's original question above."
         )
     return "".join(parts)
 
@@ -416,7 +430,8 @@ def _build_hybrid_synthesis_prompt(query: str, local_answer: str, peer_answers: 
             parts.append(f"[Peer node {i} knowledge]\n{ans}\n\n")
     parts.append(
         "Synthesize all knowledge sources into a single, well-organized answer. "
-        "Combine coherently, eliminate repetition. Be proportional to the original question."
+        "Combine coherently, eliminate repetition. Be proportional to the original question. "
+        "Respond in the same language as the user's original question above."
     )
     return "".join(parts)
 
