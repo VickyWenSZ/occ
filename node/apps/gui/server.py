@@ -570,10 +570,12 @@ async def run_command(body: CommandBody):
 
     if cmd == "/peers":
         import httpx as _httpx
-        try:
+        def _fetch():
             r = _httpx.get("https://broker.opencognitivecommons.org/nodes", timeout=10.0)
             r.raise_for_status()
-            data = r.json()
+            return r.json()
+        try:
+            data = await asyncio.to_thread(_fetch)
         except Exception as e:
             return {"output": f"Error reaching broker: {e}"}
         if not data:
