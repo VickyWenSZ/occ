@@ -695,10 +695,28 @@ function addLoadingMessage(msgId) {
   statusLine.id = 'status-' + msgId;
   statusLine.innerHTML = `<span class="status-dot"></span><span id="status-text-${msgId}">Thinking...</span>`;
 
-  row.querySelector('.assistant-body').appendChild(statusLine);
+  const logContainer = document.createElement('div');
+  logContainer.className = 'status-log';
+  logContainer.id = 'status-log-' + msgId;
+
+  const body = row.querySelector('.assistant-body');
+  body.appendChild(statusLine);
+  body.appendChild(logContainer);
   container.appendChild(row);
   scrollToBottom();
   _startWordCycle(msgId, 'Thinking');
+}
+
+function appendStatusLog(msgId, text) {
+  const log = document.getElementById('status-log-' + msgId);
+  if (!log) return;
+  const prev = log.querySelectorAll('.status-log-line');
+  prev.forEach(l => l.classList.remove('active'));
+  const line = document.createElement('div');
+  line.className = 'status-log-line active';
+  line.innerHTML = `<span class="status-log-connector">└─</span><span class="status-log-text">${escapeHtml(text.replace(/\.+$/, ''))}</span>`;
+  log.appendChild(line);
+  scrollToBottom();
 }
 
 const _OCC_WORDS = [
@@ -824,6 +842,8 @@ function updateStreamingBody(msgId, tokens) {
   if (!body) return;
   const status = document.getElementById('status-' + msgId);
   if (status) status.remove();
+  const log = document.getElementById('status-log-' + msgId);
+  if (log) log.remove();
   body.innerHTML = renderMarkdown(tokens) + '<span class="cursor-blink"></span>';
   scrollToBottom();
 }
@@ -953,6 +973,7 @@ async function sendMessage() {
           addSourcesButton(msgId, data.value);
         } else if (data.type === 'status') {
           updateStatusText(msgId, data.value);
+          appendStatusLog(msgId, data.value);
         } else if (data.type === 'token') {
           _stopWordCycle();
           tokens += data.value;

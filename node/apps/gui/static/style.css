@@ -590,6 +590,31 @@ html, body {
   50%       { opacity: 0.4; transform: scale(1.3); }
 }
 
+/* Status log */
+.status-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-top: 0.25rem;
+  padding-left: 0.125rem;
+}
+.status-log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-ghost);
+}
+.status-log-line.active {
+  color: var(--text-faint);
+}
+.status-log-connector {
+  color: var(--border-active);
+  flex-shrink: 0;
+  user-select: none;
+}
+
 /* Typing cursor */
 .cursor-blink {
   display: inline-block;
