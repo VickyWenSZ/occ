@@ -116,7 +116,7 @@ class DeliberationEngine:
             yield from self._stream_with_tools(self._chat_system, query, temperature=0.7, images=images)
             return
 
-        # DELIBERATE — retrieval + knowledge answer
+        # DELIBERATE / NETWORK — retrieval + knowledge answer
         context = (
             self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
             if self.expert_pack
@@ -125,7 +125,8 @@ class DeliberationEngine:
         local_relevant = len(context) >= _LOCAL_RELEVANCE_THRESHOLD
         local_sufficient = len(context) >= _LOCAL_SUFFICIENT_THRESHOLD
 
-        if local_sufficient:
+        # network mode (!) bypasses local_sufficient — always consults peers
+        if local_sufficient and mode != "network":
             yield ("routing", "local")
             yield ("status", "Answering from local knowledge...")
             yield from self._deliberate_local(query, context, images=images)

@@ -894,7 +894,7 @@ async function sendMessage() {
   let forcedMode = 'auto';
   let actualMessage = message;
   if (message.startsWith('!')) {
-    forcedMode = 'deliberate';
+    forcedMode = 'network';
     actualMessage = message.slice(1).trim();
   }
 
