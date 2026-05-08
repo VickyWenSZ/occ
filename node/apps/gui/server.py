@@ -517,7 +517,7 @@ async def list_peers():
 _HELP_TEXT = """\
 /?  /help          show this help
 /clear             clear conversation history and reset context
-! <query>          force knowledge retrieval (bypass classifier)
+! <query>          force network mode — consult peers regardless of local knowledge
 /model <name>      switch model  (e.g. /model deepseek-r1:14b)
 /pack <name>       load a specific pack  (e.g. /pack docker)
 /packs             list all loaded packs and domains
