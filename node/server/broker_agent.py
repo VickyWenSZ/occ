@@ -1,10 +1,6 @@
 """
 OCC Broker Agent — connects to broker.opencognitivecommons.org via WebSocket,
-registers this node, and handles incoming query messages.
-
-Usage:
-    OCC_PACK=mcp python -m node.server.broker_agent
-    OCC_PACK=docker OCC_MODEL=qwen3.5:9b python -m node.server.broker_agent
+registers this node, and handles incoming Critic query messages.
 """
 import asyncio
 import json
@@ -20,8 +16,8 @@ sys.path.insert(0, str(ROOT))
 
 from node.server.node_id import NODE_ID as _NODE_ID
 from node.deliberation.roles import ROLES
-from node.expert_runtime.pack import load_all_packs
-from node.retrieval.search import load_embeddings
+from node.hardware import get_vram_used_mb, select_tier, detect_vram_gb
+from node.crypto import load_or_generate_keypair, pubkey_b64, encrypt as _encrypt, decrypt as _decrypt
 
 try:
     from node.apps.gui import log_bus as _log_bus
@@ -31,67 +27,62 @@ except ImportError:
 
 _MODEL = os.getenv("OCC_MODEL", "qwen3.5:9b")
 _BROKER_WS = os.getenv("OCC_BROKER_URL", "wss://broker.opencognitivecommons.org/ws")
-_retriever = load_all_packs(ROOT / "expert-packs")
+
+_PRIVATE_KEY, _PUBLIC_KEY = load_or_generate_keypair()
+_VRAM_MB = get_vram_used_mb()
+_TIER_NAME = select_tier(detect_vram_gb())["name"]
 
 
-def _load_manifest() -> dict:
-    return {
-        "pack": _retriever.name,
-        "domains": _retriever.domains,
-    }
+def _handle_query(payload_str: str, requester_pubkey: str) -> str:
+    """
+    Execute Critic role on received payload.
+    Decrypts payload if requester_pubkey provided (E2E), else plain JSON fallback.
+    """
+    if requester_pubkey:
+        raw = _decrypt(payload_str, _PRIVATE_KEY)
+        data = json.loads(raw.decode())
+    else:
+        data = json.loads(payload_str)
 
+    context = data.get("context", "")
+    expert_answer = data.get("expert_answer", "")
 
-def _compute_pack_centroid() -> list[float] | None:
-    """Average of all page embedding vectors across all loaded packs."""
-    all_vectors: list[list[float]] = []
-    for pack in _retriever.packs:
-        emb = load_embeddings(pack.wiki_dir)
-        if emb and emb.get("entries"):
-            for entry in emb["entries"]:
-                all_vectors.append(entry["vector"])
-    if not all_vectors:
-        return None
-    dim = len(all_vectors[0])
-    return [sum(v[i] for v in all_vectors) / len(all_vectors) for i in range(dim)]
+    if context:
+        prompt = (
+            f"[Knowledge context]\n{context}\n\n"
+            f"[Proposed answer]\n{expert_answer}\n\n"
+            "Review this answer critically. Find gaps, errors, missing cases."
+        )
+    else:
+        prompt = (
+            f"[Proposed answer]\n{expert_answer}\n\n"
+            "Review this answer critically. Find gaps, errors, missing cases."
+        )
 
-
-def _handle_query(query_text: str) -> str:
-    context = _retriever.retrieve(query_text) if _retriever.packs else ""
-    role_cfg = ROLES["expert"]
-    context_block = f"[Knowledge base context]\n{context}\n\n" if context else ""
-    prompt = (
-        f"{context_block}"
-        f"Question: {query_text}\n\n"
-        "Answer using the knowledge base context above. "
-        "Be proportional: a precise question deserves a precise answer, "
-        "a broad question can have a broader answer. No padding, no repetition."
-    )
     response = ollama.chat(
         model=_MODEL,
         messages=[
-            {"role": "system", "content": role_cfg["system"]},
+            {"role": "system", "content": ROLES["critic"]["system"]},
             {"role": "user", "content": prompt},
         ],
         think=False,
         keep_alive=-1,
-        options={
-            "temperature": role_cfg["temperature"],
-            "num_ctx": 6144,
-            "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
-        },
+        options={"temperature": 0.3, "num_ctx": 8192},
         stream=False,
     )
-    return response.message.content or ""
+    critique = response.message.content or ""
+    response_payload = json.dumps({"critique": critique}).encode()
+
+    if requester_pubkey:
+        return _encrypt(response_payload, requester_pubkey)
+    return response_payload.decode()
 
 
 async def run():
-    manifest = _load_manifest()
-    pack_embedding = _compute_pack_centroid()
-    _log(f"[OCC Node] ID        : {_NODE_ID}")
-    _log(f"[OCC Node] Packs     : {_retriever.name}")
-    _log(f"[OCC Node] Domains   : {manifest['domains']}")
-    _log(f"[OCC Node] Embedding : {'yes' if pack_embedding else 'no (nomic unavailable)'}")
-    _log(f"[OCC Node] Broker    : {_BROKER_WS}")
+    _log(f"[OCC Node] ID         : {_NODE_ID}")
+    _log(f"[OCC Node] Tier       : {_TIER_NAME}")
+    _log(f"[OCC Node] VRAM used  : {_VRAM_MB} MB")
+    _log(f"[OCC Node] Broker     : {_BROKER_WS}")
 
     while True:
         try:
@@ -99,12 +90,13 @@ async def run():
                 await ws.send(json.dumps({
                     "type": "register",
                     "node_id": _NODE_ID,
-                    "manifest": manifest,
-                    "pack_embedding": pack_embedding,
+                    "tier_name": _TIER_NAME,
+                    "vram_used_mb": _VRAM_MB,
+                    "public_key": pubkey_b64(_PUBLIC_KEY),
                 }))
                 msg = json.loads(await ws.recv())
                 if msg.get("type") == "registered":
-                    _log(f"[OCC Node] Registered with broker. Ready.")
+                    _log(f"[OCC Node] Registered. Tier={_TIER_NAME}, VRAM={_VRAM_MB}MB. Ready.")
 
                 async def heartbeat():
                     while True:
@@ -120,17 +112,21 @@ async def run():
                     msg = json.loads(raw)
                     if msg.get("type") == "query":
                         query_id = msg["query_id"]
-                        query_text = msg.get("text", "")
-                        _log(f"[OCC Node] Query: {query_text[:80]}...")
+                        from_node = msg.get("from_node", "")
+                        payload = msg.get("payload", "")
+                        requester_pubkey = msg.get("requester_pubkey", "")
+                        _log(f"[OCC Node] Critic request from {from_node[:8]}...")
                         loop = asyncio.get_event_loop()
-                        answer = await loop.run_in_executor(None, _handle_query, query_text)
+                        answer = await loop.run_in_executor(
+                            None, _handle_query, payload, requester_pubkey
+                        )
                         await ws.send(json.dumps({
                             "type": "response",
                             "query_id": query_id,
-                            "pack": _retriever.name,
-                            "text": answer,
+                            "to": from_node,
+                            "payload": answer,
                         }))
-                        _log(f"[OCC Node] Response sent ({len(answer)} chars)")
+                        _log(f"[OCC Node] Critic response sent ({len(answer)} chars)")
                     elif msg.get("type") == "pong":
                         pass
 

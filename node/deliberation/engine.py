@@ -1,4 +1,3 @@
-import re
 from datetime import datetime
 from .roles import ROLES
 
@@ -42,16 +41,12 @@ _OCC_IDENTITY = (
     "Only mention what domains or packs you have loaded if the user explicitly asks."
 )
 
-_LOCAL_RELEVANCE_THRESHOLD = 300
-_LOCAL_SUFFICIENT_THRESHOLD = 1500
-
 
 class DeliberationEngine:
     def __init__(
         self,
         model: str,
         expert_pack=None,
-        peers: list[str] | None = None,
         num_ctx_answer: int = 8192,
         num_ctx_synth: int = 12288,
         retrieval_chars: int = 8000,
@@ -59,12 +54,15 @@ class DeliberationEngine:
         workspace=None,
         openrouter_key: str = "",
         openrouter_model: str = "",
+        local_mode: bool = False,
+        vram_used_mb: int = 0,
     ):
         self.model = model
         self.or_key = openrouter_key
         self.or_model = openrouter_model
         self.expert_pack = expert_pack
-        self.peers = peers or []
+        self._local_mode = local_mode
+        self.vram_used_mb = vram_used_mb
         self.num_ctx_answer = num_ctx_answer
         self.num_ctx_synth = num_ctx_synth
         self.retrieval_chars = retrieval_chars
@@ -95,10 +93,6 @@ class DeliberationEngine:
         self._peak_ctx_used += prompt_tokens + completion_tokens
 
     def _measure_ctx(self, messages: list) -> int:
-        """Estimate total tokens from the actual messages array being sent to Ollama.
-        More accurate than accumulation — measures exactly what enters the context window.
-        ~3.5 chars per token for technical mixed-language content.
-        """
         total_chars = sum(len(m.get("content", "") or "") for m in messages)
         return int(total_chars / 3.5)
 
@@ -116,163 +110,269 @@ class DeliberationEngine:
             yield from self._stream_with_tools(self._chat_system, query, temperature=0.7, images=images)
             return
 
-        # DELIBERATE / NETWORK — retrieval + knowledge answer
-        context = (
-            self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
-            if self.expert_pack
-            else ""
-        )
-        local_relevant = len(context) >= _LOCAL_RELEVANCE_THRESHOLD
-        local_sufficient = len(context) >= _LOCAL_SUFFICIENT_THRESHOLD
-
-        # network mode (!) bypasses local_sufficient — always consults peers
-        if local_sufficient and mode != "network":
-            yield ("routing", "local")
-            yield ("status", "Answering from local knowledge...")
-            yield from self._deliberate_local(query, context, images=images)
-            return
-
-        yield from self._route_with_peers(query, context, local_relevant, images=images)
-
-    # ─── Routing logic ────────────────────────────────────────────────────────
-
-    def _route_with_peers(self, query: str, context: str, local_relevant: bool, images: list | None = None):
-        from node.server.client import fetch_peer_manifests
-
-        yield ("status", "Checking peer capabilities...")
-        manifests = fetch_peer_manifests()
-        if not manifests:
-            yield ("routing", "local")
-            yield ("status", "No peers available — answering locally...")
-            yield from self._deliberate_local(query, context, images=images)
-            return
-        node_ids = list(manifests.keys())
-        peer_assignments, additive = _assign_roles(query, node_ids, manifests)
-        peer_domain_match = _has_domain_match(query, node_ids, manifests)
-
-        if local_relevant and peer_domain_match:
-            yield ("routing", "hybrid")
-            roles_desc = ", ".join(r for u, r in peer_assignments)
-            yield ("status", f"Hybrid — {roles_desc}...")
-            yield from self._deliberate_hybrid(query, context, peer_assignments, additive, images=images)
-
-        elif peer_domain_match:
-            yield ("routing", "delegate")
-            roles_desc = ", ".join(r for u, r in peer_assignments)
-            yield ("status", f"Delegating to peers: {roles_desc}...")
-            yield from self._deliberate_distributed(query, peer_assignments, additive)
-
-        else:
-            yield ("routing", "local")
-            yield ("status", "Answering from local knowledge...")
-            yield from self._deliberate_local(query, context, images=images)
-
-    # ─── Mode: LOCAL ──────────────────────────────────────────────────────────
-
-    def _deliberate_local(self, query: str, context: str | None = None, images: list | None = None):
-        if context is None:
+        # Local mode: uses private packs, no server, no peers
+        if self._local_mode:
             context = (
                 self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
-                if self.expert_pack
-                else ""
+                if self.expert_pack else ""
             )
-        if context:
-            prompt = (
-                f"[Knowledge base context]\n{context}\n\n"
-                f"Question: {query}\n\n"
-                "Answer using the knowledge base context above. "
-                "Be proportional: a precise question deserves a precise answer, "
-                "a broad question can have a broader answer. No padding, no repetition."
-            )
-        else:
-            prompt = f"Question: {query}\n\nAnswer helpfully and concisely."
-        yield ("status", "Thinking...")
-        yield from self._stream_with_tools(
-            ROLES["answerer"]["system"], prompt,
-            temperature=ROLES["answerer"]["temperature"],
-            images=images,
-        )
-
-    # ─── Mode: DELEGATE ───────────────────────────────────────────────────────
-
-    def _deliberate_distributed(self, query: str, peer_assignments: list, additive: bool):
-        from node.server.client import call_peers_parallel
-
-        responses = call_peers_parallel(peer_assignments, query)
-        perspective_a, perspective_b = _collect_perspectives(responses, additive)
-
-        failed = [r for r in responses if r.error]
-        if failed:
-            names = ", ".join(r.role for r in failed)
-            yield ("status", f"Peer(s) failed ({names}), synthesizing with available...")
-
-        if not perspective_a and not perspective_b:
-            yield ("status", "All peers unavailable — falling back to local...")
-            yield from self._deliberate_local(query)
+            yield ("routing", "local_private")
+            yield from self._deliberate_multiagent(query, context)
             return
 
-        peer_a_url = peer_assignments[0][0] if peer_assignments else ""
-        peer_b_url = peer_assignments[1][0] if len(peer_assignments) > 1 else ""
-        yield ("peer_answers", {
-            "mode": "delegate",
-            "local_pack": "",
-            "local_answer": "",
-            "expert_peer": peer_a_url,
-            "contrarian_peer": peer_b_url,
-            "expert_answer": perspective_a,
-            "contrarian_answer": perspective_b,
-        })
+        yield ("status", "Retrieving knowledge...")
+        context = self._retrieve_from_server(query)
 
-        yield ("status", "Synthesizing...")
-        prompt = _build_synthesis_prompt(query, perspective_a, perspective_b, additive=additive)
-        for token in self._stream_synthesis(prompt):
-            yield ("token", token)
+        if context is None:
+            yield ("routing", "local_fallback")
+            yield ("status", "Server unavailable — using local packs...")
+            local_ctx = (
+                self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
+                if self.expert_pack else ""
+            )
+            yield from self._deliberate_multiagent(query, local_ctx)
+            return
 
-    # ─── Mode: HYBRID ─────────────────────────────────────────────────────────
+        best_peer = self._select_best_peer(mode)
+        if best_peer:
+            yield ("routing", "distributed")
+            yield from self._deliberate_with_peer(query, context or "", best_peer)
+        else:
+            if mode == "network":
+                yield ("status", "No peers available — running locally...")
+            yield ("routing", "local")
+            yield from self._deliberate_multiagent(query, context or "")
 
-    def _deliberate_hybrid(self, query: str, context: str, peer_assignments: list, additive: bool, images: list | None = None):
-        from node.server.client import call_peers_parallel
+    # ─── Retrieval ────────────────────────────────────────────────────────────
 
-        yield ("status", "Calling peers...")
-        responses = call_peers_parallel(peer_assignments, query)
-
-        yield ("status", "Generating local perspective...")
-        local_prompt = (
-            f"[Knowledge base context]\n{context}\n\n"
-            f"Question: {query}\n\n"
-            "Answer using the knowledge base context above. "
-            "Be proportional: a precise question deserves a precise answer, "
-            "a broad question can have a broader answer. No padding, no repetition."
+    def _retrieve_from_server(self, query: str) -> str | None:
+        import asyncio
+        from node.retrieval.pack_cache import (
+            get_cached_wiki_dirs, fetch_pages, select_sections,
+            download_all_indices,
         )
-        local_answer = self._generate_answer(local_prompt)
+        from node.retrieval.search import get_relevant_page_refs, relevant_pack_dirs
 
-        perspective_a, perspective_b = _collect_perspectives(responses, additive)
+        wiki_dirs = get_cached_wiki_dirs()
+        if not wiki_dirs:
+            ok = download_all_indices()
+            if not ok:
+                return None
+            wiki_dirs = get_cached_wiki_dirs()
+            if not wiki_dirs:
+                return None
 
-        failed = [r for r in responses if r.error]
-        if failed:
-            names = ", ".join(r.role for r in failed)
-            yield ("status", f"Peer(s) failed ({names}), synthesizing with available...")
+        relevant_dirs = relevant_pack_dirs(wiki_dirs, query)
+        if not relevant_dirs:
+            return ""
 
-        pack_name = self.expert_pack.name if self.expert_pack else "local"
-        peer_a_url = peer_assignments[0][0] if peer_assignments else ""
-        peer_b_url = peer_assignments[1][0] if len(peer_assignments) > 1 else ""
+        page_refs: list[dict] = []
+        for wiki_dir in relevant_dirs:
+            page_refs.extend(get_relevant_page_refs(wiki_dir, query, max_pages=6))
+        if not page_refs:
+            return ""
+
+        try:
+            pages = asyncio.run(fetch_pages(page_refs))
+        except RuntimeError:
+            return None
+
+        if pages is None:
+            return None
+        if not pages:
+            return ""
+
+        return select_sections(query, pages, max_chars=self.retrieval_chars)
+
+    # ─── Peer routing ─────────────────────────────────────────────────────────
+
+    def _select_best_peer(self, mode: str):
+        from node.server.client import fetch_peer_list
+        peers = fetch_peer_list()
+        if not peers:
+            return None
+        if mode == "network":
+            return max(peers, key=lambda p: p.vram_used_mb)
+        candidates = [p for p in peers if p.vram_used_mb > self.vram_used_mb]
+        return max(candidates, key=lambda p: p.vram_used_mb) if candidates else None
+
+    def _deliberate_with_peer(self, query: str, context: str, peer):
+        """Expert (local) → Critic (remote peer, E2E encrypted) → Synthesis (local, streaming)."""
+        from node.server.client import call_peer_critic
+        from node.crypto import load_or_generate_keypair
+        from node.provider import call as _provider_call, stream as _provider_stream
+
+        _priv, _pub = load_or_generate_keypair()
+
+        # Call 1 — Expert (local)
+        yield ("status", "Expert analyzing...")
+        if context:
+            expert_prompt = (
+                f"[Knowledge context]\n{context}\n\n"
+                f"Question: {query}\n\n"
+                "Answer using the knowledge above."
+            )
+        else:
+            expert_prompt = f"Question: {query}\n\nAnswer helpfully."
+        expert_resp = _provider_call(
+            messages=[
+                {"role": "system", "content": ROLES["expert"]["system"]},
+                {"role": "user", "content": expert_prompt},
+            ],
+            model_local=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+            tools=None,
+            temperature=ROLES["expert"]["temperature"],
+            num_ctx=self.num_ctx_answer,
+        )
+        expert_answer = expert_resp.content or ""
+
+        # Call 2 — Critic (remote peer)
+        yield ("status", f"Peer critic ({peer.tier_name})...")
+        critique = call_peer_critic(context, expert_answer, peer, _priv)
+
+        if critique is None:
+            yield ("status", "Peer unavailable — Critic running locally...")
+            if context:
+                critic_prompt = (
+                    f"[Knowledge context]\n{context}\n\n"
+                    f"[Proposed answer]\n{expert_answer}\n\n"
+                    "Review this answer critically."
+                )
+            else:
+                critic_prompt = (
+                    f"[Proposed answer]\n{expert_answer}\n\n"
+                    "Review this answer critically."
+                )
+            critic_resp = _provider_call(
+                messages=[
+                    {"role": "system", "content": ROLES["critic"]["system"]},
+                    {"role": "user", "content": critic_prompt},
+                ],
+                model_local=self.model,
+                or_key=self.or_key,
+                or_model=self.or_model,
+                tools=None,
+                temperature=ROLES["critic"]["temperature"],
+                num_ctx=self.num_ctx_answer,
+            )
+            critique = critic_resp.content or ""
+
         yield ("peer_answers", {
-            "mode": "hybrid",
-            "local_pack": pack_name,
-            "local_answer": local_answer,
-            "expert_peer": peer_a_url,
-            "contrarian_peer": peer_b_url,
-            "expert_answer": perspective_a,
-            "contrarian_answer": perspective_b,
+            "mode": "network",
+            "expert_draft": expert_answer,
+            "critic_review": critique,
+            "peer_tier": peer.tier_name,
         })
 
-        yield ("status", "Synthesizing local + peer knowledge...")
-        peer_answers = [a for a in [perspective_a, perspective_b] if a]
-        prompt = _build_hybrid_synthesis_prompt(query, local_answer, peer_answers)
-        for token in self._stream_synthesis(prompt):
+        # Call 3 — Synthesis (local, streaming)
+        yield ("status", "Synthesizing...")
+        synth_prompt = (
+            f"Original question: {query}\n\n"
+            f"Initial answer:\n{expert_answer}\n\n"
+            f"Critical review:\n{critique}\n\n"
+            "Produce the final improved answer."
+        )
+        for token in _provider_stream(
+            messages=[
+                {"role": "system", "content": ROLES["synthesizer"]["system"]},
+                {"role": "user", "content": synth_prompt},
+            ],
+            model_local=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+            temperature=ROLES["synthesizer"]["temperature"],
+            num_ctx=self.num_ctx_synth,
+        ):
             yield ("token", token)
 
-    # ─── Core LLM call — tools always available ───────────────────────────────
+    # ─── Local multiagent ─────────────────────────────────────────────────────
+
+    def _deliberate_multiagent(self, query: str, context: str):
+        """3-call sequential deliberation: Expert → Critic → Synthesis (streaming)."""
+        from node.provider import call as _provider_call, stream as _provider_stream
+
+        # Call 1 — Expert
+        yield ("status", "Expert analyzing...")
+        if context:
+            expert_prompt = (
+                f"[Knowledge context]\n{context}\n\n"
+                f"Question: {query}\n\n"
+                "Answer using the knowledge above."
+            )
+        else:
+            expert_prompt = f"Question: {query}\n\nAnswer helpfully."
+        expert_resp = _provider_call(
+            messages=[
+                {"role": "system", "content": ROLES["expert"]["system"]},
+                {"role": "user", "content": expert_prompt},
+            ],
+            model_local=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+            tools=None,
+            temperature=ROLES["expert"]["temperature"],
+            num_ctx=self.num_ctx_answer,
+        )
+        expert_answer = expert_resp.content or ""
+
+        # Call 2 — Critic
+        yield ("status", "Critic reviewing...")
+        if context:
+            critic_prompt = (
+                f"[Knowledge context]\n{context}\n\n"
+                f"[Proposed answer]\n{expert_answer}\n\n"
+                "Review this answer critically."
+            )
+        else:
+            critic_prompt = (
+                f"[Proposed answer]\n{expert_answer}\n\n"
+                "Review this answer critically."
+            )
+        critic_resp = _provider_call(
+            messages=[
+                {"role": "system", "content": ROLES["critic"]["system"]},
+                {"role": "user", "content": critic_prompt},
+            ],
+            model_local=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+            tools=None,
+            temperature=ROLES["critic"]["temperature"],
+            num_ctx=self.num_ctx_answer,
+        )
+        critique = critic_resp.content or ""
+
+        # Emit intermediate answers for Sources panel before streaming final answer
+        yield ("peer_answers", {
+            "mode": "local",
+            "expert_draft": expert_answer,
+            "critic_review": critique,
+        })
+
+        # Call 3 — Synthesis (streaming)
+        yield ("status", "Synthesizing...")
+        synth_prompt = (
+            f"Original question: {query}\n\n"
+            f"Initial answer:\n{expert_answer}\n\n"
+            f"Critical review:\n{critique}\n\n"
+            "Produce the final improved answer."
+        )
+        for token in _provider_stream(
+            messages=[
+                {"role": "system", "content": ROLES["synthesizer"]["system"]},
+                {"role": "user", "content": synth_prompt},
+            ],
+            model_local=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+            temperature=ROLES["synthesizer"]["temperature"],
+            num_ctx=self.num_ctx_synth,
+        ):
+            yield ("token", token)
+
+    # ─── Chat (tools) ─────────────────────────────────────────────────────────
 
     def _stream_with_tools(self, system: str, prompt: str, temperature: float = 0.7, images: list | None = None):
         from node.deliberation.tools import TOOL_SCHEMA, TOOL_FUNCTIONS
@@ -311,137 +411,3 @@ class DeliberationEngine:
                 else:
                     result = f"Unknown tool: {fn_name}"
                 messages.append(resp.tool_result(tc, result))
-
-    # ─── Non-streaming helpers (hybrid/synthesis) ─────────────────────────────
-
-    def _generate_answer(self, prompt: str) -> str:
-        from node.provider import call as _provider_call
-        cfg = ROLES["answerer"]
-        resp = _provider_call(
-            messages=[
-                {"role": "system", "content": cfg["system"]},
-                *self._history,
-                {"role": "user", "content": prompt},
-            ],
-            model_local=self.model,
-            or_key=self.or_key,
-            or_model=self.or_model,
-            tools=None,
-            temperature=cfg["temperature"],
-            num_ctx=self.num_ctx_answer,
-        )
-        return resp.content
-
-    def _stream_synthesis(self, prompt: str):
-        from node.provider import stream as _provider_stream
-        cfg = ROLES["synthesizer"]
-        yield from _provider_stream(
-            messages=[
-                {"role": "system", "content": cfg["system"]},
-                {"role": "user", "content": prompt},
-            ],
-            model_local=self.model,
-            or_key=self.or_key,
-            or_model=self.or_model,
-            temperature=cfg["temperature"],
-            num_ctx=self.num_ctx_synth,
-        )
-
-    # ─── Backward compat ──────────────────────────────────────────────────────
-
-    def deliberate_stream(self, query: str):
-        yield from self._deliberate_local(query)
-
-    def deliberate_stream_distributed(self, query: str):
-        yield from self._route_with_peers(query)
-
-
-# ─── Module-level helpers ─────────────────────────────────────────────────────
-
-def _collect_perspectives(responses, additive: bool) -> tuple[str, str]:
-    expert_responses = [r for r in responses if r.role == "expert" and not r.error]
-    contrarian_responses = [r for r in responses if r.role == "contrarian" and not r.error]
-    perspective_a = expert_responses[0].answer if expert_responses else ""
-    if additive and len(expert_responses) > 1:
-        perspective_b = expert_responses[1].answer
-    else:
-        perspective_b = contrarian_responses[0].answer if contrarian_responses else ""
-    return perspective_a, perspective_b
-
-
-def _has_domain_match(query: str, peers: list[str], manifests: dict[str, dict]) -> bool:
-    query_words = set(re.findall(r'[a-z]+', query.lower()))
-    for url in peers:
-        domains = manifests.get(url, {}).get("domains", [])
-        domain_words = set(w for d in domains for w in re.findall(r'[a-z]+', d.lower()))
-        if query_words & domain_words:
-            return True
-    return False
-
-
-def _assign_roles(query: str, peers: list[str], manifests: dict[str, dict]) -> tuple[list[tuple[str, str]], bool]:
-    query_words = set(re.findall(r'[a-z]+', query.lower()))
-    relevant, irrelevant = [], []
-    for url in peers:
-        domains = manifests.get(url, {}).get("domains", [])
-        domain_words = set(w for d in domains for w in re.findall(r'[a-z]+', d.lower()))
-        if query_words & domain_words:
-            relevant.append((url, domains))
-        else:
-            irrelevant.append((url, domains))
-
-    if not relevant:
-        return [(url, "expert") for url in peers], True
-    if len(relevant) == 1:
-        return [(relevant[0][0], "expert")], True
-
-    domains_a = set(re.findall(r'[a-z]+', " ".join(relevant[0][1]).lower()))
-    domains_b = set(re.findall(r'[a-z]+', " ".join(relevant[1][1]).lower()))
-    same_domain = bool(domains_a & domains_b)
-
-    if same_domain:
-        return [(relevant[0][0], "expert"), (relevant[1][0], "contrarian")], False
-    else:
-        return [(url, "expert") for url, _ in relevant[:2]], True
-
-
-def _build_synthesis_prompt(query: str, perspective_a: str, perspective_b: str, additive: bool = False) -> str:
-    parts = ["", f"Original question: {query}\n\n"]
-    if additive:
-        if perspective_a:
-            parts.append(f"[Expert perspective 1]\n{perspective_a}\n\n")
-        if perspective_b:
-            parts.append(f"[Expert perspective 2]\n{perspective_b}\n\n")
-        parts.append(
-            "Integrate both expert perspectives into a single, complete, well-organized answer. "
-            "Each perspective covers a different domain — combine them coherently. "
-            f"Respond in the same language as this question: «{query}»"
-        )
-    else:
-        if perspective_a:
-            parts.append(f"[Expert analysis]\n{perspective_a}\n\n")
-        if perspective_b:
-            parts.append(f"[Critical review]\n{perspective_b}\n\n")
-        parts.append(
-            "Synthesize the above into a single, complete, well-organized answer. "
-            "Resolve disagreements and keep the strongest points. "
-            f"Respond in the same language as this question: «{query}»"
-        )
-    return "".join(parts)
-
-
-def _build_hybrid_synthesis_prompt(query: str, local_answer: str, peer_answers: list[str]) -> str:
-    parts = ["", f"Original question: {query}\n\n"]
-    if local_answer:
-        parts.append(f"[Local node knowledge]\n{local_answer}\n\n")
-    for i, ans in enumerate(peer_answers, 1):
-        if ans:
-            parts.append(f"[Peer node {i} knowledge]\n{ans}\n\n")
-    parts.append(
-        "Synthesize all knowledge sources into a single, well-organized answer. "
-        "Combine coherently, eliminate repetition. Be proportional to the original question. "
-        f"Respond in the same language as this question: «{query}»"
-    )
-    return "".join(parts)
-
-

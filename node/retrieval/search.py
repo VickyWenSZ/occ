@@ -7,7 +7,7 @@ import ollama
 
 _EMBED_MODEL = "nomic-embed-text"
 _PAGE_SIMILARITY_THRESHOLD = 0.30   # min score to include a page within a pack
-_PACK_SIMILARITY_THRESHOLD = 0.60   # min score to consider a pack relevant at all
+_PACK_SIMILARITY_THRESHOLD = 0.35   # min score to consider a pack relevant at all
 
 _STOP_WORDS = {
     # Italian
@@ -151,10 +151,13 @@ def pack_max_similarity(wiki_dir: Path, query_vec: list[float]) -> float | None:
 
 def _keyword_relevant(wiki_dir: Path, query: str) -> bool:
     """Does this pack contain any meaningful query term?
-    Checks index.md entries first; if no index, scans concept files directly."""
+    Checks pack name, index.md entries; if no index, scans concept files directly."""
     terms = [t for t in re.findall(r'\w+', query.lower()) if len(t) > 2 and t not in _STOP_WORDS]
     if not terms:
         return False
+    pack_name = wiki_dir.parent.name.lower()
+    if any(t in pack_name or pack_name in t for t in terms):
+        return True
     entries = _parse_index(wiki_dir / "index.md")
     if entries:
         for entry in entries:
@@ -180,25 +183,75 @@ def _keyword_relevant(wiki_dir: Path, query: str) -> bool:
 
 def relevant_pack_dirs(wiki_dirs: list[Path], query: str) -> list[Path]:
     """Return which wiki dirs are semantically relevant to query.
-    Uses embeddings if available, keyword match as fallback per-pack.
-    If embeddings find nothing at all, retries with keyword as last resort."""
+
+    Priority:
+    1. If any pack name appears explicitly in the query terms, return only those packs.
+       (e.g. "occ" in query → only the occ pack, not all 0.35+ packs)
+    2. Otherwise return the single best-scoring pack via embeddings (above threshold).
+    3. Fall back to keyword match if embeddings unavailable.
+    """
+    # Step 1: explicit pack-name match — highest precision
+    terms = [t for t in re.findall(r'\w+', query.lower()) if len(t) > 2 and t not in _STOP_WORDS]
+    name_matches = [
+        wd for wd in wiki_dirs
+        if any(t in wd.parent.name.lower() or wd.parent.name.lower() in t for t in terms)
+    ]
+    if name_matches:
+        return name_matches
+
+    # Step 2: top-1 embedding pack (avoids multi-pack context dilution)
     query_vec = _embed(query)
-    result = []
-    for wd in wiki_dirs:
-        if query_vec is not None:
+    if query_vec is not None:
+        scored = []
+        for wd in wiki_dirs:
             sim = pack_max_similarity(wd, query_vec)
-            if sim is None:
-                if _keyword_relevant(wd, query):
-                    result.append(wd)
-            elif sim >= _PACK_SIMILARITY_THRESHOLD:
-                result.append(wd)
-        else:
-            if _keyword_relevant(wd, query):
-                result.append(wd)
-    # Last resort: if embeddings selected nothing, fall back to keyword for all packs
-    if not result and query_vec is not None:
-        result = [wd for wd in wiki_dirs if _keyword_relevant(wd, query)]
-    return result
+            if sim is not None:
+                scored.append((sim, wd))
+            elif _keyword_relevant(wd, query):
+                scored.append((_PACK_SIMILARITY_THRESHOLD, wd))
+        if scored:
+            scored.sort(reverse=True)
+            best_sim, best_wd = scored[0]
+            if best_sim >= _PACK_SIMILARITY_THRESHOLD:
+                return [best_wd]
+
+    # Step 3: keyword fallback
+    return [wd for wd in wiki_dirs if _keyword_relevant(wd, query)]
+
+
+# ── Server-mode ref extraction (no content read) ─────────────────────────────
+
+def get_relevant_page_refs(wiki_dir: Path, query: str, max_pages: int = 5) -> list[dict]:
+    """
+    Return [{pack, file, score}] for pages relevant to query WITHOUT reading content.
+    pack is derived from wiki_dir.parent.name.
+    Used by engine.py in server mode: engine fetches content remotely after calling this.
+    """
+    pack = wiki_dir.parent.name
+    query_vec = _embed(query)
+    emb = load_embeddings(wiki_dir)
+
+    if emb and query_vec is not None:
+        scored = [
+            (_cosine(query_vec, e["vector"]), e["file"])
+            for e in emb["entries"]
+        ]
+        scored = [(s, f) for s, f in scored if s >= _PAGE_SIMILARITY_THRESHOLD]
+        scored.sort(reverse=True)
+        return [{"pack": pack, "file": f, "score": round(s, 4)} for s, f in scored[:max_pages]]
+
+    # Keyword fallback — nomic unavailable or no embeddings cached
+    terms = [t for t in re.findall(r'\w+', query.lower()) if len(t) > 2 and t not in _STOP_WORDS]
+    if not terms:
+        return []
+    scored_kw: list[tuple[float, str]] = []
+    for entry in _parse_index(wiki_dir / "index.md"):
+        searchable = (entry["title"] + " " + entry["summary"]).lower()
+        score = sum(searchable.count(t) for t in terms)
+        if score > 0:
+            scored_kw.append((float(score), entry["file"]))
+    scored_kw.sort(reverse=True)
+    return [{"pack": pack, "file": f, "score": s} for s, f in scored_kw[:max_pages]]
 
 
 # ── Main retrieval entry point ────────────────────────────────────────────────

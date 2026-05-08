@@ -266,6 +266,8 @@ def print_help(model: str, retriever):
     table.add_row("/status", "show current config")
     table.add_row("/unload", "unload model from VRAM")
     table.add_row("/load", "reload model into VRAM")
+    table.add_row("/local on|off", "use local packs only (no server contact)")
+    table.add_row("/local", "show local mode status")
     table.add_row("/openrouter off", "switch to local model for your queries")
     table.add_row("/openrouter on", "switch back to OpenRouter (if configured)")
     table.add_row("exit / quit / q", "quit")
@@ -273,12 +275,12 @@ def print_help(model: str, retriever):
     console.print()
 
 
-def build_engine(cfg: Config, retriever, model: str, peers: list[str], workspace=None) -> DeliberationEngine:
+def build_engine(cfg: Config, retriever, model: str, workspace=None) -> DeliberationEngine:
+    from node.hardware import get_vram_used_mb
     domains = retriever.domains if retriever else []
     return DeliberationEngine(
         model=model,
         expert_pack=retriever,
-        peers=peers,
         num_ctx_answer=cfg.num_ctx_answer,
         num_ctx_synth=cfg.num_ctx_synth,
         retrieval_chars=cfg.retrieval_chars,
@@ -286,6 +288,8 @@ def build_engine(cfg: Config, retriever, model: str, peers: list[str], workspace
         workspace=workspace,
         openrouter_key=cfg.openrouter_api_key,
         openrouter_model=cfg.openrouter_model,
+        local_mode=cfg.local_mode,
+        vram_used_mb=get_vram_used_mb(),
     )
 
 
@@ -379,7 +383,7 @@ def run():
 
     _start_broker_agent_background()
     warmup_model(model)
-    engine = build_engine(cfg, retriever, model, peers, workspace)
+    engine = build_engine(cfg, retriever, model, workspace)
 
     if peers:
         console.print(f"[dim]Peers: {', '.join(peers)}[/dim]\n")
@@ -442,7 +446,7 @@ def run():
                 continue
             model = new_model
             warmup_model(model)
-            engine = build_engine(cfg, retriever, model, peers, workspace)
+            engine = build_engine(cfg, retriever, model, workspace)
             console.print(f"[dim]Switched to [bold]{model}[/bold][/dim]\n")
             continue
 
@@ -453,7 +457,7 @@ def run():
                 console.print(f"[red]Pack '{pack_name}' not found in expert-packs/[/red]\n")
                 continue
             retriever = MultiPackRetriever([load_pack(pack_path)])
-            engine = build_engine(cfg, retriever, model, peers, workspace)
+            engine = build_engine(cfg, retriever, model, workspace)
             console.print(f"[dim]Loaded pack [bold]{pack_name}[/bold][/dim]\n")
             continue
 
@@ -477,12 +481,15 @@ def run():
         if query == "/peers":
             if peers:
                 console.print(f"\n  Broker: [bold]wss://broker.opencognitivecommons.org/ws[/bold]")
-                from node.server.client import fetch_peer_manifests
-                manifests = fetch_peer_manifests()
-                if manifests:
-                    for nid, info in manifests.items():
-                        domains_str = ", ".join(info.get("domains", []))
-                        console.print(f"  [bold cyan]{nid}[/bold cyan]  pack: {info.get('pack')}  domains: {domains_str}")
+                from node.server.client import fetch_peer_list
+                peer_list = fetch_peer_list()
+                if peer_list:
+                    for p in peer_list:
+                        console.print(
+                            f"  [bold cyan]{p.node_id}[/bold cyan]"
+                            f"  tier: {p.tier_name}"
+                            f"  vram: {p.vram_used_mb}MB"
+                        )
                 else:
                     console.print("  [dim]No nodes currently registered.[/dim]")
             else:
@@ -506,6 +513,21 @@ def run():
                 console.print(f"[dim]OpenRouter enabled — {cfg.openrouter_model}[/dim]\n")
             else:
                 console.print("[yellow]No OpenRouter key configured. Run --setup to add one.[/yellow]\n")
+            continue
+
+        if query in ("/local", "/local on", "/local off"):
+            from node.apps.cli.config import save_local_mode
+            if query == "/local on":
+                save_local_mode(True)
+                engine._local_mode = True
+                console.print("[dim]Local mode [bold]ON[/bold] — using local packs, no server contact.[/dim]\n")
+            elif query == "/local off":
+                save_local_mode(False)
+                engine._local_mode = False
+                console.print("[dim]Local mode [bold]OFF[/bold] — using server retrieval.[/dim]\n")
+            else:
+                state = "[bold green]ON[/bold green]" if engine._local_mode else "[bold]OFF[/bold]"
+                console.print(f"\n  Local mode: {state}\n")
             continue
 
         if query.startswith("/"):
@@ -539,18 +561,20 @@ def _print_ctx_usage(engine):
 
 
 def _routing_labels(cfg: Config) -> dict:
-    if cfg.openrouter_api_key:
-        return {
-            "chat":     "[dim cyan]chat · OpenRouter[/dim cyan]",
-            "local":    "[dim cyan]local · OpenRouter[/dim cyan]",
-            "delegate": "[dim cyan]distributed · OpenRouter[/dim cyan]",
-            "hybrid":   "[dim cyan]hybrid · OpenRouter[/dim cyan]",
-        }
+    suffix = " · OpenRouter" if cfg.openrouter_api_key else ""
+    color = "cyan" if cfg.openrouter_api_key else ""
+    def _label(text: str, style: str) -> str:
+        s = color or style
+        return f"[dim {s}]{text}{suffix}[/dim {s}]"
     return {
-        "chat":     "[dim cyan]chat[/dim cyan]",
-        "local":    "[dim green]local[/dim green]",
-        "delegate": "[dim magenta]distributed[/dim magenta]",
-        "hybrid":   "[dim blue]hybrid[/dim blue]",
+        "chat":          _label("chat", "cyan"),
+        "local":         _label("local", "green"),
+        "local_private": _label("local · private", "green"),
+        "local_fallback": _label("local · fallback", "yellow"),
+        "distributed":   _label("distributed", "magenta"),
+        # legacy (kept until Phase 6 cleanup)
+        "delegate":      _label("distributed", "magenta"),
+        "hybrid":        _label("hybrid", "blue"),
     }
 
 

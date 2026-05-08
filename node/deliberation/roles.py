@@ -30,6 +30,15 @@ ROLES = {
         ),
         "temperature": 0.4,
     },
+    "critic": {
+        "system": (
+            "You are a critical reviewer. Given a proposed answer and its source knowledge, "
+            "identify: factual errors, logical gaps, unsupported claims, missing edge cases, "
+            "anything that could be improved or is incomplete. "
+            "Be specific and constructive. Do not rewrite the full answer."
+        ),
+        "temperature": 0.3,
+    },
     "synthesizer": {
         "system": (
             "You are a synthesis expert. "

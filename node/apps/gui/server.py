@@ -174,7 +174,6 @@ def _init():
     _engine = DeliberationEngine(
         model=_model,
         expert_pack=_retriever,
-        peers=_cfg.peers,
         num_ctx_answer=_cfg.num_ctx_answer,
         num_ctx_synth=_cfg.num_ctx_synth,
         retrieval_chars=_cfg.retrieval_chars,
@@ -275,7 +274,7 @@ async def get_config():
         "openrouter_configured": bool(_cfg.openrouter_api_key),
         "openrouter_model": _cfg.openrouter_model,
         "packs": [{"name": p.name, "domains": p.domains} for p in (_retriever.packs if _retriever else [])],
-        "peers": _cfg.peers,
+        "local_mode": _cfg.local_mode,
     }
 
 
@@ -300,6 +299,21 @@ async def set_openrouter(body: OpenRouterBody):
         _engine.or_key = effective_key
         _engine.or_model = body.model
     return {"ok": True}
+
+
+class LocalModeBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/config/local_mode")
+async def set_local_mode(body: LocalModeBody):
+    global _cfg
+    from node.apps.cli.config import save_local_mode
+    save_local_mode(body.enabled)
+    _cfg = Config()
+    if _engine:
+        _engine._local_mode = body.enabled
+    return {"ok": True, "local_mode": body.enabled}
 
 
 # ── Routes — chats ────────────────────────────────────────────────────────────
@@ -504,10 +518,18 @@ async def list_peers():
     if not _cfg:
         return []
     loop = asyncio.get_event_loop()
-    from node.server.client import fetch_peer_manifests
+    from node.server.client import fetch_peer_list
     try:
-        manifests = await loop.run_in_executor(None, fetch_peer_manifests)
-        return [{"id": nid, **info} for nid, info in manifests.items()]
+        peers = await loop.run_in_executor(None, fetch_peer_list)
+        return [
+            {
+                "id": p.node_id,
+                "tier_name": p.tier_name,
+                "vram_used_mb": p.vram_used_mb,
+                "public_key": p.public_key,
+            }
+            for p in peers
+        ]
     except Exception:
         return []
 
@@ -594,7 +616,7 @@ async def run_command(body: CommandBody):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _warmup_model)
         _engine = DeliberationEngine(
-            model=_model, expert_pack=_retriever, peers=_cfg.peers,
+            model=_model, expert_pack=_retriever,
             num_ctx_answer=_cfg.num_ctx_answer, num_ctx_synth=_cfg.num_ctx_synth,
             retrieval_chars=_cfg.retrieval_chars,
             domains=_retriever.domains if _retriever else [],
@@ -612,7 +634,7 @@ async def run_command(body: CommandBody):
         new_ret = MultiPackRetriever([load_pack(pack_path)])
         _retriever = new_ret
         _engine = DeliberationEngine(
-            model=_model, expert_pack=_retriever, peers=_cfg.peers,
+            model=_model, expert_pack=_retriever,
             num_ctx_answer=_cfg.num_ctx_answer, num_ctx_synth=_cfg.num_ctx_synth,
             retrieval_chars=_cfg.retrieval_chars,
             domains=_retriever.domains,

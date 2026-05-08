@@ -223,6 +223,19 @@
         <div id="settings-info"></div>
       </div>
       <div>
+        <div class="settings-section-label">Network</div>
+        <div style="display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0;">
+          <label class="toggle-switch">
+            <input type="checkbox" id="local-mode-toggle">
+            <span class="toggle-slider"></span>
+          </label>
+          <div>
+            <div style="font-size:0.8125rem;color:var(--text-primary);font-weight:500;">Use local packs only</div>
+            <div id="local-mode-label" style="font-size:0.75rem;color:var(--text-faint);margin-top:0.125rem;">Off — using server packs</div>
+          </div>
+        </div>
+      </div>
+      <div>
         <div class="settings-section-label">OpenRouter</div>
         <p style="font-size:0.8125rem;color:var(--text-faint);margin-bottom:0.75rem;">
           Use a cloud model for your queries. Network responses always stay local.<br>

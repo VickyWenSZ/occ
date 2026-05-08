@@ -6,7 +6,7 @@ from node.hardware import get_profile
 from node.provider import BUDGET_MODEL
 
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
-_CONFIG_FILE = ROOT / ".occ_config.json"
+_CONFIG_FILE = Path.home() / ".occ" / "config.json"
 
 
 def _load_occ_config() -> dict:
@@ -18,11 +18,22 @@ def _load_occ_config() -> dict:
     return {}
 
 
+def _save_occ_config(cfg: dict) -> None:
+    _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
 def save_openrouter_config(api_key: str, model: str):
     cfg = _load_occ_config()
     cfg["openrouter_api_key"] = api_key
     cfg["openrouter_model"] = model
-    _CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    _save_occ_config(cfg)
+
+
+def save_local_mode(enabled: bool):
+    cfg = _load_occ_config()
+    cfg["local_mode"] = enabled
+    _save_occ_config(cfg)
 
 
 class Config:
@@ -49,3 +60,4 @@ class Config:
         self.openrouter_model: str = (
             os.getenv("OCC_OPENROUTER_MODEL") or occ_cfg.get("openrouter_model", BUDGET_MODEL)
         )
+        self.local_mode: bool = occ_cfg.get("local_mode", False)

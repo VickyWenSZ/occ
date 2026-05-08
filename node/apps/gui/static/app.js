@@ -150,6 +150,7 @@ function setupEventListeners() {
   document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('btn-commands').addEventListener('click', openCommands);
   document.getElementById('close-settings').addEventListener('click', () => closeModal('settings-modal'));
+  document.getElementById('local-mode-toggle')?.addEventListener('change', e => setLocalMode(e.target.checked));
   document.getElementById('close-commands').addEventListener('click', () => closeModal('commands-modal'));
 
   document.getElementById('tab-chat').addEventListener('click', () => switchTab('chat'));
@@ -676,8 +677,11 @@ function buildRoutingBadge(routing) {
   const badge = document.createElement('span');
   badge.className = `routing-badge ${routing}`;
   const labels = {
-    chat: 'chat', local: 'local',
-    delegate: 'distributed', hybrid: 'hybrid',
+    chat: 'chat',
+    local: 'server + local',
+    local_private: 'local',
+    local_fallback: 'offline + local',
+    distributed: 'network',
   };
   badge.textContent = labels[routing] || routing;
   return badge;
@@ -796,15 +800,17 @@ function buildSourcesPanel(data) {
   panel.className = 'sources-panel';
 
   const blocks = [];
-  if (data.local_answer) {
-    blocks.push({ label: `Local — ${data.local_pack || 'local'}`, text: data.local_answer, role: 'local' });
+  if (data.expert_draft) {
+    const expertLabel = data.mode === 'network'
+      ? 'Expert — local'
+      : 'Expert — draft';
+    blocks.push({ label: expertLabel, text: data.expert_draft, role: 'local' });
   }
-  if (data.expert_answer) {
-    blocks.push({ label: 'Peer — expert', text: data.expert_answer, role: 'expert' });
-  }
-  if (data.contrarian_answer) {
-    const label = data.mode === 'delegate' ? 'Peer — critical review' : 'Peer — expert 2';
-    blocks.push({ label, text: data.contrarian_answer, role: 'contrarian' });
+  if (data.critic_review) {
+    const criticLabel = data.mode === 'network'
+      ? `Critic — peer (${data.peer_tier || 'remote'})`
+      : 'Critic — review';
+    blocks.push({ label: criticLabel, text: data.critic_review, role: 'expert' });
   }
 
   blocks.forEach(b => {
@@ -1107,7 +1113,23 @@ async function openSettings() {
   document.getElementById('or-model').value = cfg.openrouter_model || 'qwen/qwen3.5-9b';
   const hint = document.getElementById('or-key-hint');
   if (hint) hint.style.display = cfg.openrouter_configured ? 'block' : 'none';
+
+  const localToggle = document.getElementById('local-mode-toggle');
+  if (localToggle) localToggle.checked = !!cfg.local_mode;
+
   document.getElementById('settings-modal').classList.remove('hidden');
+}
+
+async function setLocalMode(enabled) {
+  const r = await apiFetch('/api/config/local_mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  if (r?.ok) {
+    const label = document.getElementById('local-mode-label');
+    if (label) label.textContent = enabled ? 'On — using local packs only' : 'Off — using server packs';
+  }
 }
 
 async function saveOpenRouter() {

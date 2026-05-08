@@ -277,6 +277,28 @@ def pull_model_stream(model: str):
 # GPU utilization (real-time, 0-100 or None)
 # ---------------------------------------------------------------------------
 
+def get_vram_used_mb() -> int:
+    """VRAM occupied by the model currently loaded in Ollama (from /api/ps)."""
+    try:
+        from urllib.request import urlopen
+        import json as _json
+        with urlopen(f"{OLLAMA_URL}/api/ps", timeout=3) as r:
+            models = _json.loads(r.read()).get("models", [])
+        if models:
+            return max(m.get("size_vram", 0) for m in models) // (1024 * 1024)
+    except Exception:
+        pass
+    return _estimate_vram_from_tier()
+
+
+def _estimate_vram_from_tier() -> int:
+    """Fallback: estimate used VRAM from detected hardware tier."""
+    vram_gb = detect_vram_gb()
+    tier = select_tier(vram_gb)
+    # Use vram_min_gb of selected tier as a conservative estimate
+    return int(tier.get("vram_min_gb", 0) * 1024)
+
+
 def gpu_utilization_pct() -> int | None:
     """Return GPU utilization % (0-100) or None if hardware not supported."""
     pct = _gpu_util_nvidia()
