@@ -141,36 +141,88 @@ class DeliberationEngine:
 
     # ─── Retrieval ────────────────────────────────────────────────────────────
 
-    def _llm_select_packs(self, query: str, available_packs: list[str]) -> list[str]:
+    def _navigate_pack_tree(self, query: str) -> str | None:
+        """Walk the broker knowledge tree level by level using the LLM to pick the best path.
+        Returns a pack path like "history/prehistory" or None if no relevant pack found.
+        """
+        import httpx
         from node.provider import call as _provider_call
+        from node.retrieval.pack_cache import SERVER_URL
 
-        pack_list = "\n".join(f"- {p}" for p in available_packs)
-        prompt = (
-            f"Available knowledge packs:\n{pack_list}\n\n"
-            f"Question: {query}\n\n"
-            "List the pack names relevant to answer this question. "
-            "One pack name per line, exactly as written above. "
-            "If none are relevant, reply with: none"
-        )
-        try:
-            resp = _provider_call(
-                messages=[{"role": "user", "content": prompt}],
-                model_local=self.model,
-                or_key="",
-                or_model="",
-                tools=None,
-                temperature=0.0,
-                num_ctx=4096,
-            )
-            raw = resp.content or ""
-            selected = []
-            for line in raw.splitlines():
-                line = line.strip().lstrip("- ").strip()
-                if line in available_packs:
-                    selected.append(line)
-            return selected if selected else []
-        except Exception:
-            return []
+        current_path = ""
+        MAX_DEPTH = 6
+
+        for depth in range(MAX_DEPTH):
+            url = f"{SERVER_URL}/tree" if not current_path else f"{SERVER_URL}/tree/{current_path}"
+            try:
+                resp = httpx.get(url, timeout=5.0)
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+            except Exception:
+                break
+
+            if depth == 0:
+                children = data if isinstance(data, list) else []
+                has_pack = False
+            else:
+                children = data.get("children", [])
+                has_pack = data.get("has_pack", False)
+
+            if not children:
+                return current_path if has_pack else None
+
+            children_str = ", ".join(children)
+            if current_path:
+                stop_hint = " Or reply 'stop' to use this location." if has_pack else " Or reply 'none' if nothing is relevant."
+                prompt = (
+                    f"You are navigating a knowledge tree to answer: \"{query}\"\n"
+                    f"Current location: {current_path}\n"
+                    f"Sub-topics: {children_str}\n"
+                    + ("This location has a knowledge pack.\n" if has_pack else "")
+                    + f"Which sub-topic is most relevant? Reply with exactly one name from the list.{stop_hint}"
+                )
+            else:
+                prompt = (
+                    f"You are navigating a knowledge tree to answer: \"{query}\"\n"
+                    f"Top-level topics: {children_str}\n"
+                    "Which topic is most relevant? Reply with exactly one topic name, or 'none' if nothing is relevant."
+                )
+
+            try:
+                llm_resp = _provider_call(
+                    messages=[{"role": "user", "content": prompt}],
+                    model_local=self.model,
+                    or_key="",
+                    or_model="",
+                    tools=None,
+                    temperature=0.0,
+                    num_ctx=2048,
+                )
+                choice = (llm_resp.content or "").strip().rstrip(".").lower()
+            except Exception:
+                break
+
+            if choice in ("none", "stop", ""):
+                return current_path if has_pack else None
+
+            matched = next((c for c in children if c.lower() == choice), None)
+            if not matched:
+                matched = next((c for c in children if choice in c.lower() or c.lower() in choice), None)
+            if not matched:
+                return current_path if has_pack else None
+
+            current_path = f"{current_path}/{matched}" if current_path else matched
+
+        # Reached max depth — verify and return
+        if current_path:
+            try:
+                resp = httpx.get(f"{SERVER_URL}/tree/{current_path}", timeout=5.0)
+                if resp.status_code == 200 and resp.json().get("has_pack", False):
+                    return current_path
+            except Exception:
+                pass
+        return None
 
     def _llm_select_pages(self, query: str, indices: dict[str, str]) -> list[dict]:
         from node.provider import call as _provider_call
@@ -212,19 +264,21 @@ class DeliberationEngine:
             refs = []
             for line in raw.splitlines():
                 line = line.strip().lstrip("- ").strip()
-                if "/" not in line:
+                if not line:
                     continue
-                parts = line.split("/", 1)
-                if len(parts) != 2:
-                    continue
-                pack, filepath = parts[0].strip(), parts[1].strip()
-                if pack in valid_files and filepath in valid_files[pack]:
-                    refs.append({"pack": pack, "file": filepath})
-                elif pack not in valid_files:
-                    for pname, files in valid_files.items():
-                        if line in files:
-                            refs.append({"pack": pname, "file": line})
+                # Match by pack name prefix (handles nested paths like "history/prehistory/file.md")
+                matched_pack = None
+                matched_file = None
+                for pack_name in valid_files:
+                    prefix = pack_name + "/"
+                    if line.startswith(prefix):
+                        candidate = line[len(prefix):]
+                        if candidate in valid_files[pack_name]:
+                            matched_pack = pack_name
+                            matched_file = candidate
                             break
+                if matched_pack:
+                    refs.append({"pack": matched_pack, "file": matched_file})
             return refs[:6]
         except Exception:
             return []
@@ -233,70 +287,48 @@ class DeliberationEngine:
         import asyncio
         import concurrent.futures
         from node.retrieval.pack_cache import (
-            get_cached_wiki_dirs, fetch_pages, download_all_indices,
+            fetch_pages, ensure_pack_cached, CACHE_DIR,
         )
 
-        # 1. Assicura che la cache degli indici sia disponibile
-        wiki_dirs = get_cached_wiki_dirs()
-        if not wiki_dirs:
-            ok = download_all_indices()
-            if not ok:
-                return None
-            wiki_dirs = get_cached_wiki_dirs()
-            if not wiki_dirs:
-                return None
+        # 1. Navigate the tree to find the best pack
+        pack_path = self._navigate_pack_tree(query)
+        if pack_path is None:
+            return ""
 
-        available_packs = [wd.parent.name for wd in wiki_dirs]
+        # 2. Ensure index is cached (download if needed)
+        if not ensure_pack_cached(pack_path):
+            return None  # server unreachable
 
-        # 2. Call 0a — LLM sceglie pack rilevanti
-        selected_pack_names = self._llm_select_packs(query, available_packs)
+        # 3. Read index from local cache
+        index_path = CACHE_DIR / pack_path / "wiki" / "index.md"
+        if not index_path.exists():
+            return ""
+        try:
+            index_content = index_path.read_text(encoding="utf-8")
+        except Exception:
+            return ""
 
-        # Fallback a embedding se LLM non sceglie nulla
-        if not selected_pack_names:
-            from node.retrieval.search import get_relevant_page_refs, relevant_pack_dirs
-            relevant_dirs = relevant_pack_dirs(wiki_dirs, query)
-            if not relevant_dirs:
-                return ""
-            page_refs: list[dict] = []
-            for wiki_dir in relevant_dirs:
-                page_refs.extend(get_relevant_page_refs(wiki_dir, query, max_pages=6))
-            if not page_refs:
-                return ""
-        else:
-            selected_wiki_dirs = [wd for wd in wiki_dirs if wd.parent.name in selected_pack_names]
+        indices = {pack_path: index_content}
 
-            # 3. Leggi indici dalla cache locale
-            indices: dict[str, str] = {}
-            for wd in selected_wiki_dirs:
-                index_path = wd / "index.md"
-                if index_path.exists():
-                    try:
-                        indices[wd.parent.name] = index_path.read_text(encoding="utf-8")
-                    except Exception:
-                        pass
+        # 4. Call 0b — LLM picks specific pages
+        page_refs = self._llm_select_pages(query, indices)
 
-            if not indices:
-                return ""
-
-            # 4. Call 0b — LLM sceglie pagine specifiche
-            page_refs = self._llm_select_pages(query, indices)
-
-            # Fallback a embedding se LLM non trova pagine
-            if not page_refs:
-                from node.retrieval.search import get_relevant_page_refs
-                page_refs = []
-                for wd in selected_wiki_dirs:
-                    page_refs.extend(get_relevant_page_refs(wd, query, max_pages=6))
+        # Fallback to keyword search if LLM picks nothing
+        if not page_refs:
+            from node.retrieval.search import get_relevant_page_refs
+            wiki_dir = CACHE_DIR / pack_path / "wiki"
+            raw_refs = get_relevant_page_refs(wiki_dir, query, max_pages=6)
+            # Override pack field with full nested path (get_relevant_page_refs uses parent.name only)
+            page_refs = [{"pack": pack_path, "file": r["file"]} for r in raw_refs]
 
         if not page_refs:
             return ""
 
-        # 5. Fetch pagine dal server
+        # 5. Fetch pages from server
         try:
             pages = asyncio.run(fetch_pages(page_refs))
         except RuntimeError:
             # GUI runs on asyncio — asyncio.run() fails inside a running loop.
-            # Use a fresh thread with its own event loop instead.
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 try:
                     pages = pool.submit(asyncio.run, fetch_pages(page_refs)).result(timeout=30)
@@ -308,7 +340,7 @@ class DeliberationEngine:
         if not pages:
             return ""
 
-        # 6. Assembla il contesto — pagine intere fino al cap retrieval_chars
+        # 6. Assemble context up to retrieval_chars cap
         parts = []
         total = 0
         for filename, content in pages.items():

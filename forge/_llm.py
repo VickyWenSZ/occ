@@ -6,6 +6,7 @@ See forge/OPENAI_RESPONSES_API_GUIDE.md for critical rules.
 import os
 import json
 import httpx
+from datetime import date
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 DEFAULT_EXTRACT_MODEL = "gpt-5-mini"
@@ -102,6 +103,7 @@ def update_wiki_page(
     existing_content: str,
     new_source_text: str,
     source_name: str,
+    raw_path: str = "",
     model: str = DEFAULT_WRITE_MODEL,
 ) -> str:
     """
@@ -121,8 +123,11 @@ def update_wiki_page(
         f"Instructions:\n"
         f"- Keep all existing content. Add new facts, details, and sections from the new source.\n"
         f"- If the new source contradicts existing content, add a `> ⚠️ Conflict: ...` blockquote.\n"
-        f"- Update the `source:` frontmatter field to list both sources.\n"
-        f"- Keep the same slug and title. Update tags if needed.\n"
+        f"- Keep all existing content. Add new facts, details, and sections from the new source.\n"
+        f"- Append `  - {raw_path or source_name}` to the `sources:` YAML list in frontmatter.\n"
+        f"- Update the `updated:` frontmatter field to today: {date.today().isoformat()}.\n"
+        f"- Update `summary:` if the new source meaningfully expands the concept.\n"
+        f"- Keep the same slug, title, category, and created date. Update tags if needed.\n"
         f"- Output the complete updated page, starting with the frontmatter block.\n"
     )
     return _call(model, system, user, json_mode=False, max_output_tokens=32000)
@@ -169,6 +174,7 @@ def write_wiki_page(
     concept: dict,
     source_text: str,
     source_name: str,
+    raw_path: str = "",
     model: str = DEFAULT_WRITE_MODEL,
 ) -> str:
     """
@@ -187,8 +193,13 @@ def write_wiki_page(
         f"---\n"
         f"title: {concept['title']}\n"
         f"slug: {concept['slug']}\n"
-        f"source: {source_name}\n"
+        f"category: concept\n"
+        f"sources:\n"
+        f"  - {raw_path or source_name}\n"
         f"confidence: high\n"
+        f"created: {date.today().isoformat()}\n"
+        f"updated: {date.today().isoformat()}\n"
+        f"summary: [replace with one sentence describing this concept]\n"
         f"tags: [replace with 3-5 relevant lowercase keywords]\n"
         f"---\n\n"
         f"# {concept['title']}\n\n"

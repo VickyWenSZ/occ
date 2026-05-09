@@ -64,6 +64,28 @@ def update_index(wiki_dir: Path, pages: list[dict]):
         lines.append(f"| concepts/{fname} | {title} | {summary} |\n")
 
     (wiki_dir / "index.md").write_text("".join(lines), encoding="utf-8")
+    _update_concepts_index(wiki_dir, deduped)
+
+
+def _update_concepts_index(wiki_dir: Path, pages: list[dict]):
+    """Write _index.md inside concepts/ (one _index.md per directory, Karpathy pattern)."""
+    today = date.today().isoformat()
+    concepts_dir = wiki_dir / "concepts"
+    concepts_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Concepts Index\n\n",
+        f"> Compiled wiki articles for this expert pack.\n\n",
+        f"Last updated: {today}\n\n",
+        "## Contents\n\n",
+        "| File | Title | Summary |\n",
+        "|------|-------|--------|\n",
+    ]
+    for p in pages:
+        fname = _slug_to_filename(p["slug"])
+        title = p.get("title", "").replace("|", "/")
+        summary = p.get("summary", "").replace("|", "/")
+        lines.append(f"| [{fname}]({fname}) | {title} | {summary} |\n")
+    (concepts_dir / "_index.md").write_text("".join(lines), encoding="utf-8")
 
 
 def append_log(wiki_dir: Path, source_name: str, n_pages: int, source_url: str = ""):
@@ -76,6 +98,84 @@ def append_log(wiki_dir: Path, source_name: str, n_pages: int, source_url: str =
     )
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(entry)
+
+
+def write_raw_source(pack_dir: Path, source_name: str, source_url: str, text: str) -> str:
+    """
+    Write the original source text immutably to raw/articles/.
+    Returns the relative path from pack_dir (e.g. 'raw/articles/2026-05-09-prehistory.md').
+    Never overwrites an existing file — appends -2, -3, etc. if needed.
+    """
+    today = date.today().isoformat()
+    raw_dir = pack_dir / "raw" / "articles"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    slug = re.sub(r'[^a-z0-9-]', '-', source_name.lower()).strip('-')
+    base = f"{today}-{slug}"
+    filename = f"{base}.md"
+    counter = 2
+    while (raw_dir / filename).exists():
+        filename = f"{base}-{counter}.md"
+        counter += 1
+
+    content = (
+        f"---\n"
+        f"title: \"{source_name}\"\n"
+        f"source: \"{source_url}\"\n"
+        f"type: articles\n"
+        f"ingested: {today}\n"
+        f"tags: []\n"
+        f"summary: \"\"\n"
+        f"---\n\n"
+        f"{text}\n"
+    )
+    (raw_dir / filename).write_text(content, encoding="utf-8")
+    _update_raw_index(pack_dir)
+    return f"raw/articles/{filename}"
+
+
+def _update_raw_index(pack_dir: Path):
+    """Rebuild raw/_index.md and raw/articles/_index.md from files on disk."""
+    today = date.today().isoformat()
+    raw_dir = pack_dir / "raw"
+    articles_dir = raw_dir / "articles"
+    articles_dir.mkdir(parents=True, exist_ok=True)
+
+    articles = []
+    for md_file in sorted(articles_dir.glob("*.md")):
+        if md_file.name == "_index.md":
+            continue
+        fm = _parse_frontmatter(md_file.read_text(encoding="utf-8", errors="replace"))
+        articles.append({
+            "file": md_file.name,
+            "title": fm.get("title", md_file.stem),
+            "ingested": fm.get("ingested", ""),
+        })
+
+    art_lines = [
+        "# Articles Index\n\n",
+        f"Last updated: {today}\n\n",
+        "## Contents\n\n",
+        "| File | Title | Ingested |\n",
+        "|------|-------|----------|\n",
+    ]
+    for a in articles:
+        art_lines.append(f"| [{a['file']}]({a['file']}) | {a['title']} | {a['ingested']} |\n")
+    (articles_dir / "_index.md").write_text("".join(art_lines), encoding="utf-8")
+
+    raw_lines = [
+        "# Raw Sources Index\n\n",
+        f"Last updated: {today}  \n",
+        f"Total sources: {len(articles)}\n\n",
+        "## Contents\n\n",
+        "| File | Title | Ingested |\n",
+        "|------|-------|----------|\n",
+    ]
+    for a in articles:
+        raw_lines.append(
+            f"| [articles/{a['file']}](articles/{a['file']}) | {a['title']} | {a['ingested']} |\n"
+        )
+    (raw_dir / "_index.md").write_text("".join(raw_lines), encoding="utf-8")
 
 
 def ensure_schema(wiki_dir: Path, pack_name: str):

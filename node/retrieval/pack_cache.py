@@ -1,13 +1,14 @@
 """
 Local cache for OCC server pack indices.
 
-Cache layout: ~/.occ_cache/{pack}/wiki/index.md
-The wiki/ dir mirrors the structure search.py expects as wiki_dir.
+Cache layout: ~/.occ_cache/{pack_path}/wiki/index.md
+For nested packs (e.g., history/prehistory), the cache mirrors the tree:
+  ~/.occ_cache/history/prehistory/wiki/index.md
+
 Page files are NOT stored locally — fetched on demand from the server.
 """
 import asyncio
 import json
-import os
 import threading
 import time
 from pathlib import Path
@@ -21,21 +22,58 @@ _TIMESTAMP_FILE = CACHE_DIR / ".last_updated"
 _REFRESH_INTERVAL_HOURS = 24
 
 
+# ─── Tree traversal ───────────────────────────────────────────────────────────
+
+def _walk_tree(parent_path: str, children: list, packs: list, depth: int = 0) -> None:
+    if depth > 6:
+        return
+    for child in children:
+        path = f"{parent_path}/{child}" if parent_path else child
+        try:
+            with urlopen(f"{SERVER_URL}/tree/{path}", timeout=5) as r:
+                data = json.loads(r.read())
+        except Exception:
+            continue
+        if data.get("has_pack"):
+            packs.append(path)
+        sub_children = data.get("children", [])
+        if sub_children:
+            _walk_tree(path, sub_children, packs, depth + 1)
+
+
+def _enumerate_packs_from_tree() -> list[str]:
+    """Walk the broker tree and return all pack paths that have a wiki/index.md."""
+    try:
+        with urlopen(f"{SERVER_URL}/tree", timeout=10) as r:
+            top_level: list[str] = json.loads(r.read())
+    except Exception:
+        return []
+    packs: list[str] = []
+    _walk_tree("", top_level, packs)
+    return packs
+
+
+# ─── Index download ───────────────────────────────────────────────────────────
+
 def download_all_indices() -> bool:
-    """Download index.md for every pack from the server.
+    """Download index.md for every pack from the server (tree-based).
     Returns True if at least one pack was cached successfully.
     """
-    try:
-        with urlopen(f"{SERVER_URL}/packs", timeout=10) as r:
-            pack_names: list[str] = json.loads(r.read())
-    except Exception:
-        return False
+    pack_paths = _enumerate_packs_from_tree()
+
+    # Fallback: flat /packs list for servers without /tree
+    if not pack_paths:
+        try:
+            with urlopen(f"{SERVER_URL}/packs", timeout=10) as r:
+                pack_paths = json.loads(r.read())
+        except Exception:
+            return False
 
     ok = False
-    for pack in pack_names:
-        wiki_dir = CACHE_DIR / pack / "wiki"
+    for pack_path in pack_paths:
+        wiki_dir = CACHE_DIR / pack_path / "wiki"
         wiki_dir.mkdir(parents=True, exist_ok=True)
-        url = f"{SERVER_URL}/packs/{pack}/wiki/index.md"
+        url = f"{SERVER_URL}/packs/{pack_path}/wiki/index.md"
         dest = wiki_dir / "index.md"
         try:
             with urlopen(url, timeout=10) as r:
@@ -50,15 +88,46 @@ def download_all_indices() -> bool:
     return ok
 
 
+def ensure_pack_cached(pack_path: str) -> bool:
+    """Download index.md for a specific pack path if not already cached.
+    Returns True if index is available (cached or just downloaded).
+    """
+    wiki_dir = CACHE_DIR / pack_path / "wiki"
+    dest = wiki_dir / "index.md"
+    if dest.exists():
+        age_secs = time.time() - dest.stat().st_mtime
+        if age_secs < _REFRESH_INTERVAL_HOURS * 3600:
+            return True
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    url = f"{SERVER_URL}/packs/{pack_path}/wiki/index.md"
+    try:
+        with urlopen(url, timeout=10) as r:
+            dest.write_bytes(r.read())
+        return True
+    except Exception:
+        return dest.exists()  # stale copy is better than nothing
+
+
+# ─── Cache inspection ─────────────────────────────────────────────────────────
+
+def _find_wiki_dirs(directory: Path, result: list) -> None:
+    for p in sorted(directory.iterdir()):
+        if p.name.startswith(".") or not p.is_dir():
+            continue
+        if p.name == "wiki":
+            if (p / "index.md").exists():
+                result.append(p)
+        else:
+            _find_wiki_dirs(p, result)
+
+
 def get_cached_wiki_dirs() -> list[Path]:
-    """Return ~/.occ_cache/{pack}/wiki/ dirs that have a valid index.md."""
+    """Return all ~/.occ_cache/.../wiki/ dirs that have a valid index.md (recursive)."""
     if not CACHE_DIR.exists():
         return []
-    return [
-        p / "wiki"
-        for p in sorted(CACHE_DIR.iterdir())
-        if p.is_dir() and not p.name.startswith(".") and (p / "wiki" / "index.md").exists()
-    ]
+    result: list[Path] = []
+    _find_wiki_dirs(CACHE_DIR, result)
+    return result
 
 
 def is_stale(pack_name: str, max_age_hours: int = _REFRESH_INTERVAL_HOURS) -> bool:
@@ -87,10 +156,12 @@ def start_refresh_thread() -> None:
     threading.Thread(target=_loop, daemon=True, name="occ-cache-refresh").start()
 
 
+# ─── Page fetching ────────────────────────────────────────────────────────────
+
 async def fetch_pages(page_refs: list[dict]) -> dict[str, str] | None:
     """
     Fetch page content from the server in parallel.
-    page_refs: list of {pack, file}
+    page_refs: list of {pack, file}  — pack may be a nested path like "history/prehistory"
     Returns {file: content} or None if the server is unreachable.
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -107,5 +178,3 @@ async def fetch_pages(page_refs: list[dict]) -> dict[str, str] | None:
             }
         except (httpx.ConnectError, httpx.TimeoutException):
             return None
-
-

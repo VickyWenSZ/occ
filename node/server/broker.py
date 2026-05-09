@@ -44,26 +44,49 @@ def _select_target(requester_vram_mb: int, requester_id: str) -> str | None:
     return candidates[0][1]
 
 
+# ─── HTTP: Tree navigation ────────────────────────────────────────────────
+
+@app.get("/tree")
+async def tree_root():
+    """Top-level children of the knowledge tree."""
+    if not PACKS_DIR.exists():
+        return []
+    return sorted(d.name for d in PACKS_DIR.iterdir() if d.is_dir())
+
+
+@app.get("/tree/{path:path}")
+async def tree_node(path: str):
+    """Children and pack status of a tree node."""
+    node_dir = (PACKS_DIR / path).resolve()
+    if not str(node_dir).startswith(str(PACKS_DIR.resolve())):
+        raise HTTPException(403)
+    if not node_dir.exists() or not node_dir.is_dir():
+        raise HTTPException(404)
+    children = sorted(d.name for d in node_dir.iterdir() if d.is_dir() and d.name != "wiki")
+    has_pack = (node_dir / "wiki" / "index.md").exists()
+    return {"children": children, "has_pack": has_pack}
+
+
 # ─── HTTP: Pack file serving ───────────────────────────────────────────────
 
 @app.get("/packs")
 async def list_packs():
     if not PACKS_DIR.exists():
         return []
-    return [d.name for d in PACKS_DIR.iterdir() if d.is_dir()]
+    return sorted(d.name for d in PACKS_DIR.iterdir() if d.is_dir())
 
 
 @app.get("/packs/{pack}/index.md")
 async def get_index(pack: str):
-    f = PACKS_DIR / pack / "index.md"
+    f = PACKS_DIR / pack / "wiki" / "index.md"
     if not f.exists():
         raise HTTPException(404)
     return Response(f.read_text(encoding="utf-8"), media_type="text/markdown")
 
 
-@app.get("/packs/{pack}/wiki/{filename:path}")
-async def get_page(pack: str, filename: str):
-    f = (PACKS_DIR / pack / "wiki" / filename).resolve()
+@app.get("/packs/{path:path}/wiki/{file:path}")
+async def get_page(path: str, file: str):
+    f = (PACKS_DIR / path / "wiki" / file).resolve()
     if not str(f).startswith(str(PACKS_DIR.resolve())):
         raise HTTPException(403)
     if not f.exists():

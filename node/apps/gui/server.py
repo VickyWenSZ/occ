@@ -535,6 +535,9 @@ def _forge_run_core(body: "ForgeRunBody"):
         for text_content, source_name, source_url in raw_sources:
             yield f"\n━━━ Source: {source_name} ({len(text_content):,} chars) ━━━"
 
+            raw_path = wiki.write_raw_source(pack_dir, source_name, source_url, text_content)
+            yield f"💾 Raw source saved → {raw_path}"
+
             yield f"🔍 Extracting concepts ({extract_model})..."
             concepts = None
             for attempt in range(3):
@@ -563,7 +566,7 @@ def _forge_run_core(body: "ForgeRunBody"):
                     for attempt in range(3):
                         try:
                             page_content = llm.update_wiki_page(
-                                concept, existing_content, text_content, source_name, model=write_model
+                                concept, existing_content, text_content, source_name, raw_path=raw_path, model=write_model
                             )
                             break
                         except Exception as e:
@@ -574,7 +577,7 @@ def _forge_run_core(body: "ForgeRunBody"):
                     for attempt in range(3):
                         try:
                             page_content = llm.write_wiki_page(
-                                concept, text_content, source_name, model=write_model
+                                concept, text_content, source_name, raw_path=raw_path, model=write_model
                             )
                             break
                         except Exception as e:

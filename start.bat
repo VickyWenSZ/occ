@@ -71,6 +71,7 @@ if %errorlevel% neq 0 (
     echo  This may take several minutes. Do not close this window.
     echo.
     ollama pull %OCC_MODEL%
+    ollama show %OCC_MODEL% >nul 2>&1
     if %errorlevel% neq 0 (
         echo  [!] Model download failed. Check your internet connection and try again.
         pause

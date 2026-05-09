@@ -65,6 +65,10 @@ def run(
     for text, source_name, source_url in raw_sources:
         console.print(f"\n[bold]▶ Source:[/bold] {source_name}  ({len(text):,} chars)")
 
+        # Save raw source immutably before any processing
+        raw_path = wiki.write_raw_source(pack_dir, source_name, source_url, text)
+        console.print(f"  [dim]Saved raw source → {raw_path}[/dim]")
+
         # Step 1: identify concepts
         console.print(f"  [dim]Extracting concepts ({extract_model})...[/dim]", end=" ")
         concepts = llm.extract_concepts(text, model=extract_model)
@@ -84,7 +88,12 @@ def run(
             title = concept.get("title", slug)
 
             console.print(f"  → [dim]{title}[/dim]... ", end="")
-            page_content = llm.write_wiki_page(concept, text, source_name, model=write_model)
+            if slug in existing_slugs:
+                existing_path = wiki_dir / "concepts" / wiki._slug_to_filename(slug)
+                existing_content = existing_path.read_text(encoding="utf-8") if existing_path.exists() else ""
+                page_content = llm.update_wiki_page(concept, existing_content, text, source_name, raw_path=raw_path, model=write_model)
+            else:
+                page_content = llm.write_wiki_page(concept, text, source_name, raw_path=raw_path, model=write_model)
 
             if page_content.strip():
                 wiki.write_page(wiki_dir, slug, page_content)

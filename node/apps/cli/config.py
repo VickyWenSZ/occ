@@ -68,5 +68,5 @@ class Config:
         )
         self.local_mode: bool = occ_cfg.get("local_mode", False)
         self.openai_api_key: str = (
-            os.getenv("OPENAI_API_KEY") or occ_cfg.get("openai_api_key", "")
+            occ_cfg.get("openai_api_key", "") or os.getenv("OPENAI_API_KEY", "")
         )
