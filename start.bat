@@ -89,7 +89,21 @@ if %errorlevel% neq 0 (
     echo  [OK] Model already installed.
 )
 
-:: ── 8. Start GUI ─────────────────────────────────────────────────────────────
+:: ── 8. Generate icons ────────────────────────────────────────────────────────
+echo  Generating icons...
+python make_icons.py
+if %errorlevel% neq 0 (
+    echo  [!] Icon generation failed ^(non-critical, continuing^).
+)
+
+:: ── 9. Create desktop shortcut ───────────────────────────────────────────────
+echo  Creating desktop shortcut...
+python setup_shortcut.py
+if %errorlevel% neq 0 (
+    echo  [!] Shortcut creation failed ^(non-critical, continuing^).
+)
+
+:: ── 10. Start GUI ─────────────────────────────────────────────────────────────
 echo.
 echo  Starting OCC Node...
 echo  Opening browser at http://localhost:7891

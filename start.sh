@@ -89,7 +89,16 @@ else
     echo " [OK] Model already installed."
 fi
 
-# ── 8. Start GUI ──────────────────────────────────────────────────────────────
+# ── 8. Generate icons ─────────────────────────────────────────────────────────
+echo " Generating icons..."
+python3 make_icons.py || echo " [!] Icon generation failed (non-critical, continuing)."
+
+# ── 9. Create desktop shortcut ────────────────────────────────────────────────
+echo " Creating desktop shortcut..."
+python3 setup_shortcut.py || echo " [!] Shortcut creation failed (non-critical, continuing)."
+chmod +x launch.sh 2>/dev/null || true
+
+# ── 10. Start GUI ─────────────────────────────────────────────────────────────
 echo ""
 echo " Starting OCC Node..."
 echo " Opening browser at http://localhost:7891"
