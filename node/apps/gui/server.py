@@ -1037,8 +1037,10 @@ async def run_command(body: CommandBody):
             return {"output": "No nodes currently registered on the broker."}
         lines = ["Broker: wss://broker.opencognitivecommons.org/ws", ""]
         for nid, info in data.items():
-            d = ", ".join(info.get("domains", []))
-            lines.append(f"{nid}  pack: {info.get('pack', '?')}  domains: {d}")
+            tier = info.get("tier_name", "?")
+            vram_mb = info.get("vram_used_mb", 0)
+            vram_str = f"{vram_mb / 1024:.1f}GB" if vram_mb else "CPU"
+            lines.append(f"{nid}  tier: {tier}  vram: {vram_str}")
         return {"output": "\n".join(lines)}
 
     if cmd.startswith("/model "):
