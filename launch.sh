@@ -4,9 +4,9 @@ OS="$(uname -s)"
 
 # Kill any process currently on port 7891
 if [[ "$OS" == "Darwin" ]]; then
-    lsof -ti :7891 2>/dev/null | xargs kill -9 2>/dev/null || true
+    lsof -ti TCP:7891 -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || true
 else
-    lsof -ti :7891 2>/dev/null | xargs kill -9 2>/dev/null || \
+    lsof -ti TCP:7891 -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || \
     fuser -k 7891/tcp 2>/dev/null || true
 fi
 sleep 1
