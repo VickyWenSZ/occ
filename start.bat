@@ -7,7 +7,7 @@ echo  OCC Node
 echo  ════════════════════════════
 echo.
 
-:: ── 1. Python ────────────────────────────────────────────────────────────────
+:: -- 1. Python ----------------------------------------------------------------
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo  [!] Python not found.
@@ -20,7 +20,7 @@ if %errorlevel% neq 0 (
 )
 echo  [OK] Python found.
 
-:: ── 2. Ollama ─────────────────────────────────────────────────────────────────
+:: -- 2. Ollama ----------------------------------------------------------------
 where ollama >nul 2>&1
 if %errorlevel% neq 0 (
     echo  [!] Ollama not found.
@@ -33,7 +33,7 @@ if %errorlevel% neq 0 (
 )
 echo  [OK] Ollama found.
 
-:: ── 3. Python dependencies ───────────────────────────────────────────────────
+:: -- 3. Python dependencies --------------------------------------------------
 echo  Installing dependencies ^(skipped if already up to date^)...
 python -m pip install -r node/requirements.txt -q
 if %errorlevel% neq 0 (
@@ -43,7 +43,7 @@ if %errorlevel% neq 0 (
 )
 echo  [OK] Dependencies ready.
 
-:: ── 4. Detect model ──────────────────────────────────────────────────────────
+:: -- 4. Detect model ---------------------------------------------------------
 echo  Detecting hardware...
 python -c "from node.hardware import get_profile; print(get_profile()['model'])" > "%TEMP%\occ_model.txt" 2>nul
 if %errorlevel% neq 0 (
@@ -55,7 +55,7 @@ set /p OCC_MODEL=<"%TEMP%\occ_model.txt"
 del "%TEMP%\occ_model.txt" >nul 2>&1
 echo  [OK] Model: %OCC_MODEL%
 
-:: ── 5. Start Ollama (needed for pull) ────────────────────────────────────────
+:: -- 5. Start Ollama (needed for pull) ---------------------------------------
 echo  Starting Ollama...
 ollama list >nul 2>&1
 if %errorlevel% neq 0 (
@@ -64,7 +64,7 @@ if %errorlevel% neq 0 (
 )
 echo  [OK] Ollama running.
 
-:: ── 6. Pull model if needed ──────────────────────────────────────────────────
+:: -- 6. Pull model if needed -------------------------------------------------
 ollama show %OCC_MODEL% >nul 2>&1
 if %errorlevel% neq 0 (
     echo  Downloading model %OCC_MODEL%...
@@ -78,7 +78,6 @@ if %errorlevel% neq 0 (
     )
     echo  [OK] Model downloaded.
 
-    :: ── 7. Restart Ollama so it registers the new model ─────────────────────
     echo  Restarting Ollama...
     taskkill /F /IM ollama.exe >nul 2>&1
     timeout /t 2 /nobreak >nul
@@ -89,21 +88,17 @@ if %errorlevel% neq 0 (
     echo  [OK] Model already installed.
 )
 
-:: ── 8. Generate icons ────────────────────────────────────────────────────────
+:: -- 7. Generate icons -------------------------------------------------------
 echo  Generating icons...
 python make_icons.py
-if %errorlevel% neq 0 (
-    echo  [!] Icon generation failed ^(non-critical, continuing^).
-)
+if %errorlevel% neq 0 echo  [!] Icon generation failed, continuing.
 
-:: ── 9. Create desktop shortcut ───────────────────────────────────────────────
+:: -- 8. Create desktop shortcut ----------------------------------------------
 echo  Creating desktop shortcut...
 python setup_shortcut.py
-if %errorlevel% neq 0 (
-    echo  [!] Shortcut creation failed ^(non-critical, continuing^).
-)
+if %errorlevel% neq 0 echo  [!] Shortcut creation failed, continuing.
 
-:: ── 10. Start GUI ─────────────────────────────────────────────────────────────
+:: -- 9. Start GUI ------------------------------------------------------------
 echo.
 echo  Starting OCC Node...
 echo  Opening browser at http://localhost:7891
