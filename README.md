@@ -32,58 +32,70 @@ Three routing modes happen automatically:
 
 ## Getting started
 
-### Requirements
+### 1 — Prerequisites
 
-- [Git](https://git-scm.com/downloads)
 - [Python 3.11+](https://www.python.org/downloads) — on Windows, check *Add Python to PATH* during installation
-- [Ollama](https://ollama.com/download)
+- [Git](https://git-scm.com/downloads) — all defaults are fine
+- **Ollama** — the setup script checks for it automatically and will prompt you if it is missing
 
-Clone the repository:
+### 2 — Installation
 
 ```bash
 git clone https://github.com/VikFinlay/occ.git
 cd occ
 ```
 
-### First launch
+Then run the setup script for your platform:
 
-On the first run, a launcher script handles everything: it verifies that Python and Ollama are present, installs Python dependencies, detects your hardware, downloads the appropriate model, and starts the node.
-
-**Windows** — double-click `start.bat`, or run it from a terminal:
+**Windows**
 ```
 start.bat
 ```
 
-**macOS / Linux** — run from a terminal:
+**macOS / Linux**
 ```bash
 bash start.sh
 ```
 
-The GUI opens automatically at `http://localhost:7891`.
+The script walks you through setup step by step — checks all requirements, installs dependencies, and launches OCC automatically. At the end, it creates an **OCC Node shortcut on your desktop** so future launches require no terminal at all.
 
-### Subsequent launches
+### 3 — First launch
 
-Once the setup is complete, you can start the node directly:
+On the first run, OCC detects your available VRAM and downloads the appropriate model automatically. This download only happens once — subsequent launches start in seconds.
+
+| Tier | VRAM | Model | Quant | Size |
+|------|------|-------|-------|------|
+| Micro | CPU | qwen3.5:2b | Q4_K_M | — |
+| Small | 4 GB | qwen3.5:4b | Q4_K_M | 3.4 GB |
+| Mid | 8 GB | qwen3.5:9b | Q4_K_M | 5.97 GB |
+| Large | 16 GB | qwen3.5:9b | Q8_0 | 9.53 GB |
+| XL | 24 GB | qwen3.5:9b | BF16 | 19 GB |
+| Server S | 32 GB | qwen3.6:27b | Q4_K_M | 16.8 GB |
+| Server L | 80 GB | qwen3.6:27b | BF16 | 56 GB |
+
+All tiers use the Qwen family with 262K context and thinking mode.
+
+### 4 — Launching OCC
+
+Double-click the **OCC Node** icon on your desktop. The server starts and OCC opens in your browser automatically — no terminal needed.
+
+**Manual fallback** — if the shortcut does not work, open a terminal in the OCC folder and run:
 
 ```bash
 python node/apps/gui/server.py
 ```
 
-Or use the CLI:
+Then open `http://localhost:7891` in your browser.
+
+### 5 — Updating
+
+Inside OCC Node, open **Settings** and click **Update to latest**. OCC pulls the newest version, reinstalls dependencies, and restarts automatically.
+
+**Manual fallback:**
 
 ```bash
-python node/apps/cli/main.py
+git pull
 ```
-
-### Manual setup (advanced)
-
-If you prefer to manage the environment yourself, the only hard requirements are Python 3.11+, Ollama running locally, and the Python dependencies:
-
-```bash
-pip install -r node/requirements.txt
-```
-
-OCC selects the model automatically based on your hardware. You can override it with the `OCC_MODEL` environment variable.
 
 ---
 
@@ -102,7 +114,7 @@ expert-packs/
   general/    ← OCC itself, deliberation concepts
 ```
 
-Packs are plain markdown. You can read them, edit them, add to them. To build new packs from web sources and documents, use **OCC Forge** (`python forge/app.py`).
+Packs are plain markdown. You can read them, edit them, add to them. To build new packs from web sources and documents, use **OCC Forge** — accessible from the sidebar inside OCC Node.
 
 ---
 
@@ -126,12 +138,12 @@ occ/
   node/               ← OCC Node (what you run)
     apps/
       cli/            ← terminal chat interface
-      gui/            ← web GUI (http://localhost:7891)
+      gui/            ← web GUI (http://localhost:7891) — includes Forge
     deliberation/     ← engine, classifier, roles, tools
     expert_runtime/   ← pack loading and retrieval
     server/           ← broker agent, HTTP client
-  forge/              ← OCC Forge (knowledge builder, uses GPT-4o/5)
-  expert-packs/       ← knowledge bases
+  forge/              ← OCC Forge backend (knowledge builder, uses GPT-5)
+  expert-packs/       ← local knowledge bases
 ```
 
 ---
