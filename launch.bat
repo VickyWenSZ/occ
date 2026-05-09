@@ -1,12 +1,11 @@
 @echo off
 cd /d "%~dp0"
 
-:: If server already on 7891, just open browser
-netstat -an 2>nul | findstr ":7891 " >nul 2>&1
-if %errorlevel% equ 0 (
-    start http://localhost:7891
-    exit /b 0
+:: Kill any process currently on port 7891
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":7891 "') do (
+    taskkill /F /PID %%a >nul 2>&1
 )
+timeout /t 1 /nobreak >nul
 
 :: Start Ollama if not running
 ollama list >nul 2>&1
