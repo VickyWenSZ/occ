@@ -1,32 +1,45 @@
 # Open Cognitive Commons
 
-> What if small AI models, running on ordinary hardware, could think together?
+> Free, trustworthy AI for everyone. Forever.
 
-OCC is a distributed AI system where each participant runs a small local language model specialized with an **expert pack** — a curated knowledge base on a specific domain. When you ask a question, your node consults peers across the network. Each peer retrieves from its own knowledge, reasons with its own model, and sends back a perspective. Your node synthesizes the answers.
+OCC is a distributed AI system where small language models — running on ordinary hardware, owned by ordinary people — reason together to produce answers that no single model could reach alone.
 
-The result is a response that no single small model could produce alone.
+Every node accesses the same **verified, community-curated knowledge**: expert packs built from approved sources, cryptographically signed, and served from the OCC server. The network is not a collection of specialists each guarding their own domain. It is a collective of reasoners, all working from the same trusted foundation, each contributing the cognitive role their hardware is best suited for.
 
-No cloud inference. No data sent to third parties. The knowledge stays local. The thinking stays local. Only the conversation between nodes travels through the network — through a lightweight broker that knows nothing about what it carries.
+No cloud inference. No subscription. The knowledge is shared and verified. The reasoning is local and private. The network makes you smarter than your hardware alone.
 
 ---
 
 ## How it works
 
+When you ask a technical question, your node runs a three-stage deliberation:
+
 ```
-You ask a question
-    └── your node checks its expert packs
-    └── your node asks the broker: "who knows about this?"
-    └── broker routes the question to relevant peers
-    └── each peer retrieves from its knowledge base, runs its LLM
-    └── your node receives their answers
-    └── your node synthesizes a final response
+1. RETRIEVE (private)
+   Your node matches your question against a local index
+   → fetches the relevant knowledge pages by name from the OCC server
+   The server never sees your question — only which pages you requested.
+
+2. REASON (distributed)
+   Your node writes an Expert answer using the retrieved knowledge.
+   If a peer with stronger hardware is online, it reviews that answer as Critic —
+   checking for errors, gaps, and unsupported claims.
+   The peer receives the answer and context, encrypted end-to-end.
+   The broker routes the message without reading it.
+
+3. SYNTHESIZE (local)
+   Your node combines the Expert answer and the Critique
+   → produces a final response, streamed to you.
 ```
 
-Three routing modes happen automatically:
+Routing happens automatically based on your question and available peers:
 
-- **Local** — your packs cover the question, no peers needed
-- **Delegate** — peers know more than you, you synthesize their answers
-- **Hybrid** — you and peers both know something, all perspectives combined
+- **Chat** — conversational questions answered directly, no retrieval
+- **Local** — deliberation using server knowledge, no suitable peer available
+- **Distributed** — deliberation with a peer Critic (stronger hardware online)
+- **Local private** — deliberation using your own private packs (local mode)
+
+The stronger your peer's hardware, the harder the reasoning task it receives. A 27B model reviews what a 9B model wrote. A 9B model reviews what a 4B model wrote. The network is self-organizing by capability.
 
 ---
 
@@ -105,29 +118,30 @@ Once running, your node connects to the network broker and becomes part of the c
 
 ## Expert packs
 
-Expert packs are the knowledge units of OCC. Each pack is a collection of dense, factual wiki pages on a specific domain, optimized for LLM retrieval.
+Expert packs are the knowledge units of OCC. Each pack is a structured wiki of dense, factual pages on a specific domain — built by a language model from approved sources, following the [LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).
 
-```
-expert-packs/
-  mcp/        ← Model Context Protocol
-  docker/     ← Docker & container ecosystem
-  general/    ← OCC itself, deliberation concepts
-```
+Packs on the OCC server are:
+- Built exclusively from sources approved by the community (the Source Registry)
+- Cryptographically signed before distribution
+- Identical for every node — no node can poison the network with corrupted local knowledge
+- Auditable: every page is traceable to its source URL and ingestion timestamp
 
-Packs are plain markdown. You can read them, edit them, add to them. To build new packs from web sources and documents, use **OCC Forge** — accessible from the sidebar inside OCC Node.
+To build your own packs from documents, URLs, or free text, use **OCC Forge** — accessible from the sidebar inside OCC Node. Private packs live on your machine and are only used when you enable local mode.
 
 ---
 
 ## Network
 
-Nodes connect through a lightweight WebSocket broker at `broker.opencognitivecommons.org`. The broker:
+Nodes connect through a lightweight WebSocket broker at `broker.opencognitivecommons.org`. The broker is not a knowledge server — it is a mailman.
 
-- Knows which nodes are online and what domains they cover
-- Routes questions to relevant nodes
-- Collects and returns answers
-- Knows nothing about the content of messages
+It does three things:
+- Maintains a registry of online nodes and their hardware tier
+- Routes encrypted messages between nodes
+- Knows nothing about the content of what it carries
 
-The broker is open source and federatable. Anyone can run a compatible broker. Nodes point to whichever broker they trust via `OCC_BROKER_URL`.
+All deliberation payloads are encrypted end-to-end between nodes. The broker sees only opaque blobs and routing metadata. No query, no answer, no retrieved content is ever readable by the broker.
+
+The broker is open source and federatable. Anyone can run a compatible instance. Nodes point to whichever broker they trust via `OCC_BROKER_URL`.
 
 ---
 
@@ -160,9 +174,13 @@ What's missing: more packs, pack signing, a public pack catalog. These are next.
 
 The premise of OCC is that intelligence is not a property of model size. It is a property of knowledge, reasoning, and — when models work together — deliberation.
 
-A 9B model that knows everything about Docker, talking to a 9B model that knows everything about Kubernetes, produces something neither could produce alone. Scale that to hundreds of domains and thousands of nodes, and the collective becomes something new.
+The knowledge problem: most AI systems either centralize inference in the cloud (fast, expensive, private to one company) or leave users alone with a small local model and no knowledge base. OCC takes a third path — shared, verified knowledge that no single actor controls, combined with distributed reasoning that no single node could achieve alone.
 
-OCC is an experiment in what that could look like.
+The trust problem: any system that lets users contribute knowledge becomes a target for manipulation. OCC's answer is a community-governed Source Registry. Packs are built only from approved sources, signed, and auditable. Adding a bad source requires compromising a public, reviewable process — not just uploading a file.
+
+The hardware problem: a 2B model and a 70B model are not the same. OCC uses the difference deliberately. The stronger the peer's hardware, the harder the cognitive task it receives. A small model writes a first answer. A larger model finds its flaws. The network routes work to where it fits.
+
+The result: free, trustworthy AI that runs on hardware people already own, backed by knowledge that a community maintains and verifies, improving as more people join.
 
 ---
 
