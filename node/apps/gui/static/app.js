@@ -9,7 +9,13 @@ let attachments    = [];   // [{name, type, data}]
 let logsSource     = null; // EventSource for broker logs
 let logLineCount   = 0;
 let activeTab      = 'chat';
+let activeView     = 'chat'; // 'chat' | 'forge'
 let config         = {};
+
+// Forge state
+let forgeFiles   = [];   // [{name, data_b64}]
+let forgeMode    = 'add';
+let forgeRunning = false;
 
 let _cmdIdx        = -1;
 let _cmdMouseDown  = false;
@@ -148,10 +154,11 @@ function setupEventListeners() {
   document.getElementById('search-input').addEventListener('input', e => filterChats(e.target.value));
 
   document.getElementById('btn-settings').addEventListener('click', openSettings);
-  document.getElementById('btn-commands').addEventListener('click', openCommands);
+  document.getElementById('btn-forge').addEventListener('click', () => switchView('forge'));
   document.getElementById('close-settings').addEventListener('click', () => closeModal('settings-modal'));
   document.getElementById('local-mode-toggle')?.addEventListener('change', e => setLocalMode(e.target.checked));
-  document.getElementById('close-commands').addEventListener('click', () => closeModal('commands-modal'));
+  document.getElementById('btn-save-openai').addEventListener('click', saveOpenAIKey);
+  document.getElementById('btn-clear-openai').addEventListener('click', clearOpenAIKey);
 
   document.getElementById('tab-chat').addEventListener('click', () => switchTab('chat'));
   document.getElementById('tab-logs').addEventListener('click', () => switchTab('logs'));
@@ -181,6 +188,304 @@ function setupEventListeners() {
       if (e.target === overlay) overlay.classList.add('hidden');
     });
   });
+
+  setupForgeListeners();
+}
+
+// ── Forge ─────────────────────────────────────────────────────────────────────
+
+function switchView(view) {
+  activeView = view;
+  const forgePanelEl = document.getElementById('panel-forge');
+  const chatPanelEl  = document.getElementById('panel-chat');
+  const logsPanelEl  = document.getElementById('panel-logs');
+  const tabsEl       = document.getElementById('main-tabs');
+  const titleEl      = document.getElementById('chat-title');
+  const forgeBtn     = document.getElementById('btn-forge');
+
+  if (view === 'forge') {
+    chatPanelEl.classList.add('hidden');
+    logsPanelEl.classList.add('hidden');
+    forgePanelEl.classList.remove('hidden');
+    tabsEl.classList.add('hidden');
+    titleEl.textContent = 'Forge';
+    forgeBtn.classList.add('active-nav');
+    loadForgePackInfo();
+  } else {
+    forgePanelEl.classList.add('hidden');
+    tabsEl.classList.remove('hidden');
+    chatPanelEl.classList.toggle('hidden', activeTab !== 'chat');
+    logsPanelEl.classList.toggle('hidden', activeTab !== 'logs');
+    const chat = allChats.find(c => c.id === currentChatId);
+    titleEl.textContent = chat?.title || 'New Chat';
+    forgeBtn.classList.remove('active-nav');
+    document.getElementById('message-input').focus();
+  }
+}
+
+function setupForgeListeners() {
+  const dropZone  = document.getElementById('forge-drop-zone');
+  const fileInput = document.getElementById('forge-file-input');
+
+  dropZone.addEventListener('click', e => {
+    if (!e.target.closest('.forge-file-remove')) fileInput.click();
+  });
+  fileInput.addEventListener('change', e => {
+    addForgeFiles(e.target.files);
+    fileInput.value = '';
+  });
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    addForgeFiles(e.dataTransfer.files);
+  });
+
+  document.querySelectorAll('.forge-mode-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.forge-mode-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      forgeMode = btn.dataset.mode;
+    });
+  });
+
+  const packNameInput = document.getElementById('forge-pack-name');
+  let _packDebounce = null;
+  packNameInput.addEventListener('input', () => {
+    clearTimeout(_packDebounce);
+    _packDebounce = setTimeout(loadForgePackInfo, 450);
+  });
+
+  document.getElementById('forge-run-btn').addEventListener('click', runForge);
+  document.getElementById('forge-reset-btn').addEventListener('click', resetForge);
+  document.getElementById('forge-clear-output-btn').addEventListener('click', () => {
+    document.getElementById('forge-output-body').innerHTML =
+      '<span class="log-line system">Waiting for Forge run...</span>';
+  });
+}
+
+function addForgeFiles(fileList) {
+  Array.from(fileList).forEach(file => {
+    if (forgeFiles.some(f => f.name === file.name)) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      const data_b64 = e.target.result.split(',')[1];
+      forgeFiles.push({ name: file.name, data_b64 });
+      renderForgeFileList();
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function removeForgeFile(idx) {
+  forgeFiles.splice(idx, 1);
+  renderForgeFileList();
+}
+
+function renderForgeFileList() {
+  const list        = document.getElementById('forge-file-list');
+  const placeholder = document.getElementById('forge-drop-placeholder');
+  list.innerHTML    = '';
+
+  if (!forgeFiles.length) {
+    placeholder.style.display = 'flex';
+    return;
+  }
+  placeholder.style.display = 'none';
+
+  forgeFiles.forEach((f, i) => {
+    const item   = document.createElement('div');
+    item.className = 'forge-file-item';
+
+    const name   = document.createElement('span');
+    name.className = 'forge-file-name';
+    name.textContent = f.name;
+
+    const remove = document.createElement('button');
+    remove.className = 'forge-file-remove';
+    remove.textContent = '×';
+    remove.addEventListener('click', e => { e.stopPropagation(); removeForgeFile(i); });
+
+    item.appendChild(name);
+    item.appendChild(remove);
+    list.appendChild(item);
+  });
+}
+
+async function loadForgePackInfo() {
+  const raw     = document.getElementById('forge-pack-name').value.trim().toLowerCase();
+  const packName = raw.replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+  const infoEl  = document.getElementById('forge-pack-info');
+
+  if (!packName) {
+    infoEl.className = 'forge-pack-info';
+    infoEl.textContent = '';
+    return;
+  }
+
+  const packs = await apiFetch('/api/forge/packs');
+  if (!packs) return;
+
+  const pack = packs.find(p => p.name === packName);
+  if (!pack) {
+    infoEl.className = 'forge-pack-info';
+    infoEl.textContent = 'New pack — will be created on first run.';
+    return;
+  }
+
+  if (!pack.source_count) {
+    infoEl.className = 'forge-pack-info';
+    infoEl.textContent = '● Pack exists — no sources yet.';
+    return;
+  }
+
+  const lastFetched = pack.sources.length > 0 ? pack.sources[pack.sources.length - 1].fetched : null;
+  infoEl.className = 'forge-pack-info has-content';
+  infoEl.textContent =
+    `● ${pack.source_count} source${pack.source_count !== 1 ? 's' : ''} ingested` +
+    (lastFetched ? ` · last: ${lastFetched}` : '');
+}
+
+async function runForge() {
+  if (forgeRunning) return;
+
+  const packName = document.getElementById('forge-pack-name').value.trim();
+  if (!packName) {
+    appendForgeOutput('❌ Enter a pack name.', 'error');
+    return;
+  }
+
+  const model  = document.getElementById('forge-model').value;
+  const urls   = document.getElementById('forge-urls').value
+    .split('\n').map(u => u.trim()).filter(Boolean);
+  const text   = document.getElementById('forge-text').value.trim();
+
+  if (!forgeFiles.length && !urls.length && !text) {
+    appendForgeOutput('❌ No sources provided. Add files, URLs, or paste text.', 'error');
+    return;
+  }
+
+  forgeRunning = true;
+  const runBtn = document.getElementById('forge-run-btn');
+  runBtn.disabled = true;
+  runBtn.classList.add('running');
+  runBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Running...`;
+
+  document.getElementById('forge-output-body').innerHTML = '';
+
+  try {
+    const resp = await fetch('/api/forge/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pack_name: packName, mode: forgeMode, model, files: forgeFiles, urls, text }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      appendForgeOutput(`❌ ${err.detail || 'Server error'}`, 'error');
+      return;
+    }
+
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch { continue; }
+        if (data.text !== undefined) appendForgeOutput(data.text);
+        else if (data.type === 'forge_complete') showForgeActions(data.pack_name);
+      }
+    }
+
+    await loadForgePackInfo();
+
+  } catch (err) {
+    appendForgeOutput(`❌ ${err.message}`, 'error');
+  } finally {
+    forgeRunning = false;
+    runBtn.disabled = false;
+    runBtn.classList.remove('running');
+    runBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Forge`;
+  }
+}
+
+function resetForge() {
+  document.getElementById('forge-pack-name').value = '';
+  document.getElementById('forge-urls').value = '';
+  document.getElementById('forge-text').value = '';
+  forgeFiles = [];
+  renderForgeFileList();
+  forgeMode = 'add';
+  document.querySelectorAll('.forge-mode-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector('.forge-mode-btn[data-mode="add"]').classList.add('active');
+  const infoEl = document.getElementById('forge-pack-info');
+  infoEl.className = 'forge-pack-info';
+  infoEl.textContent = '';
+  document.getElementById('forge-output-body').innerHTML =
+    '<span class="log-line system">Waiting for Forge run...</span>';
+}
+
+function appendForgeOutput(text) {
+  const body = document.getElementById('forge-output-body');
+  const line = document.createElement('span');
+
+  let cls = 'log-line system';
+  if (text.includes('❌'))      cls = 'log-line error';
+  else if (text.includes('✅') || text.includes('🎉')) cls = 'log-line ok';
+  else if (text.includes('⚠️')) cls = 'log-line warn';
+  else if (text.startsWith('\n━') || text.startsWith('━')) cls = 'log-line node';
+
+  line.className   = cls;
+  line.textContent = text;
+  body.appendChild(line);
+  body.appendChild(document.createTextNode('\n'));
+
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+  if (nearBottom) body.scrollTop = body.scrollHeight;
+}
+
+function showForgeActions(packName) {
+  const body = document.getElementById('forge-output-body');
+  const panel = document.createElement('div');
+  panel.className = 'forge-complete-panel';
+  panel.innerHTML = `
+    <div class="forge-complete-title">Pack <strong>${packName}</strong> ready.</div>
+    <div class="forge-complete-btns">
+      <button class="forge-act-btn forge-act-primary" onclick="forgeReloadPacks('${packName}', this)">↺ Load into Node</button>
+      <button class="forge-act-btn" onclick="window.open('https://www.opencognitivecommons.org/packs','_blank')">↑ Submit to Community</button>
+      <button class="forge-act-btn" onclick="forgeOpenFolder('${packName}')">⬚ Open Folder</button>
+    </div>
+    <div class="forge-complete-note">Submit: indicate which node you want to propose it under.</div>
+    <div class="forge-complete-note">To query this pack locally, enable <strong>Local mode</strong> via <code>/local on</code> or in Settings.</div>
+  `;
+  body.appendChild(panel);
+  body.scrollTop = body.scrollHeight;
+}
+
+async function forgeReloadPacks(packName, btn) {
+  btn.disabled = true;
+  btn.textContent = '↻ Loading...';
+  const r = await apiFetch('/api/forge/reload-packs', { method: 'POST' });
+  if (r && r.ok) {
+    btn.textContent = `✓ Loaded (${r.packs} pack${r.packs !== 1 ? 's' : ''})`;
+    btn.classList.add('forge-act-success');
+  } else {
+    btn.textContent = '❌ Failed';
+    btn.disabled = false;
+  }
+}
+
+async function forgeOpenFolder(packName) {
+  await apiFetch(`/api/forge/open-folder/${encodeURIComponent(packName)}`, { method: 'POST' });
 }
 
 // ── Input / textarea ──────────────────────────────────────────────────────────
@@ -289,6 +594,7 @@ async function loadChats() {
 
 async function newChat() {
   if (isStreaming) return;
+  if (activeView !== 'chat') switchView('chat');
   const data = await apiFetch('/api/chats', { method: 'POST' });
   if (!data) return;
   await loadChats();
@@ -297,6 +603,7 @@ async function newChat() {
 
 async function selectChat(id) {
   if (isStreaming) return;
+  if (activeView !== 'chat') switchView('chat');
   currentChatId = id;
 
   // Update active state in sidebar
@@ -1115,7 +1422,46 @@ async function openSettings() {
   const localToggle = document.getElementById('local-mode-toggle');
   if (localToggle) localToggle.checked = !!cfg.local_mode;
 
+  const openaiStatus = document.getElementById('openai-status-line');
+  if (openaiStatus) {
+    openaiStatus.className = cfg.openai_configured ? 'or-status ok' : 'or-status off';
+    openaiStatus.textContent = cfg.openai_configured ? '● API key configured' : '○ Not configured';
+  }
+  const openaiHint = document.getElementById('openai-key-hint');
+  if (openaiHint) openaiHint.style.display = cfg.openai_configured ? 'block' : 'none';
+
   document.getElementById('settings-modal').classList.remove('hidden');
+}
+
+async function saveOpenAIKey() {
+  const key = document.getElementById('openai-key').value.trim();
+  if (!key) { alert('Enter an API key.'); return; }
+  const r = await apiFetch('/api/config/openai', {
+    method: 'POST',
+    body: JSON.stringify({ api_key: key }),
+  });
+  if (r?.ok) {
+    document.getElementById('openai-key').value = '';
+    config.openai_configured = true;
+    const st = document.getElementById('openai-status-line');
+    if (st) { st.className = 'or-status ok'; st.textContent = '● API key configured'; }
+    const hnt = document.getElementById('openai-key-hint');
+    if (hnt) hnt.style.display = 'block';
+  }
+}
+
+async function clearOpenAIKey() {
+  const r = await apiFetch('/api/config/openai', {
+    method: 'POST',
+    body: JSON.stringify({ api_key: '' }),
+  });
+  if (r?.ok) {
+    config.openai_configured = false;
+    const st = document.getElementById('openai-status-line');
+    if (st) { st.className = 'or-status off'; st.textContent = '○ Not configured'; }
+    const hnt = document.getElementById('openai-key-hint');
+    if (hnt) hnt.style.display = 'none';
+  }
 }
 
 async function setLocalMode(enabled) {
@@ -1170,10 +1516,6 @@ async function disableOpenRouter() {
     orStatus.textContent = '○ Not configured';
     updateProviderBadge(false);
   }
-}
-
-function openCommands() {
-  document.getElementById('commands-modal').classList.remove('hidden');
 }
 
 function closeModal(id) {

@@ -6,7 +6,11 @@ Then open: http://localhost:7891
 import asyncio
 import base64
 import json
+import os
+import re
+import shutil
 import sys
+import tempfile
 import threading
 import uuid
 from datetime import datetime
@@ -262,6 +266,7 @@ async def get_config():
         "openrouter_model": _cfg.openrouter_model,
         "packs": [{"name": p.name, "domains": p.domains} for p in (_retriever.packs if _retriever else [])],
         "local_mode": _cfg.local_mode,
+        "openai_configured": bool(_cfg.openai_api_key),
     }
 
 
@@ -301,6 +306,313 @@ async def set_local_mode(body: LocalModeBody):
     if _engine:
         _engine._local_mode = body.enabled
     return {"ok": True, "local_mode": body.enabled}
+
+
+# ── Routes — OpenAI config ───────────────────────────────────────────────────
+
+class OpenAIKeyBody(BaseModel):
+    api_key: str
+
+
+@app.post("/api/config/openai")
+async def set_openai_key(body: OpenAIKeyBody):
+    from node.apps.cli.config import save_openai_config
+    save_openai_config(body.api_key.strip())
+    global _cfg
+    _cfg = Config()
+    return {"ok": True}
+
+
+# ── Routes — Forge ────────────────────────────────────────────────────────────
+
+@app.get("/api/forge/packs")
+async def forge_list_packs():
+    import yaml
+    packs_root = ROOT / "expert-packs"
+    result = []
+    if packs_root.exists():
+        for pack_dir in sorted(packs_root.iterdir()):
+            if pack_dir.is_dir() and (pack_dir / "wiki").exists():
+                manifest_path = pack_dir / "manifest.yaml"
+                sources = []
+                if manifest_path.exists():
+                    try:
+                        with open(manifest_path, encoding="utf-8") as f:
+                            mf = yaml.safe_load(f) or {}
+                        sources = mf.get("sources", [])
+                    except Exception:
+                        pass
+                result.append({
+                    "name": pack_dir.name,
+                    "source_count": len(sources),
+                    "sources": [
+                        {"url": s.get("url", "?"), "fetched": s.get("fetched", "?")}
+                        for s in sources
+                    ],
+                })
+    return result
+
+
+class ForgeRunBody(BaseModel):
+    pack_name: str
+    mode: str = "add"
+    model: str = "gpt-5"
+    files: list[dict] = []
+    urls: list[str] = []
+    text: str = ""
+
+
+@app.post("/api/forge/run")
+async def forge_run(body: ForgeRunBody):
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    if not _cfg.openai_api_key:
+        raise HTTPException(400, "OpenAI API key not configured. Add it in Settings → OpenAI / Forge.")
+
+    pack_name_clean = re.sub(r'[^a-z0-9-]', '-', body.pack_name.strip().lower()).strip('-')
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def thread():
+            success = False
+            try:
+                for line in _forge_run_core(body):
+                    asyncio.run_coroutine_threadsafe(q.put({"text": line}), loop)
+                success = True
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(q.put({"text": f"❌ Error: {exc}"}), loop)
+            finally:
+                if success:
+                    asyncio.run_coroutine_threadsafe(
+                        q.put({"type": "forge_complete", "pack_name": pack_name_clean}), loop
+                    )
+                asyncio.run_coroutine_threadsafe(q.put(None), loop)
+
+        threading.Thread(target=thread, daemon=True).start()
+
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _forge_run_core(body: "ForgeRunBody"):
+    """Blocking generator — runs in a thread, yields log lines."""
+    os.environ["OPENAI_API_KEY"] = _cfg.openai_api_key
+
+    import forge._llm as llm
+    import forge._sources as sources
+    import forge._wiki as wiki
+    import forge._manifest as manifest
+
+    pack_name = re.sub(r'[^a-z0-9-]', '-', body.pack_name.strip().lower()).strip('-')
+    if not pack_name:
+        yield "❌ Invalid pack name."
+        return
+
+    extract_model = "gpt-5-mini"
+    write_model = body.model
+
+    pack_dir = ROOT / "expert-packs" / pack_name
+    wiki_dir = pack_dir / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    rebuild = body.mode == "rebuild"
+    if rebuild:
+        concepts_dir = wiki_dir / "concepts"
+        if concepts_dir.exists():
+            shutil.rmtree(concepts_dir)
+            yield "🗑️ Concepts deleted — starting from scratch."
+        log_path = wiki_dir / "log.md"
+        if log_path.exists():
+            log_path.unlink()
+        mf = manifest.load_or_create(pack_dir, pack_name)
+        mf["sources"] = []
+    else:
+        mf = manifest.load_or_create(pack_dir, pack_name)
+
+    wiki.ensure_schema(wiki_dir, pack_name)
+    all_pages = wiki.scan_existing_pages(wiki_dir)
+    existing_slugs = {p["slug"] for p in all_pages}
+
+    raw_sources = []
+    temp_files_cleanup = []
+
+    for f in body.files:
+        try:
+            data = base64.b64decode(f["data_b64"])
+            suffix = Path(f.get("name", "file.txt")).suffix or ".txt"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(data)
+            tmp.close()
+            temp_files_cleanup.append(tmp.name)
+            yield f"📂 Reading file: {f.get('name', 'file')}..."
+            text_content, name, url = sources.read_file(Path(tmp.name))
+            stem = Path(f.get("name", name)).stem
+            name = re.sub(r'[^a-z0-9-]', '-', stem.lower()).strip('-') or name
+            raw_sources.append((text_content, name, url))
+        except Exception as e:
+            yield f"❌ Error reading {f.get('name', 'file')}: {e}"
+
+    for url in body.urls:
+        url = url.strip()
+        if not url:
+            continue
+        yield f"🌐 Fetching: {url}..."
+        try:
+            text_content, name, fetched_url = sources.fetch_url(url)
+            raw_sources.append((text_content, name, fetched_url))
+        except Exception as e:
+            err = str(e)
+            if any(c in err for c in ["403", "401", "406"]):
+                yield f"⚠️ {url}\n   → Blocked ({err[:3]}). Try saving the page as a file."
+            else:
+                yield f"❌ Error fetching {url}: {e}"
+
+    if body.text and body.text.strip():
+        yield "📝 Using text input..."
+        raw_sources.append((body.text.strip(), "manual-text", "text://manual"))
+
+    if not raw_sources:
+        yield "❌ No sources found. Add files, URLs, or paste text."
+        return
+
+    total_written = 0
+
+    try:
+        for text_content, source_name, source_url in raw_sources:
+            yield f"\n━━━ Source: {source_name} ({len(text_content):,} chars) ━━━"
+
+            yield f"🔍 Extracting concepts ({extract_model})..."
+            concepts = None
+            for attempt in range(3):
+                try:
+                    concepts = llm.extract_concepts(text_content, model=extract_model)
+                    break
+                except Exception as e:
+                    yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
+            if not concepts:
+                yield "❌ Concept extraction failed after 3 attempts, skipping source."
+                continue
+
+            yield f"💡 Found {len(concepts)} concepts: {', '.join(c.get('title', c.get('slug', '?')) for c in concepts)}"
+
+            written = 0
+            for concept in concepts:
+                slug = re.sub(r'[^a-z0-9-]', '-', concept.get("slug", "unknown")).strip('-')
+                concept["slug"] = slug
+                title = concept.get("title", slug)
+
+                existing_path = wiki_dir / "concepts" / f"{slug}.md"
+                if existing_path.exists():
+                    yield f"✍️  Enriching: {title}..."
+                    existing_content = existing_path.read_text(encoding="utf-8")
+                    page_content = None
+                    for attempt in range(3):
+                        try:
+                            page_content = llm.update_wiki_page(
+                                concept, existing_content, text_content, source_name, model=write_model
+                            )
+                            break
+                        except Exception as e:
+                            yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
+                else:
+                    yield f"✍️  Writing: {title}..."
+                    page_content = None
+                    for attempt in range(3):
+                        try:
+                            page_content = llm.write_wiki_page(
+                                concept, text_content, source_name, model=write_model
+                            )
+                            break
+                        except Exception as e:
+                            yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
+
+                if not page_content:
+                    yield f"❌ '{title}' failed after 3 attempts, skipping."
+                    continue
+
+                if page_content.strip():
+                    wiki.write_page(wiki_dir, slug, page_content)
+                    entry = {"slug": slug, "title": title, "summary": concept.get("summary", "")}
+                    if slug not in existing_slugs:
+                        all_pages.append(entry)
+                        existing_slugs.add(slug)
+                    else:
+                        for p in all_pages:
+                            if p["slug"] == slug:
+                                p.update(entry)
+                                break
+                    written += 1
+                    total_written += 1
+                    yield f"  ✅ {title} → concepts/{slug}.md"
+                else:
+                    yield f"  ⚠️ {title}: empty response"
+
+            manifest.add_source(mf, source_url, sources.sha256(text_content))
+            wiki.append_log(wiki_dir, source_name, written, source_url)
+
+        wiki.update_index(wiki_dir, all_pages)
+        manifest.save(pack_dir, mf)
+
+        yield f"\n🎉 Done! {total_written} pages written to expert-packs/{pack_name}/wiki/concepts/"
+        yield f"📋 Index updated: {len(all_pages)} total pages in pack."
+
+    finally:
+        for tmp_path in temp_files_cleanup:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+@app.post("/api/forge/reload-packs")
+async def forge_reload_packs():
+    global _retriever, _engine
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    _retriever = load_all_packs(_cfg.packs_root)
+    workspace = ROOT / "workspace"
+    _engine = DeliberationEngine(
+        model=_model,
+        expert_pack=_retriever,
+        num_ctx_answer=_cfg.num_ctx_answer,
+        num_ctx_synth=_cfg.num_ctx_synth,
+        retrieval_chars=_cfg.retrieval_chars,
+        domains=_retriever.domains if _retriever else [],
+        workspace=workspace,
+        openrouter_key=_cfg.openrouter_api_key,
+        openrouter_model=_cfg.openrouter_model,
+        local_mode=_cfg.local_mode,
+    )
+    n = len(_retriever.packs)
+    log_bus.write(f"[GUI] Packs reloaded: {n} pack(s)")
+    return {"ok": True, "packs": n}
+
+
+@app.post("/api/forge/open-folder/{pack_name}")
+async def forge_open_folder(pack_name: str):
+    import platform, subprocess
+    pack_dir = ROOT / "expert-packs" / pack_name
+    if not pack_dir.exists():
+        raise HTTPException(404, "Pack not found")
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(str(pack_dir))
+    elif system == "Darwin":
+        subprocess.Popen(["open", str(pack_dir)])
+    else:
+        subprocess.Popen(["xdg-open", str(pack_dir)])
+    return {"ok": True}
 
 
 # ── Routes — chats ────────────────────────────────────────────────────────────
