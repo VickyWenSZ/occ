@@ -211,6 +211,7 @@ function switchView(view) {
     titleEl.textContent = 'Forge';
     forgeBtn.classList.add('active-nav');
     loadForgePackInfo();
+    loadLintPacks();
   } else {
     forgePanelEl.classList.add('hidden');
     tabsEl.classList.remove('hidden');
@@ -259,6 +260,7 @@ function setupForgeListeners() {
 
   document.getElementById('forge-run-btn').addEventListener('click', runForge);
   document.getElementById('forge-reset-btn').addEventListener('click', resetForge);
+  document.getElementById('forge-lint-btn').addEventListener('click', () => runLint());
   document.getElementById('forge-clear-output-btn').addEventListener('click', () => {
     document.getElementById('forge-output-body').innerHTML =
       '<span class="log-line system">Waiting for Forge run...</span>';
@@ -313,6 +315,21 @@ function renderForgeFileList() {
   });
 }
 
+async function loadLintPacks() {
+  const sel = document.getElementById('forge-lint-pack');
+  const current = sel.value;
+  const packs = await apiFetch('/api/forge/packs');
+  if (!packs) return;
+  sel.innerHTML = '<option value="">— select a pack —</option>';
+  packs.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.name;
+    opt.textContent = `${p.name}  (${p.source_count} source${p.source_count !== 1 ? 's' : ''})`;
+    sel.appendChild(opt);
+  });
+  if (current && packs.find(p => p.name === current)) sel.value = current;
+}
+
 async function loadForgePackInfo() {
   const raw     = document.getElementById('forge-pack-name').value.trim().toLowerCase();
   const packName = raw.replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
@@ -326,6 +343,17 @@ async function loadForgePackInfo() {
 
   const packs = await apiFetch('/api/forge/packs');
   if (!packs) return;
+
+  // populate datalist for autocomplete
+  const dl = document.getElementById('forge-pack-list');
+  if (dl) {
+    dl.innerHTML = '';
+    packs.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      dl.appendChild(opt);
+    });
+  }
 
   const pack = packs.find(p => p.name === packName);
   if (!pack) {
@@ -461,6 +489,7 @@ function showForgeActions(packName) {
     <div class="forge-complete-title">Pack <strong>${packName}</strong> ready.</div>
     <div class="forge-complete-btns">
       <button class="forge-act-btn forge-act-primary" onclick="forgeReloadPacks('${packName}', this)">↺ Load into Node</button>
+      <button class="forge-act-btn" onclick="runLint('${packName}')">⊙ Lint this Pack</button>
       <button class="forge-act-btn" onclick="window.open('https://www.opencognitivecommons.org/packs','_blank')">↑ Submit to Community</button>
       <button class="forge-act-btn" onclick="forgeOpenFolder('${packName}')">⬚ Open Folder</button>
     </div>
@@ -486,6 +515,68 @@ async function forgeReloadPacks(packName, btn) {
 
 async function forgeOpenFolder(packName) {
   await apiFetch(`/api/forge/open-folder/${encodeURIComponent(packName)}`, { method: 'POST' });
+}
+
+async function runLint(packNameOverride = null) {
+  const packName = packNameOverride || document.getElementById('forge-lint-pack').value;
+  if (!packName) {
+    appendForgeOutput('❌ Select a pack to lint.', 'error');
+    return;
+  }
+
+  const model = document.getElementById('forge-model').value;
+  const lintBtn = document.getElementById('forge-lint-btn');
+  if (lintBtn) { lintBtn.disabled = true; lintBtn.textContent = 'Running...'; }
+
+  document.getElementById('forge-output-body').innerHTML = '';
+  appendForgeOutput(`🔍 Linting pack: ${packName}...`);
+
+  try {
+    const resp = await fetch('/api/forge/lint', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pack_name: packName, model }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      appendForgeOutput(`❌ ${err.detail || 'Server error'}`, 'error');
+      return;
+    }
+
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch { continue; }
+        if (data.text !== undefined) appendForgeOutput(data.text);
+        else if (data.type === 'lint_complete') showLintComplete(data.pack_name);
+      }
+    }
+  } catch (err) {
+    appendForgeOutput(`❌ ${err.message}`, 'error');
+  } finally {
+    if (lintBtn) { lintBtn.disabled = false; lintBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Run Lint'; }
+  }
+}
+
+function showLintComplete(packName) {
+  const body = document.getElementById('forge-output-body');
+  const note = document.createElement('div');
+  note.className = 'forge-complete-note';
+  note.style.marginTop = '0.75rem';
+  note.textContent = `Lint complete for pack "${packName}".`;
+  body.appendChild(note);
+  body.scrollTop = body.scrollHeight;
 }
 
 // ── Input / textarea ──────────────────────────────────────────────────────────

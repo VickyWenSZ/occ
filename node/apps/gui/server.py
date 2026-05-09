@@ -575,6 +575,95 @@ def _forge_run_core(body: "ForgeRunBody"):
                 pass
 
 
+class ForgeLintBody(BaseModel):
+    pack_name: str
+    model: str = "gpt-5"
+
+
+@app.post("/api/forge/lint")
+async def forge_lint(body: ForgeLintBody):
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    if not _cfg.openai_api_key:
+        raise HTTPException(400, "OpenAI API key not configured. Add it in Settings → OpenAI / Forge.")
+
+    pack_name = re.sub(r'[^a-z0-9-]', '-', body.pack_name.strip().lower()).strip('-')
+    if not pack_name:
+        raise HTTPException(400, "Invalid pack name.")
+
+    pack_dir = ROOT / "expert-packs" / pack_name
+    wiki_dir = pack_dir / "wiki"
+    if not wiki_dir.exists():
+        raise HTTPException(404, f"Pack '{pack_name}' not found.")
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def thread():
+            try:
+                for line in _lint_run_core(pack_name, wiki_dir, body.model):
+                    asyncio.run_coroutine_threadsafe(q.put({"text": line}), loop)
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "lint_complete", "pack_name": pack_name}), loop
+                )
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(q.put({"text": f"❌ Error: {exc}"}), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(None), loop)
+
+        threading.Thread(target=thread, daemon=True).start()
+
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _lint_run_core(pack_name: str, wiki_dir: Path, model: str):
+    os.environ["OPENAI_API_KEY"] = _cfg.openai_api_key
+    import forge._llm as llm
+
+    yield f"🔍 Reading pack '{pack_name}'..."
+
+    index_path = wiki_dir / "index.md"
+    index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else "(no index.md found)"
+
+    concepts_dir = wiki_dir / "concepts"
+    pages_parts = []
+    MAX_TOTAL = 80_000
+    total_chars = 0
+
+    if concepts_dir.exists():
+        page_files = sorted(concepts_dir.glob("*.md"))
+        yield f"📄 Found {len(page_files)} page(s) — loading..."
+        for pf in page_files:
+            content = pf.read_text(encoding="utf-8")
+            chunk = f"\n### {pf.stem}\n{content}\n"
+            if total_chars + len(chunk) > MAX_TOTAL:
+                pages_parts.append(f"\n### (truncated — {len(page_files)} total pages, limit reached)")
+                break
+            pages_parts.append(chunk)
+            total_chars += len(chunk)
+    else:
+        yield "⚠️  No concepts directory found."
+
+    pages_content = "".join(pages_parts) or "(no pages found)"
+
+    yield f"🤖 Running lint analysis ({model})..."
+    report = llm.lint_wiki(pack_name, index_content, pages_content, model=model)
+
+    yield "\n" + report
+    yield f"\n✅ Lint complete."
+
+
 @app.post("/api/forge/reload-packs")
 async def forge_reload_packs():
     global _retriever, _engine

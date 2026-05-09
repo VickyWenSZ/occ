@@ -128,6 +128,43 @@ def update_wiki_page(
     return _call(model, system, user, json_mode=False, max_output_tokens=32000)
 
 
+def lint_wiki(
+    pack_name: str,
+    index_content: str,
+    pages_content: str,
+    model: str = DEFAULT_WRITE_MODEL,
+) -> str:
+    """
+    Perform a quality review (lint) of an expert pack wiki.
+    Returns a structured markdown report.
+    """
+    system = (
+        "You are a knowledge quality reviewer for an LLM wiki. "
+        "Analyze the provided wiki pages and produce a precise, actionable quality report. "
+        "Be specific: quote exact claims when flagging issues. Output markdown."
+    )
+    user = (
+        f"Wiki pack: {pack_name}\n\n"
+        f"INDEX.MD:\n---\n{index_content}\n---\n\n"
+        f"PAGES:\n---\n{pages_content}\n---\n\n"
+        f"Produce a quality review report with these exact sections:\n\n"
+        f"## Summary\n"
+        f"Overall assessment in 1-2 sentences.\n\n"
+        f"## Contradictions\n"
+        f"Conflicting claims between pages. Quote the specific conflicting statements and name the pages.\n\n"
+        f"## Orphaned Pages\n"
+        f"Pages present in the concepts directory but not referenced in index.md.\n\n"
+        f"## Missing Cross-References\n"
+        f"Concepts that are related but not linked to each other.\n\n"
+        f"## Coverage Gaps\n"
+        f"Important concepts that appear in sources but have no dedicated page.\n\n"
+        f"## Staleness Warnings\n"
+        f"Claims that may be outdated (version numbers, deprecated features, date-sensitive info).\n\n"
+        f"For any section with no issues, write exactly: _None found._"
+    )
+    return _call(model, system, user, json_mode=False, max_output_tokens=8192)
+
+
 def write_wiki_page(
     concept: dict,
     source_text: str,
