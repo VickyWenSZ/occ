@@ -6,6 +6,7 @@ OS="$(uname -s)"
 if [[ "$OS" == "Darwin" ]]; then
     lsof -ti :7891 2>/dev/null | xargs kill -9 2>/dev/null || true
 else
+    lsof -ti :7891 2>/dev/null | xargs kill -9 2>/dev/null || \
     fuser -k 7891/tcp 2>/dev/null || true
 fi
 sleep 1

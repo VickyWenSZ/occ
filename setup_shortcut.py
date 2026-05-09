@@ -48,7 +48,7 @@ def linux():
         f'Type=Application\n'
         f'Name=OCC Node\n'
         f'Comment=Launch OCC Node\n'
-        f'Exec={proj}/launch.sh\n'
+        f'Exec="{proj}/launch.sh"\n'
         f'Icon={icon}\n'
         f'Terminal=false\n'
         f'Categories=Utility;\n',
