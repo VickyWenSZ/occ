@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -321,6 +321,49 @@ async def set_openai_key(body: OpenAIKeyBody):
     global _cfg
     _cfg = Config()
     return {"ok": True}
+
+
+# ── Routes — Update ───────────────────────────────────────────────────────────
+
+@app.post("/api/update")
+async def update_app(background_tasks: BackgroundTasks):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull", "--ff-only",
+            cwd=str(ROOT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        return {"updated": False, "message": "Timed out. Check your internet connection."}
+    except Exception as e:
+        return {"updated": False, "message": f"Error: {e}"}
+
+    if proc.returncode != 0:
+        err = stderr.decode().strip()
+        return {"updated": False, "message": err or "git pull failed — is this a git repository?"}
+
+    git_out = stdout.decode().strip()
+    if "Already up to date" in git_out or "Already up-to-date" in git_out:
+        return {"updated": False, "message": "Already up to date."}
+
+    pip = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "pip", "install", "-r",
+        str(ROOT / "node" / "requirements.txt"), "-q",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await pip.communicate()
+
+    background_tasks.add_task(_restart_server)
+    return {"updated": True, "message": git_out}
+
+
+def _restart_server():
+    import time
+    time.sleep(1.5)
+    os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
 
 
 # ── Routes — Forge ────────────────────────────────────────────────────────────

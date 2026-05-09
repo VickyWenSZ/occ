@@ -181,6 +181,7 @@ function setupEventListeners() {
 
   document.getElementById('btn-save-or').addEventListener('click', saveOpenRouter);
   document.getElementById('btn-disable-or').addEventListener('click', disableOpenRouter);
+  document.getElementById('btn-update').addEventListener('click', runUpdate);
 
   // Close modals on overlay click
   document.querySelectorAll('.modal-overlay').forEach(overlay => {
@@ -1611,6 +1612,48 @@ async function disableOpenRouter() {
 
 function closeModal(id) {
   document.getElementById(id).classList.add('hidden');
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+
+async function runUpdate() {
+  const btn = document.getElementById('btn-update');
+  const status = document.getElementById('update-status');
+  btn.disabled = true;
+  status.style.color = 'var(--text-faint)';
+  status.textContent = 'Checking for updates…';
+
+  let data;
+  try {
+    const r = await fetch('/api/update', { method: 'POST' });
+    data = await r.json();
+  } catch {
+    status.style.color = 'var(--text-faint)';
+    status.textContent = 'Network error.';
+    btn.disabled = false;
+    return;
+  }
+
+  if (!data.updated) {
+    status.textContent = data.message || 'Already up to date.';
+    btn.disabled = false;
+    return;
+  }
+
+  status.style.color = 'var(--accent)';
+  status.textContent = 'Updated — restarting…';
+
+  // Poll until server is back, then reload
+  await new Promise(r => setTimeout(r, 2500));
+  for (let i = 0; i < 30; i++) {
+    try {
+      const r = await fetch('/api/config', { signal: AbortSignal.timeout(2000) });
+      if (r.ok) { location.reload(); return; }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  status.textContent = 'Restart timed out — click the OCC Node icon to restart manually.';
+  btn.disabled = false;
 }
 
 // ── Context bar ──────────────────────────────────────────────────────────────
