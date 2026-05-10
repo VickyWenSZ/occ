@@ -266,7 +266,6 @@ async def get_config():
         "openrouter_model": _cfg.openrouter_model,
         "packs": [{"name": p.name, "domains": p.domains} for p in (_retriever.packs if _retriever else [])],
         "local_mode": _cfg.local_mode,
-        "openai_configured": bool(_cfg.openai_api_key),
     }
 
 
@@ -306,21 +305,6 @@ async def set_local_mode(body: LocalModeBody):
     if _engine:
         _engine._local_mode = body.enabled
     return {"ok": True, "local_mode": body.enabled}
-
-
-# ── Routes — OpenAI config ───────────────────────────────────────────────────
-
-class OpenAIKeyBody(BaseModel):
-    api_key: str
-
-
-@app.post("/api/config/openai")
-async def set_openai_key(body: OpenAIKeyBody):
-    from node.apps.cli.config import save_openai_config
-    save_openai_config(body.api_key.strip())
-    global _cfg
-    _cfg = Config()
-    return {"ok": True}
 
 
 # ── Routes — Update ───────────────────────────────────────────────────────────
@@ -399,7 +383,8 @@ async def forge_list_packs():
 class ForgeRunBody(BaseModel):
     pack_name: str
     mode: str = "add"
-    model: str = "gpt-5"
+    extract_model: str = "openai/gpt-5-mini"
+    model: str = "openai/gpt-5"
     files: list[dict] = []
     urls: list[str] = []
     text: str = ""
@@ -409,8 +394,8 @@ class ForgeRunBody(BaseModel):
 async def forge_run(body: ForgeRunBody):
     if not _cfg:
         raise HTTPException(503, "Not ready")
-    if not _cfg.openai_api_key:
-        raise HTTPException(400, "OpenAI API key not configured. Add it in Settings → OpenAI / Forge.")
+    if not _cfg.openrouter_api_key:
+        raise HTTPException(400, "OpenRouter API key not configured. Add it in Settings → OpenRouter.")
 
     pack_name_clean = re.sub(r'[^a-z0-9-]', '-', body.pack_name.strip().lower()).strip('-')
 
@@ -450,7 +435,7 @@ async def forge_run(body: ForgeRunBody):
 
 def _forge_run_core(body: "ForgeRunBody"):
     """Blocking generator — runs in a thread, yields log lines."""
-    os.environ["OPENAI_API_KEY"] = _cfg.openai_api_key
+    os.environ["OPENROUTER_API_KEY"] = _cfg.openrouter_api_key
 
     import forge._llm as llm
     import forge._sources as sources
@@ -462,7 +447,7 @@ def _forge_run_core(body: "ForgeRunBody"):
         yield "❌ Invalid pack name."
         return
 
-    extract_model = "gpt-5-mini"
+    extract_model = body.extract_model
     write_model = body.model
 
     pack_dir = ROOT / "expert-packs" / pack_name
@@ -630,8 +615,8 @@ class ForgeLintBody(BaseModel):
 async def forge_lint(body: ForgeLintBody):
     if not _cfg:
         raise HTTPException(503, "Not ready")
-    if not _cfg.openai_api_key:
-        raise HTTPException(400, "OpenAI API key not configured. Add it in Settings → OpenAI / Forge.")
+    if not _cfg.openrouter_api_key:
+        raise HTTPException(400, "OpenRouter API key not configured. Add it in Settings → OpenRouter.")
 
     pack_name = re.sub(r'[^a-z0-9-]', '-', body.pack_name.strip().lower()).strip('-')
     if not pack_name:
@@ -674,7 +659,7 @@ async def forge_lint(body: ForgeLintBody):
 
 
 def _lint_run_core(pack_name: str, wiki_dir: Path, model: str):
-    os.environ["OPENAI_API_KEY"] = _cfg.openai_api_key
+    os.environ["OPENROUTER_API_KEY"] = _cfg.openrouter_api_key
     import forge._llm as llm
 
     yield f"🔍 Reading pack '{pack_name}'..."

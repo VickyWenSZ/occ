@@ -22,3 +22,4 @@ fix_nginx.py
 .occ_config.json
 .occ_chats.json
 OCC_DESIGN_SYSTEM.md
+admin/

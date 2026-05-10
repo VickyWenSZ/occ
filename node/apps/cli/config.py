@@ -36,11 +36,6 @@ def save_local_mode(enabled: bool):
     _save_occ_config(cfg)
 
 
-def save_openai_config(api_key: str):
-    cfg = _load_occ_config()
-    cfg["openai_api_key"] = api_key
-    _save_occ_config(cfg)
-
 
 class Config:
     def __init__(self):
@@ -67,6 +62,3 @@ class Config:
             os.getenv("OCC_OPENROUTER_MODEL") or occ_cfg.get("openrouter_model", BUDGET_MODEL)
         )
         self.local_mode: bool = occ_cfg.get("local_mode", False)
-        self.openai_api_key: str = (
-            occ_cfg.get("openai_api_key", "") or os.getenv("OPENAI_API_KEY", "")
-        )

@@ -1,34 +1,31 @@
 """
-OpenAI Responses API calls for OCC Forge.
-IMPORTANT: Always use /v1/responses, never /v1/chat/completions.
-See forge/OPENAI_RESPONSES_API_GUIDE.md for critical rules.
+OpenRouter Chat Completions API calls for OCC Forge.
+Uses OPENROUTER_API_KEY — same key as Node (no separate OpenAI key needed).
+Models: openai/gpt-5, openai/gpt-5-mini, anthropic/claude-sonnet-4-6, etc.
 """
 import os
 import json
 import httpx
 from datetime import date
 
-OPENAI_API_URL = "https://api.openai.com/v1/responses"
-DEFAULT_EXTRACT_MODEL = "gpt-5-mini"
-DEFAULT_WRITE_MODEL = "gpt-5"
+OR_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_EXTRACT_MODEL = "openai/gpt-5-mini"
+DEFAULT_WRITE_MODEL   = "openai/gpt-5"
 _TIMEOUT = None
 
 
 def _api_key() -> str:
-    key = os.environ.get("OPENAI_API_KEY", "")
+    key = os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
-        raise RuntimeError("OPENAI_API_KEY environment variable not set.")
+        raise RuntimeError("OPENROUTER_API_KEY not set. Add your OpenRouter key in Settings.")
     return key
 
 
-def _extract_text(data: dict) -> str:
-    """Extract text from Responses API output[]. Loops to find type='message', never assumes output[0]."""
-    for item in data.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                if block.get("type") in ("output_text", "text") and block.get("text"):
-                    return block["text"]
-    return data.get("output_text", "")
+def _normalize_model(model: str) -> str:
+    """Add openai/ prefix to bare GPT model names for OpenRouter compatibility."""
+    if "/" not in model:
+        return f"openai/{model}"
+    return model
 
 
 def _call(
@@ -38,32 +35,32 @@ def _call(
     json_mode: bool = False,
     max_output_tokens: int = 4096,
 ) -> str:
+    model = _normalize_model(model)
     body: dict = {
         "model": model,
-        "input": [
+        "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user",   "content": user},
         ],
-        "max_output_tokens": max_output_tokens,
+        "max_tokens": max_output_tokens,
     }
     if json_mode:
-        # CRITICAL: prompt must contain the word "json" when using json_object format.
-        # Both system and user prompts above contain "JSON" — requirement satisfied.
-        body["text"] = {"format": {"type": "json_object"}}
+        body["response_format"] = {"type": "json_object"}
 
-    key = _api_key()
     resp = httpx.post(
-        OPENAI_API_URL,
+        OR_API_URL,
         headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
+            "Authorization":  f"Bearer {_api_key()}",
+            "Content-Type":   "application/json",
+            "HTTP-Referer":   "https://opencognitivecommons.org",
+            "X-Title":        "OCC Forge",
         },
         json=body,
         timeout=_TIMEOUT,
     )
     if not resp.is_success:
-        raise RuntimeError(f"OpenAI {resp.status_code}: {resp.text[:600]}")
-    return _extract_text(resp.json())
+        raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:600]}")
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 def extract_concepts(source_text: str, model: str = DEFAULT_EXTRACT_MODEL) -> list[dict]:

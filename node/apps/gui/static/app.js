@@ -157,9 +157,6 @@ function setupEventListeners() {
   document.getElementById('btn-forge').addEventListener('click', () => switchView('forge'));
   document.getElementById('close-settings').addEventListener('click', () => closeModal('settings-modal'));
   document.getElementById('local-mode-toggle')?.addEventListener('change', e => setLocalMode(e.target.checked));
-  document.getElementById('btn-save-openai').addEventListener('click', saveOpenAIKey);
-  document.getElementById('btn-clear-openai').addEventListener('click', clearOpenAIKey);
-
   document.getElementById('tab-chat').addEventListener('click', () => switchTab('chat'));
   document.getElementById('tab-logs').addEventListener('click', () => switchTab('logs'));
 
@@ -385,6 +382,7 @@ async function runForge() {
     return;
   }
 
+  const extractModel = document.getElementById('forge-extract-model').value;
   const model  = document.getElementById('forge-model').value;
   const urls   = document.getElementById('forge-urls').value
     .split('\n').map(u => u.trim()).filter(Boolean);
@@ -407,7 +405,7 @@ async function runForge() {
     const resp = await fetch('/api/forge/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pack_name: packName, mode: forgeMode, model, files: forgeFiles, urls, text }),
+      body: JSON.stringify({ pack_name: packName, mode: forgeMode, extract_model: extractModel, model, files: forgeFiles, urls, text }),
     });
 
     if (!resp.ok) {
@@ -1514,46 +1512,8 @@ async function openSettings() {
   const localToggle = document.getElementById('local-mode-toggle');
   if (localToggle) localToggle.checked = !!cfg.local_mode;
 
-  const openaiStatus = document.getElementById('openai-status-line');
-  if (openaiStatus) {
-    openaiStatus.className = cfg.openai_configured ? 'or-status ok' : 'or-status off';
-    openaiStatus.textContent = cfg.openai_configured ? '● API key configured' : '○ Not configured';
-  }
-  const openaiHint = document.getElementById('openai-key-hint');
-  if (openaiHint) openaiHint.style.display = cfg.openai_configured ? 'block' : 'none';
 
   document.getElementById('settings-modal').classList.remove('hidden');
-}
-
-async function saveOpenAIKey() {
-  const key = document.getElementById('openai-key').value.trim();
-  if (!key) { alert('Enter an API key.'); return; }
-  const r = await apiFetch('/api/config/openai', {
-    method: 'POST',
-    body: JSON.stringify({ api_key: key }),
-  });
-  if (r?.ok) {
-    document.getElementById('openai-key').value = '';
-    config.openai_configured = true;
-    const st = document.getElementById('openai-status-line');
-    if (st) { st.className = 'or-status ok'; st.textContent = '● API key configured'; }
-    const hnt = document.getElementById('openai-key-hint');
-    if (hnt) hnt.style.display = 'block';
-  }
-}
-
-async function clearOpenAIKey() {
-  const r = await apiFetch('/api/config/openai', {
-    method: 'POST',
-    body: JSON.stringify({ api_key: '' }),
-  });
-  if (r?.ok) {
-    config.openai_configured = false;
-    const st = document.getElementById('openai-status-line');
-    if (st) { st.className = 'or-status off'; st.textContent = '○ Not configured'; }
-    const hnt = document.getElementById('openai-key-hint');
-    if (hnt) hnt.style.display = 'none';
-  }
 }
 
 async function setLocalMode(enabled) {

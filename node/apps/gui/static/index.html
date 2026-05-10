@@ -224,11 +224,22 @@
               <div id="forge-pack-info" class="forge-pack-info"></div>
             </div>
             <div class="form-group">
+              <label class="form-label">Extraction model</label>
+              <select class="form-select" id="forge-extract-model">
+                <option value="openai/gpt-5-mini">GPT-5 Mini — fast &amp; cheap</option>
+                <option value="openai/gpt-5">GPT-5 — best quality</option>
+                <option value="anthropic/claude-sonnet-4.6">Claude Sonnet 4.6</option>
+              </select>
+              <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Identifies concepts from sources.</div>
+            </div>
+            <div class="form-group">
               <label class="form-label">Writing model</label>
               <select class="form-select" id="forge-model">
-                <option value="gpt-5">gpt-5 (best quality)</option>
-                <option value="gpt-5-mini">gpt-5-mini (faster)</option>
+                <option value="openai/gpt-5">GPT-5 — best quality</option>
+                <option value="openai/gpt-5-mini">GPT-5 Mini — fast &amp; cheap</option>
+                <option value="anthropic/claude-sonnet-4.6">Claude Sonnet 4.6 — alternative</option>
               </select>
+              <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Writes the wiki pages.</div>
             </div>
           </div>
 
@@ -338,7 +349,7 @@
       <div>
         <div class="settings-section-label">OpenRouter</div>
         <p style="font-size:0.8125rem;color:var(--text-faint);margin-bottom:0.75rem;">
-          Use a cloud model for your queries. Network responses always stay local.<br>
+          Used for cloud queries and Forge pack creation.<br>
           Get a free API key at <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--accent);text-decoration:none;">openrouter.ai/keys</a>.
         </p>
         <div id="or-status-line"></div>
@@ -363,23 +374,6 @@
         <div class="form-actions" style="margin-top:0.875rem;">
           <button class="btn-primary" id="btn-save-or">Save</button>
           <button class="btn-danger" id="btn-disable-or">Disable</button>
-        </div>
-      </div>
-      <div>
-        <div class="settings-section-label">OpenAI — Forge</div>
-        <p style="font-size:0.8125rem;color:var(--text-faint);margin-bottom:0.75rem;">
-          Required for Forge pack creation. Get a key at
-          <a href="https://platform.openai.com/api-keys" target="_blank" style="color:var(--accent);text-decoration:none;">platform.openai.com/api-keys</a>.
-        </p>
-        <div id="openai-status-line"></div>
-        <div class="form-group" style="margin-top:0.625rem;">
-          <label class="form-label">API Key</label>
-          <input class="form-input" type="password" id="openai-key" placeholder="sk-...">
-          <div id="openai-key-hint" style="display:none;font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Key saved — leave blank to keep it, or enter a new one to replace.</div>
-        </div>
-        <div class="form-actions" style="margin-top:0.875rem;">
-          <button class="btn-primary" id="btn-save-openai">Save</button>
-          <button class="btn-danger" id="btn-clear-openai">Clear</button>
         </div>
       </div>
       <div>
