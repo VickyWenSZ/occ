@@ -312,6 +312,11 @@ async def set_local_mode(body: LocalModeBody):
 @app.post("/api/update")
 async def update_app(background_tasks: BackgroundTasks):
     try:
+        await asyncio.create_subprocess_exec(
+            "git", "remote", "set-url", "origin",
+            "https://github.com/VickyWenSZ/occ.git",
+            cwd=str(ROOT),
+        )
         proc = await asyncio.create_subprocess_exec(
             "git", "pull", "--ff-only",
             cwd=str(ROOT),
