@@ -384,6 +384,10 @@ async function runForge() {
 
   const extractModel = document.getElementById('forge-extract-model').value;
   const model  = document.getElementById('forge-model').value;
+  const fetchImagesEl = document.getElementById('forge-fetch-images');
+  const fetchImages = !!(fetchImagesEl && fetchImagesEl.checked);
+  const fetchMathEl = document.getElementById('forge-fetch-math');
+  const fetchMath = !!(fetchMathEl && fetchMathEl.checked);
   const urls   = document.getElementById('forge-urls').value
     .split('\n').map(u => u.trim()).filter(Boolean);
   const text   = document.getElementById('forge-text').value.trim();
@@ -405,7 +409,7 @@ async function runForge() {
     const resp = await fetch('/api/forge/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pack_name: packName, mode: forgeMode, extract_model: extractModel, model, files: forgeFiles, urls, text }),
+      body: JSON.stringify({ pack_name: packName, mode: forgeMode, extract_model: extractModel, model, files: forgeFiles, urls, text, fetch_images: fetchImages, fetch_math: fetchMath }),
     });
 
     if (!resp.ok) {
@@ -524,17 +528,19 @@ async function runLint(packNameOverride = null) {
   }
 
   const model = document.getElementById('forge-model').value;
+  const fixCheckbox = document.getElementById('forge-lint-fix');
+  const fix = !!(fixCheckbox && fixCheckbox.checked);
   const lintBtn = document.getElementById('forge-lint-btn');
   if (lintBtn) { lintBtn.disabled = true; lintBtn.textContent = 'Running...'; }
 
   document.getElementById('forge-output-body').innerHTML = '';
-  appendForgeOutput(`🔍 Linting pack: ${packName}...`);
+  appendForgeOutput(`🔍 Linting pack: ${packName}${fix ? ' (auto-fix ON)' : ''}...`);
 
   try {
     const resp = await fetch('/api/forge/lint', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pack_name: packName, model }),
+      body: JSON.stringify({ pack_name: packName, model, fix }),
     });
 
     if (!resp.ok) {

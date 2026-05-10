@@ -245,8 +245,9 @@
 
           <div class="forge-section-label" style="margin-top:0.25rem;">Mode</div>
           <div class="forge-mode-group">
-            <button class="forge-mode-btn active" data-mode="add">Add sources</button>
-            <button class="forge-mode-btn" data-mode="rebuild">Rebuild from scratch</button>
+            <button class="forge-mode-btn active" data-mode="add" title="Append new sources to the existing pack. Concepts the model recognizes as duplicates of existing pages will update those pages.">Add sources</button>
+            <button class="forge-mode-btn" data-mode="recompile" title="Regenerate all wiki pages from the existing raw sources without re-fetching anything. Use after improving prompts to apply the new prompt logic to every page. Zero network, only LLM cost.">Recompile from raw</button>
+            <button class="forge-mode-btn" data-mode="rebuild" title="Delete all wiki pages and re-fetch every URL/file from scratch. Most expensive option.">Rebuild from scratch</button>
           </div>
 
           <div class="forge-section-label" style="margin-top:0.25rem;">Sources</div>
@@ -277,6 +278,15 @@
             <textarea class="form-input forge-textarea forge-text-large" id="forge-text" placeholder="Paste documentation, notes, or any text here…" spellcheck="false"></textarea>
           </div>
 
+          <label class="forge-lint-fix-label" title="Two effects: (1) for URL sources, fetches &lt;img&gt; ≥5KB, captions them with the Extraction model, and embeds relevant ones into wiki pages. (2) for PDF files, when a page extracts very little text (likely a scan or formula-heavy page), rasterizes that page and sends it to the Extraction model for transcription. Adds vision LLM cost.">
+            <input type="checkbox" id="forge-fetch-images">
+            <span>Img — fetch images from URLs + vision fallback for PDFs</span>
+          </label>
+          <label class="forge-lint-fix-label" title="When enabled, Forge extracts mathematical formulas (LaTeX, MathML, Wikipedia math fallback images) from URL sources and injects them as inline LaTeX in the raw text. For Wikipedia, switches to the parse API to access formulas. No vision cost — pure HTML parsing.">
+            <input type="checkbox" id="forge-fetch-math">
+            <span>Math — extract LaTeX/MathML from URL sources</span>
+          </label>
+
           <div class="forge-action-row">
             <button class="forge-run-btn" id="forge-run-btn">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
@@ -299,6 +309,10 @@
               Run Lint
             </button>
           </div>
+          <label class="forge-lint-fix-label" title="When enabled, fixable issues (missing indexes, missing title/summary, See Also back-links) are repaired in place. Default off — dry-run report only.">
+            <input type="checkbox" id="forge-lint-fix">
+            <span>Auto-fix repairable issues</span>
+          </label>
 
         </div>
 

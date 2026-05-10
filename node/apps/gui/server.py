@@ -388,6 +388,8 @@ class ForgeRunBody(BaseModel):
     files: list[dict] = []
     urls: list[str] = []
     text: str = ""
+    fetch_images: bool = False
+    fetch_math: bool = False
 
 
 @app.post("/api/forge/run")
@@ -454,7 +456,9 @@ def _forge_run_core(body: "ForgeRunBody"):
     wiki_dir = pack_dir / "wiki"
     wiki_dir.mkdir(parents=True, exist_ok=True)
 
-    rebuild = body.mode == "rebuild"
+    rebuild   = body.mode == "rebuild"
+    recompile = body.mode == "recompile"
+
     if rebuild:
         concepts_dir = wiki_dir / "concepts"
         if concepts_dir.exists():
@@ -465,6 +469,13 @@ def _forge_run_core(body: "ForgeRunBody"):
             log_path.unlink()
         mf = manifest.load_or_create(pack_dir, pack_name)
         mf["sources"] = []
+    elif recompile:
+        # Wipe wiki pages but keep raw/ untouched (raw is immutable)
+        concepts_dir = wiki_dir / "concepts"
+        if concepts_dir.exists():
+            shutil.rmtree(concepts_dir)
+            yield "🗑️ Wiki pages cleared — recompiling from existing raw/ (no re-fetch)."
+        mf = manifest.load_or_create(pack_dir, pack_name)
     else:
         mf = manifest.load_or_create(pack_dir, pack_name)
 
@@ -475,59 +486,132 @@ def _forge_run_core(body: "ForgeRunBody"):
     raw_sources = []
     temp_files_cleanup = []
 
-    for f in body.files:
-        try:
-            data = base64.b64decode(f["data_b64"])
-            suffix = Path(f.get("name", "file.txt")).suffix or ".txt"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.write(data)
-            tmp.close()
-            temp_files_cleanup.append(tmp.name)
-            yield f"📂 Reading file: {f.get('name', 'file')}..."
-            text_content, name, url = sources.read_file(Path(tmp.name))
-            stem = Path(f.get("name", name)).stem
-            name = re.sub(r'[^a-z0-9-]', '-', stem.lower()).strip('-') or name
-            raw_sources.append((text_content, name, url))
-        except Exception as e:
-            yield f"❌ Error reading {f.get('name', 'file')}: {e}"
+    pdf_vision_model = extract_model if body.fetch_images else None
 
-    for url in body.urls:
-        url = url.strip()
-        if not url:
-            continue
-        yield f"🌐 Fetching: {url}..."
-        try:
-            text_content, name, fetched_url = sources.fetch_url(url)
-            raw_sources.append((text_content, name, fetched_url))
-        except Exception as e:
-            err = str(e)
-            if any(c in err for c in ["403", "401", "406"]):
-                yield f"⚠️ {url}\n   → Blocked ({err[:3]}). Try saving the page as a file."
-            else:
-                yield f"❌ Error fetching {url}: {e}"
+    # ── Recompile mode: load existing raw sources, ignore any new input ───────
+    if recompile:
+        raw_articles = pack_dir / "raw" / "articles"
+        if not raw_articles.exists():
+            yield "❌ Recompile requires existing raw/articles/ — none found. Use 'Add sources' first."
+            return
+        loaded = _load_existing_raws_as_sources(raw_articles)
+        if not loaded:
+            yield "❌ No usable raw sources found in raw/articles/."
+            return
+        yield f"📚 Loaded {len(loaded)} existing raw source(s) for recompilation."
+        raw_sources.extend(loaded)
+        # Skip body.files / body.urls / body.text — we are re-using raw only
+    else:
+        for f in body.files:
+            try:
+                data = base64.b64decode(f["data_b64"])
+                suffix = Path(f.get("name", "file.txt")).suffix or ".txt"
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                tmp.write(data)
+                tmp.close()
+                temp_files_cleanup.append(tmp.name)
+                is_pdf = suffix.lower() == ".pdf"
+                note = " (PDF + vision fallback for low-text pages)" if is_pdf and pdf_vision_model else ""
+                yield f"📂 Reading file: {f.get('name', 'file')}{note}..."
+                text_content, name, url = sources.read_file(
+                    Path(tmp.name),
+                    vision_model=pdf_vision_model if is_pdf else None,
+                )
+                stem = Path(f.get("name", name)).stem
+                name = re.sub(r'[^a-z0-9-]', '-', stem.lower()).strip('-') or name
+                raw_sources.append((text_content, name, url))
+            except Exception as e:
+                yield f"❌ Error reading {f.get('name', 'file')}: {e}"
 
-    if body.text and body.text.strip():
-        yield "📝 Using text input..."
-        raw_sources.append((body.text.strip(), "manual-text", "text://manual"))
+        for url in body.urls:
+            url = url.strip()
+            if not url:
+                continue
+            yield f"🌐 Fetching: {url}{' (math extraction ON)' if body.fetch_math else ''}..."
+            try:
+                text_content, name, fetched_url = sources.fetch_url(url, include_math=body.fetch_math)
+                raw_sources.append((text_content, name, fetched_url))
+            except Exception as e:
+                err = str(e)
+                if any(c in err for c in ["403", "401", "406"]):
+                    yield f"⚠️ {url}\n   → Blocked ({err[:3]}). Try saving the page as a file."
+                else:
+                    yield f"❌ Error fetching {url}: {e}"
+
+        if body.text and body.text.strip():
+            yield "📝 Using text input..."
+            raw_sources.append((body.text.strip(), "manual-text", "text://manual"))
 
     if not raw_sources:
         yield "❌ No sources found. Add files, URLs, or paste text."
         return
 
     total_written = 0
+    touched_slugs: set[str] = set()
 
     try:
-        for text_content, source_name, source_url in raw_sources:
+        for source_item in raw_sources:
+            # In recompile mode, raw_sources entries carry an extra `raw_path` field
+            if len(source_item) == 4:
+                text_content, source_name, source_url, raw_path = source_item
+                from_existing_raw = True
+            else:
+                text_content, source_name, source_url = source_item
+                from_existing_raw = False
+
             yield f"\n━━━ Source: {source_name} ({len(text_content):,} chars) ━━━"
 
-            raw_path = wiki.write_raw_source(pack_dir, source_name, source_url, text_content)
-            yield f"💾 Raw source saved → {raw_path}"
+            if from_existing_raw:
+                yield f"📂 Reusing existing raw → {raw_path}"
+            else:
+                raw_path = wiki.write_raw_source(pack_dir, source_name, source_url, text_content)
+                yield f"💾 Raw source saved → {raw_path}"
+
+            # ── Image pipeline (Phase 1: URL sources only, opt-in) ────────────
+            available_images: list[dict] = []
+            if body.fetch_images and not from_existing_raw and source_url.startswith(("http://", "https://")):
+                assets_dir = wiki_dir / "assets" / source_name
+                yield f"🖼️  Scanning {source_url} for images..."
+                try:
+                    candidates = sources.fetch_images_from_url(source_url, assets_dir)
+                except Exception as e:
+                    candidates = []
+                    yield f"  ⚠️ Image scan failed: {e}"
+                if candidates:
+                    yield f"  📥 Downloaded {len(candidates)} candidate image(s) ≥5KB — captioning ({extract_model})..."
+                    relevant = []
+                    for img in candidates:
+                        try:
+                            verdict = llm.caption_image(img["path"], source_name, model=extract_model)
+                        except Exception as e:
+                            yield f"    ⚠️ {img['filename']} caption failed: {e}"
+                            continue
+                        if verdict.get("relevant"):
+                            img["caption"] = verdict.get("caption", "")
+                            img["page_rel_path"] = f"../assets/{source_name}/{img['filename']}"
+                            relevant.append(img)
+                            yield f"    ✅ {img['filename']}: {img['caption'][:80]}"
+                        else:
+                            try:
+                                img["path"].unlink()
+                            except Exception:
+                                pass
+                    if relevant:
+                        wiki.append_images_to_raw(pack_dir, raw_path, relevant, source_name)
+                        yield f"  📋 Kept {len(relevant)}/{len(candidates)} image(s); appended ## Images to raw"
+                        available_images = relevant
+                    else:
+                        yield f"  ↪️ No relevant images after caption filter"
+                else:
+                    yield f"  ↪️ No image candidates ≥5KB"
 
             yield f"🔍 Extracting concepts ({extract_model})..."
             concepts = None
             for attempt in range(3):
                 try:
-                    concepts = llm.extract_concepts(text_content, model=extract_model)
+                    concepts = llm.extract_concepts(
+                        text_content, existing_concepts=all_pages, model=extract_model
+                    )
                     break
                 except Exception as e:
                     yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
@@ -535,34 +619,68 @@ def _forge_run_core(body: "ForgeRunBody"):
                 yield "❌ Concept extraction failed after 3 attempts, skipping source."
                 continue
 
-            yield f"💡 Found {len(concepts)} concepts: {', '.join(c.get('title', c.get('slug', '?')) for c in concepts)}"
+            labels = []
+            for c in concepts:
+                tag = " (→ updates existing)" if c.get("match_existing") else ""
+                labels.append(f"{c.get('title', c.get('slug', '?'))}{tag}")
+            yield f"💡 Found {len(concepts)} concepts: {', '.join(labels)}"
 
             written = 0
             for concept in concepts:
-                slug = re.sub(r'[^a-z0-9-]', '-', concept.get("slug", "unknown")).strip('-')
+                # Resolve to existing slug if LLM matched it, else sanitize the new slug
+                match = concept.get("match_existing")
+                if match and match in existing_slugs:
+                    slug = match
+                else:
+                    slug = re.sub(r'[^a-z0-9-]', '-', concept.get("slug", "unknown")).strip('-')
                 concept["slug"] = slug
                 title = concept.get("title", slug)
 
-                existing_path = wiki_dir / "concepts" / f"{slug}.md"
+                existing_path = wiki_dir / "concepts" / wiki._slug_to_filename(slug)
                 if existing_path.exists():
-                    yield f"✍️  Enriching: {title}..."
                     existing_content = existing_path.read_text(encoding="utf-8")
-                    page_content = None
-                    for attempt in range(3):
-                        try:
-                            page_content = llm.update_wiki_page(
-                                concept, existing_content, text_content, source_name, raw_path=raw_path, model=write_model
-                            )
-                            break
-                        except Exception as e:
-                            yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
+                    existing_sources = _existing_sources_from_frontmatter(existing_content)
+                    # If the page already has sources AND the new raw is not among them,
+                    # re-synthesize from scratch using all raws + the new one (avoids drift).
+                    all_payload = []
+                    if existing_sources and raw_path not in existing_sources:
+                        all_payload = _build_sources_payload(pack_dir, existing_sources, raw_path, text_content, source_name)
+
+                    if len(all_payload) >= 2:
+                        yield f"🧬 Re-synthesizing: {title} (from {len(all_payload)} sources)..."
+                        page_content = None
+                        for attempt in range(3):
+                            try:
+                                page_content = llm.synthesize_wiki_page(
+                                    concept, all_payload,
+                                    available_images=available_images,
+                                    model=write_model,
+                                )
+                                break
+                            except Exception as e:
+                                yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
+                    else:
+                        yield f"✍️  Enriching: {title}..."
+                        page_content = None
+                        for attempt in range(3):
+                            try:
+                                page_content = llm.update_wiki_page(
+                                    concept, existing_content, text_content, source_name,
+                                    raw_path=raw_path, available_images=available_images,
+                                    model=write_model,
+                                )
+                                break
+                            except Exception as e:
+                                yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
                 else:
                     yield f"✍️  Writing: {title}..."
                     page_content = None
                     for attempt in range(3):
                         try:
                             page_content = llm.write_wiki_page(
-                                concept, text_content, source_name, raw_path=raw_path, model=write_model
+                                concept, text_content, source_name,
+                                raw_path=raw_path, available_images=available_images,
+                                model=write_model,
                             )
                             break
                         except Exception as e:
@@ -583,14 +701,36 @@ def _forge_run_core(body: "ForgeRunBody"):
                             if p["slug"] == slug:
                                 p.update(entry)
                                 break
+                    touched_slugs.add(slug)
                     written += 1
                     total_written += 1
-                    yield f"  ✅ {title} → concepts/{slug}.md"
+                    yield f"  ✅ {title} → concepts/{wiki._slug_to_filename(slug)}"
                 else:
                     yield f"  ⚠️ {title}: empty response"
 
             manifest.add_source(mf, source_url, sources.sha256(text_content))
             wiki.append_log(wiki_dir, source_name, written, source_url)
+
+        # Cross-link pass — connect newly-written pages to the rest of the wiki
+        if touched_slugs and len(all_pages) > 1:
+            yield f"\n🔗 Cross-linking {len(touched_slugs)} touched pages ({extract_model})..."
+            for slug in sorted(touched_slugs):
+                page = next((p for p in all_pages if p["slug"] == slug), None)
+                if not page:
+                    continue
+                candidates = [p for p in all_pages if p["slug"] != slug]
+                try:
+                    links = llm.suggest_cross_links(
+                        page.get("title", slug),
+                        page.get("summary", ""),
+                        candidates,
+                        model=extract_model,
+                    )
+                except Exception as e:
+                    yield f"  ⚠️ {page.get('title', slug)}: cross-link skipped ({e})"
+                    continue
+                ok = wiki.fill_see_also(wiki_dir, slug, links)
+                yield f"  🔗 {page.get('title', slug)} → {len(links)} link(s)" if ok else f"  · {page.get('title', slug)} → no links"
 
         wiki.update_index(wiki_dir, all_pages)
         manifest.save(pack_dir, mf)
@@ -606,9 +746,98 @@ def _forge_run_core(body: "ForgeRunBody"):
                 pass
 
 
+def _existing_sources_from_frontmatter(page_text: str) -> list[str]:
+    """Extract the `sources:` list (paths) from a wiki page's YAML frontmatter."""
+    import re as _re
+    m = _re.match(r"^---\n(.*?)\n---", page_text, _re.DOTALL)
+    if not m:
+        return []
+    try:
+        import yaml as _yaml
+        fm = _yaml.safe_load(m.group(1)) or {}
+    except Exception:
+        return []
+    sources = fm.get("sources") or []
+    if not isinstance(sources, list):
+        return []
+    return [str(s).strip() for s in sources if str(s).strip()]
+
+
+def _build_sources_payload(
+    pack_dir: Path,
+    existing_source_paths: list[str],
+    new_raw_path: str,
+    new_text: str,
+    new_source_name: str,
+) -> list[dict]:
+    """
+    Build the payload for synthesize_wiki_page: list of {name, text, raw_path}
+    covering all existing sources (read from disk) + the new one (passed in).
+
+    Skips existing sources whose file is missing on disk (best-effort).
+    """
+    import re as _re
+    payload: list[dict] = []
+    for s_path in existing_source_paths:
+        full = pack_dir / s_path
+        if not full.exists():
+            continue
+        text = full.read_text(encoding="utf-8", errors="replace")
+        m = _re.match(r"^---\n.*?\n---\n?(.*)$", text, _re.DOTALL)
+        body = m.group(1).strip() if m else text
+        if not body:
+            continue
+        # Recover a friendly source_name from the filename (strip date prefix)
+        stem = full.stem
+        name = _re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem) or stem
+        payload.append({"name": name, "text": body, "raw_path": s_path})
+    payload.append({"name": new_source_name, "text": new_text, "raw_path": new_raw_path})
+    return payload
+
+
+def _load_existing_raws_as_sources(raw_articles_dir: Path) -> list[tuple]:
+    """
+    Read every raw/articles/*.md and return a list of
+    (text, source_name, source_url, raw_path) tuples for re-compilation.
+
+    The 4-tuple form (vs the 3-tuple used for fresh ingestion) signals to
+    `_forge_run_core` that the raw already exists on disk and must NOT be
+    rewritten.
+    """
+    import re as _re
+    out: list[tuple] = []
+    pack_dir = raw_articles_dir.parent.parent  # raw/articles → pack root
+    for f in sorted(raw_articles_dir.glob("*.md")):
+        if f.name == "_index.md":
+            continue
+        full = f.read_text(encoding="utf-8", errors="replace")
+        m = _re.match(r"^---\n(.*?)\n---\n?(.*)$", full, _re.DOTALL)
+        if not m:
+            continue
+        try:
+            import yaml as _yaml
+            fm = _yaml.safe_load(m.group(1)) or {}
+        except Exception:
+            fm = {}
+        body_text = m.group(2).strip()
+        if not body_text:
+            continue
+        title = str(fm.get("title") or f.stem).strip()
+        # Strip the date prefix from the slug to recover the source_name
+        stem = f.stem
+        stem_no_date = _re.sub(r"^\d{4}-\d{2}-\d{2}-", "", stem)
+        source_name = stem_no_date or stem
+        source_url = str(fm.get("source") or f.resolve().as_uri()).strip()
+        rel_raw_path = f"raw/articles/{f.name}"
+        out.append((body_text, source_name, source_url, rel_raw_path))
+    return out
+
+
 class ForgeLintBody(BaseModel):
     pack_name: str
     model: str = "gpt-5"
+    fix: bool = False
+    skip_semantic: bool = False
 
 
 @app.post("/api/forge/lint")
@@ -633,7 +862,10 @@ async def forge_lint(body: ForgeLintBody):
 
         def thread():
             try:
-                for line in _lint_run_core(pack_name, wiki_dir, body.model):
+                for line in _lint_run_core(
+                    pack_name, wiki_dir, pack_dir,
+                    model=body.model, fix=body.fix, skip_semantic=body.skip_semantic,
+                ):
                     asyncio.run_coroutine_threadsafe(q.put({"text": line}), loop)
                 asyncio.run_coroutine_threadsafe(
                     q.put({"type": "lint_complete", "pack_name": pack_name}), loop
@@ -658,12 +890,44 @@ async def forge_lint(body: ForgeLintBody):
     )
 
 
-def _lint_run_core(pack_name: str, wiki_dir: Path, model: str):
-    os.environ["OPENROUTER_API_KEY"] = _cfg.openrouter_api_key
+def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
+                   model: str, fix: bool = False, skip_semantic: bool = False):
+    """
+    Two-phase lint:
+      1. Mechanical Karpathy checks (C1, C2, C3, C4, C4b, C11) — deterministic, optional auto-fix
+      2. Semantic LLM review (Contradictions, Coverage Gaps, Staleness) — optional via skip_semantic
+    """
+    import forge._lint as lint
     import forge._llm as llm
 
-    yield f"🔍 Reading pack '{pack_name}'..."
+    # ── Phase 1: mechanical structural checks ─────────────────────────────────
+    yield f"🔧 Running structural lint (Karpathy C1, C2, C3, C4, C4b, C11)..."
+    if fix:
+        yield "    🛠️  Auto-fix enabled — fixable issues will be repaired in place"
 
+    issues, summary = lint.run_structural_checks(wiki_dir, pack_dir, fix=fix)
+    yield (
+        f"    Found {summary['total']} issue(s): "
+        f"{summary['critical']} critical, {summary['warning']} warning, "
+        f"{summary['suggestion']} suggestion, {summary['info']} info"
+    )
+    if fix and summary["fixed"]:
+        yield f"    ✅ Auto-fixed {summary['fixed']} issue(s)"
+
+    yield "\n" + lint.format_report(issues, summary, pack_name, fix_applied=fix)
+
+    # ── Phase 2: semantic LLM review ──────────────────────────────────────────
+    if skip_semantic:
+        yield "✅ Lint complete (semantic phase skipped)."
+        return
+
+    if not _cfg.openrouter_api_key:
+        yield "⚠️  Semantic phase skipped — OpenRouter API key not configured."
+        return
+
+    os.environ["OPENROUTER_API_KEY"] = _cfg.openrouter_api_key
+
+    yield f"\n🤖 Running semantic review ({model})..."
     index_path = wiki_dir / "index.md"
     index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else "(no index.md found)"
 
@@ -671,11 +935,11 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, model: str):
     pages_parts = []
     MAX_TOTAL = 80_000
     total_chars = 0
-
     if concepts_dir.exists():
         page_files = sorted(concepts_dir.glob("*.md"))
-        yield f"📄 Found {len(page_files)} page(s) — loading..."
         for pf in page_files:
+            if pf.name == "_index.md":
+                continue
             content = pf.read_text(encoding="utf-8")
             chunk = f"\n### {pf.stem}\n{content}\n"
             if total_chars + len(chunk) > MAX_TOTAL:
@@ -683,16 +947,12 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, model: str):
                 break
             pages_parts.append(chunk)
             total_chars += len(chunk)
-    else:
-        yield "⚠️  No concepts directory found."
 
     pages_content = "".join(pages_parts) or "(no pages found)"
 
-    yield f"🤖 Running lint analysis ({model})..."
     report = llm.lint_wiki(pack_name, index_content, pages_content, model=model)
-
     yield "\n" + report
-    yield f"\n✅ Lint complete."
+    yield f"\n✅ Lint complete (structural + semantic)."
 
 
 @app.post("/api/forge/reload-packs")

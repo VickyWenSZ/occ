@@ -21,6 +21,55 @@ def write_page(wiki_dir: Path, slug: str, content: str) -> Path:
     return path
 
 
+def fill_see_also(wiki_dir: Path, slug: str, links: list[dict]) -> bool:
+    """
+    Replace the `## See Also` section of a page with `links`.
+    Each link: {slug, title, note}.
+
+    Replaces the placeholder `_To be linked after compilation._` and any prior
+    bullet list under `## See Also` up to the next `## ` heading.
+    Returns True if the page was rewritten, False otherwise.
+    """
+    if not links:
+        return False
+    path = wiki_dir / "concepts" / _slug_to_filename(slug)
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+
+    bullets = []
+    for l in links:
+        target_slug = l.get("slug", "")
+        if not target_slug or target_slug == slug:
+            continue
+        target_title = l.get("title", target_slug)
+        note = l.get("note", "").strip()
+        target_file = _slug_to_filename(target_slug)
+        bullets.append(
+            f"- [[{target_slug}|{target_title}]] "
+            f"([{target_title}]({target_file}))"
+            + (f" — {note}" if note else "")
+        )
+    if not bullets:
+        return False
+
+    new_section = "## See Also\n\n" + "\n".join(bullets) + "\n"
+
+    pattern = re.compile(r"^##\s+See Also\s*$.*?(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL)
+    if pattern.search(text):
+        new_text = pattern.sub(new_section + "\n", text, count=1)
+    else:
+        # No See Also section yet — insert before Sources, or before Key Points, or at end
+        for anchor in ("## Sources", "## Key Points"):
+            if anchor in text:
+                new_text = text.replace(anchor, new_section + "\n" + anchor, 1)
+                break
+        else:
+            new_text = text.rstrip() + "\n\n" + new_section
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
 def scan_existing_pages(wiki_dir: Path) -> list[dict]:
     """Read frontmatter from all existing concept pages."""
     concepts_dir = wiki_dir / "concepts"
@@ -98,6 +147,37 @@ def append_log(wiki_dir: Path, source_name: str, n_pages: int, source_url: str =
     )
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(entry)
+
+
+def append_images_to_raw(
+    pack_dir: Path,
+    raw_path: str,
+    images: list[dict],
+    source_slug: str,
+) -> None:
+    """
+    Append a `## Images` section to a raw source file with one bullet per
+    relevant image. Each image dict: {filename, caption}.
+
+    Writes a relative link from the raw file's location to wiki/assets/<slug>/<file>.
+    Raw lives in `pack_dir/raw/articles/`, assets live in `pack_dir/wiki/assets/`,
+    so the relative path is `../../wiki/assets/<slug>/<filename>`.
+    """
+    if not images:
+        return
+    raw_file = pack_dir / raw_path
+    if not raw_file.exists():
+        return
+
+    lines = ["", "## Images", ""]
+    for img in images:
+        caption = (img.get("caption") or "").strip().replace("\n", " ")
+        rel = f"../../wiki/assets/{source_slug}/{img['filename']}"
+        lines.append(f"- ![{caption}]({rel}) — {caption}" if caption else f"- ![]({rel})")
+    lines.append("")
+
+    with open(raw_file, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def write_raw_source(pack_dir: Path, source_name: str, source_url: str, text: str) -> str:

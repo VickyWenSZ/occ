@@ -1593,6 +1593,20 @@ html, body {
   flex: 1;
   min-width: 0;
 }
+.forge-lint-fix-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #888);
+  cursor: pointer;
+  user-select: none;
+}
+.forge-lint-fix-label input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
 .forge-lint-btn {
   display: flex;
   align-items: center;
