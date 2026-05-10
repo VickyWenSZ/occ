@@ -504,6 +504,74 @@ html, body {
 .source-block.role-local      { border-left-color: var(--green-border); background: #030b05; }
 .source-block.role-expert     { border-left-color: #075985;             background: #00101a; }
 .source-block.role-contrarian { border-left-color: #92400e;             background: #100800; }
+.source-block.role-retrieved  { border-left-color: #4c1d95;             background: #0a0414; padding: 0; }
+
+/* Retrieved sources — collapsible header + list */
+.retrieved-sources-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.625rem 0.875rem 0.625rem 1rem;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.retrieved-sources-toggle:hover { background: rgba(76, 29, 149, 0.15); }
+.retrieved-sources-toggle .caret {
+  display: inline-block;
+  transition: transform var(--t-fast);
+  color: var(--text-ghost);
+}
+.source-block.role-retrieved.open .retrieved-sources-toggle .caret {
+  transform: rotate(90deg);
+}
+.retrieved-sources-label {
+  color: var(--text-ghost);
+  letter-spacing: 0.08em;
+}
+.retrieved-sources-count {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: 0.625rem;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.retrieved-sources-list {
+  display: none;
+  padding: 0 1rem 0.75rem 1rem;
+  border-top: 1px solid var(--border);
+}
+.source-block.role-retrieved.open .retrieved-sources-list { display: block; }
+.retrieved-source-item {
+  padding: 0.625rem 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.retrieved-source-item:last-child { border-bottom: none; }
+.retrieved-source-path {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  color: var(--text-faint);
+  word-break: break-all;
+  margin-bottom: 0.25rem;
+}
+.retrieved-source-title {
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  font-weight: 500;
+  margin-bottom: 0.25rem;
+}
+.retrieved-source-snippet {
+  font-size: 0.75rem;
+  color: var(--text-ghost);
+  line-height: 1.5;
+}
 .source-label {
   font-family: var(--font-mono);
   font-size: 0.625rem;
@@ -992,6 +1060,18 @@ html, body {
   margin-left: 0.5rem;
   user-select: none;
 }
+.terminal-spinner {
+  display: none;
+  width: 10px;
+  height: 10px;
+  margin-left: 8px;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: terminal-spin 0.9s linear infinite;
+}
+.terminal-spinner.active { display: inline-block; }
+@keyframes terminal-spin { to { transform: rotate(360deg); } }
 .terminal-counter {
   font-family: var(--font-mono);
   font-size: 0.75rem;

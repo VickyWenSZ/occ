@@ -112,7 +112,7 @@ def _or_call(messages, model, api_key, tools, temperature) -> ProviderResponse:
         kw["tool_choice"] = "auto"
     resp = client.chat.completions.create(**kw)
     msg = resp.choices[0].message
-    content = _extract_content(msg)
+    content = _strip_leading_fragment(_extract_content(msg))
     raw_tcs = msg.tool_calls or []
     if not raw_tcs:
         return ProviderResponse(content, None, "openrouter")
@@ -142,6 +142,7 @@ def _or_stream(messages, model, api_key, temperature) -> Iterator[str]:
     client = OpenAI(api_key=api_key, base_url=_OR_BASE, timeout=120.0)
     in_think = False
     buf = ""
+    header_stripped = False
     for chunk in client.chat.completions.create(
         model=model, messages=messages, temperature=temperature, stop=_STOP, stream=True
     ):
@@ -157,11 +158,23 @@ def _or_stream(messages, model, api_key, temperature) -> Iterator[str]:
             in_think = True
             buf = ""
             continue
-        # Flush buffer once we have enough to be sure no <think> is coming
+        # Strip a Qwen-leaked leading word fragment (e.g. "it. ", "dy. ") from
+        # the very first emitted chunk. Only one strip per stream.
+        if not header_stripped:
+            if len(buf) >= 30 or "\n" in buf:
+                buf = _strip_leading_fragment(buf)
+                header_stripped = True
+                if buf:
+                    yield buf
+                buf = ""
+            continue
+        # Normal flushing once the header is past
         if len(buf) > 20:
             yield buf
             buf = ""
     if buf and not in_think:
+        if not header_stripped:
+            buf = _strip_leading_fragment(buf)
         yield buf
 
 

@@ -153,7 +153,7 @@ def _fetch_wikipedia(url: str) -> str:
         "format": "json",
         "redirects": "1",
     }
-    resp = httpx.get(api_url, params=params, timeout=30)
+    resp = httpx.get(api_url, params=params, headers={"User-Agent": _WIKIPEDIA_USER_AGENT}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     pages = data.get("query", {}).get("pages", {})
@@ -190,7 +190,7 @@ def _fetch_wikipedia_html_with_math(url: str) -> str:
         "disableeditsection": "1",
         "disabletoc": "1",
     }
-    resp = httpx.get(api_url, params=params, timeout=30)
+    resp = httpx.get(api_url, params=params, headers={"User-Agent": _WIKIPEDIA_USER_AGENT}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     html = data.get("parse", {}).get("text", {}).get("*", "")
@@ -342,6 +342,12 @@ _IMG_ACCEPTED_EXT = {".jpg", ".jpeg", ".png", ".webp"}  # raster, vision-friendl
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Wikipedia / WMF endpoints reject generic UAs (403). Identify the tool per
+# https://meta.wikimedia.org/wiki/User-Agent_policy
+_WIKIPEDIA_USER_AGENT = (
+    "OCC-Forge/0.1 (https://github.com/VikFinlay/OCC; vickywensz@gmail.com) httpx"
 )
 
 

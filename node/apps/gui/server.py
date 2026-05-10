@@ -467,6 +467,13 @@ def _forge_run_core(body: "ForgeRunBody"):
         log_path = wiki_dir / "log.md"
         if log_path.exists():
             log_path.unlink()
+        raw_articles_dir = pack_dir / "raw" / "articles"
+        if raw_articles_dir.exists():
+            shutil.rmtree(raw_articles_dir)
+            yield "🗑️ Raw articles deleted — will re-fetch from sources."
+        raw_index = pack_dir / "raw" / "_index.md"
+        if raw_index.exists():
+            raw_index.unlink()
         mf = manifest.load_or_create(pack_dir, pack_name)
         mf["sources"] = []
     elif recompile:
@@ -711,14 +718,19 @@ def _forge_run_core(body: "ForgeRunBody"):
             manifest.add_source(mf, source_url, sources.sha256(text_content))
             wiki.append_log(wiki_dir, source_name, written, source_url)
 
-        # Cross-link pass — connect newly-written pages to the rest of the wiki
+        # Cross-link pass — connect newly-written pages to the rest of the wiki.
+        # Re-scan from disk first: `all_pages` holds the concept-extractor's
+        # title/summary, but write_wiki_page rewrites both in the final
+        # frontmatter. Using the in-memory list would feed the cross-link LLM
+        # stale labels (and produce malformed wikilinks).
         if touched_slugs and len(all_pages) > 1:
             yield f"\n🔗 Cross-linking {len(touched_slugs)} touched pages ({extract_model})..."
+            disk_pages = wiki.scan_existing_pages(wiki_dir)
             for slug in sorted(touched_slugs):
-                page = next((p for p in all_pages if p["slug"] == slug), None)
+                page = next((p for p in disk_pages if p["slug"] == slug), None)
                 if not page:
                     continue
-                candidates = [p for p in all_pages if p["slug"] != slug]
+                candidates = [p for p in disk_pages if p["slug"] != slug]
                 try:
                     links = llm.suggest_cross_links(
                         page.get("title", slug),
@@ -732,11 +744,12 @@ def _forge_run_core(body: "ForgeRunBody"):
                 ok = wiki.fill_see_also(wiki_dir, slug, links)
                 yield f"  🔗 {page.get('title', slug)} → {len(links)} link(s)" if ok else f"  · {page.get('title', slug)} → no links"
 
-        wiki.update_index(wiki_dir, all_pages)
+        fresh_pages = wiki.scan_existing_pages(wiki_dir)
+        wiki.update_index(wiki_dir, fresh_pages)
         manifest.save(pack_dir, mf)
 
         yield f"\n🎉 Done! {total_written} pages written to expert-packs/{pack_name}/wiki/concepts/"
-        yield f"📋 Index updated: {len(all_pages)} total pages in pack."
+        yield f"📋 Index updated: {len(fresh_pages)} total pages in pack."
 
     finally:
         for tmp_path in temp_files_cleanup:

@@ -17,8 +17,69 @@ def write_page(wiki_dir: Path, slug: str, content: str) -> Path:
     concepts_dir.mkdir(parents=True, exist_ok=True)
     filename = _slug_to_filename(slug)
     path = concepts_dir / filename
-    path.write_text(content, encoding="utf-8")
+    path.write_text(_dedup_sources(content), encoding="utf-8")
     return path
+
+
+def _dedup_sources(content: str) -> str:
+    """
+    Remove duplicate entries from the YAML `sources:` list in frontmatter and
+    from `## Sources` bullet lines in the body. The LLM occasionally appends
+    the same raw_path twice when a page is enriched from a source it already
+    contains (e.g. multi-concept ingest of the same Wikipedia article).
+    Order-preserving dedup; bullets are deduped by their full text.
+    """
+    if not content.startswith("---\n"):
+        return content
+    end = content.find("\n---\n", 4)
+    if end == -1:
+        return content
+    fm_block = content[4:end]
+    body = content[end + 5:]
+
+    # Dedup YAML `sources:` list (order-preserving) without parsing the whole
+    # frontmatter — keeps unrelated quoting/whitespace intact.
+    fm_block = re.sub(
+        r"(^sources:\s*\n)((?:[ \t]+-[^\n]*\n)+)",
+        lambda m: m.group(1) + _dedup_yaml_list_block(m.group(2)),
+        fm_block,
+        flags=re.MULTILINE,
+    )
+
+    # Dedup `## Sources` bullets (exact-line match, order-preserving)
+    body = re.sub(
+        r"(^##\s+Sources\s*\n)((?:.*\n)*?)(?=^##\s+|\Z)",
+        lambda m: m.group(1) + _dedup_bullet_block(m.group(2)),
+        body,
+        flags=re.MULTILINE,
+    )
+
+    return f"---\n{fm_block}\n---\n{body}"
+
+
+def _dedup_yaml_list_block(block: str) -> str:
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    for line in block.splitlines(keepends=True):
+        key = line.strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        out_lines.append(line)
+    return "".join(out_lines)
+
+
+def _dedup_bullet_block(block: str) -> str:
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    for line in block.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+        out_lines.append(line)
+    return "".join(out_lines)
 
 
 def fill_see_also(wiki_dir: Path, slug: str, links: list[dict]) -> bool:
@@ -44,10 +105,8 @@ def fill_see_also(wiki_dir: Path, slug: str, links: list[dict]) -> bool:
             continue
         target_title = l.get("title", target_slug)
         note = l.get("note", "").strip()
-        target_file = _slug_to_filename(target_slug)
         bullets.append(
-            f"- [[{target_slug}|{target_title}]] "
-            f"([{target_title}]({target_file}))"
+            f"- [[{target_slug}|{target_title}]]"
             + (f" — {note}" if note else "")
         )
     if not bullets:
@@ -77,6 +136,8 @@ def scan_existing_pages(wiki_dir: Path) -> list[dict]:
         return []
     pages = []
     for md_file in sorted(concepts_dir.glob("*.md")):
+        if md_file.name.startswith("_"):
+            continue  # _index.md and any other folder-meta file
         text = md_file.read_text(encoding="utf-8", errors="replace")
         fm = _parse_frontmatter(text)
         pages.append({

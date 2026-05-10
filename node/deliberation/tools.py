@@ -57,6 +57,47 @@ def is_tool_request(query: str) -> bool:
     return bool(words & _TOOL_KEYWORDS)
 
 
+# ── Web-tool gating ────────────────────────────────────────────────────────────
+# OCC's design rule: knowledge must come from community-approved expert packs.
+# Web tools (web_search, fetch_url) bypass that guarantee, so they are exposed
+# to the model ONLY when the user explicitly invokes the web.
+
+WEB_TOOL_NAMES = frozenset({"web_search", "fetch_url"})
+
+_WEB_KEYWORDS = {"web", "online", "internet"}
+_WEB_PHRASES = {
+    "search the web", "search online", "look up online", "find online",
+    "web search", "browse the web", "browse online",
+    "latest news", "current news", "news about",
+    "cerca sul web", "cerca online", "cerca su internet",
+    "su internet", "sul web",
+}
+
+
+def is_web_request(query: str) -> bool:
+    """True iff the user explicitly invokes the web. URL in the message counts as explicit consent."""
+    q = (query or "").lower()
+    if _URL_RE.search(query or ""):
+        return True
+    if any(p in q for p in _WEB_PHRASES):
+        return True
+    words = set(re.findall(r'\b\w+\b', q))
+    return bool(words & _WEB_KEYWORDS)
+
+
+def get_allowed_tools(query: str) -> tuple[list, frozenset]:
+    """
+    Return (schema, allowed_function_names) for the given user query.
+    Web tools (web_search, fetch_url) are stripped unless the query explicitly
+    invokes the web. Other tools are always available.
+    """
+    if is_web_request(query):
+        return TOOL_SCHEMA, frozenset(TOOL_FUNCTIONS.keys())
+    schema = [t for t in TOOL_SCHEMA if t["function"]["name"] not in WEB_TOOL_NAMES]
+    allowed = frozenset(TOOL_FUNCTIONS.keys()) - WEB_TOOL_NAMES
+    return schema, allowed
+
+
 def web_search(query: str, max_results: int = 5) -> str:
     from ddgs import DDGS
     results = DDGS().text(query, max_results=max_results)

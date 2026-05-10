@@ -402,6 +402,7 @@ async function runForge() {
   runBtn.disabled = true;
   runBtn.classList.add('running');
   runBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Running...`;
+  document.getElementById('forge-output-spinner').classList.add('active');
 
   document.getElementById('forge-output-body').innerHTML = '';
 
@@ -446,6 +447,7 @@ async function runForge() {
     runBtn.disabled = false;
     runBtn.classList.remove('running');
     runBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Forge`;
+    document.getElementById('forge-output-spinner').classList.remove('active');
   }
 }
 
@@ -534,6 +536,7 @@ async function runLint(packNameOverride = null) {
   if (lintBtn) { lintBtn.disabled = true; lintBtn.textContent = 'Running...'; }
 
   document.getElementById('forge-output-body').innerHTML = '';
+  document.getElementById('forge-output-spinner').classList.add('active');
   appendForgeOutput(`🔍 Linting pack: ${packName}${fix ? ' (auto-fix ON)' : ''}...`);
 
   try {
@@ -571,6 +574,7 @@ async function runLint(packNameOverride = null) {
     appendForgeOutput(`❌ ${err.message}`, 'error');
   } finally {
     if (lintBtn) { lintBtn.disabled = false; lintBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Run Lint'; }
+    document.getElementById('forge-output-spinner').classList.remove('active');
   }
 }
 
@@ -1204,6 +1208,11 @@ function buildSourcesPanel(data) {
   const panel = document.createElement('div');
   panel.className = 'sources-panel';
 
+  // ── Retrieved sources (collapsible) ──────────────────────────────────────
+  if (Array.isArray(data.sources) && data.sources.length > 0) {
+    panel.appendChild(buildRetrievedSourcesBlock(data.sources));
+  }
+
   const expertLabel = data.mode === 'network' ? 'Expert — local' : 'Expert — draft';
   const criticLabel = data.mode === 'network'
     ? `Critic — peer (${data.peer_tier || 'remote'})`
@@ -1229,6 +1238,49 @@ function buildSourcesPanel(data) {
   });
 
   return panel;
+}
+
+function buildRetrievedSourcesBlock(sources) {
+  const block = document.createElement('div');
+  block.className = 'source-block role-retrieved';
+
+  const packs = new Set(sources.map(s => s.pack));
+  const header = document.createElement('button');
+  header.type = 'button';
+  header.className = 'retrieved-sources-toggle';
+  header.innerHTML =
+    `<span class="caret">▸</span>` +
+    `<span class="retrieved-sources-label">Sources from server</span>` +
+    `<span class="retrieved-sources-count">${sources.length} page${sources.length === 1 ? '' : 's'}, ${packs.size} pack${packs.size === 1 ? '' : 's'}</span>`;
+
+  const list = document.createElement('div');
+  list.className = 'retrieved-sources-list';
+
+  sources.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'retrieved-source-item';
+    const path = document.createElement('div');
+    path.className = 'retrieved-source-path';
+    path.textContent = `${s.pack}/${s.file}`;
+    const title = document.createElement('div');
+    title.className = 'retrieved-source-title';
+    title.textContent = s.title || s.file;
+    const snippet = document.createElement('div');
+    snippet.className = 'retrieved-source-snippet';
+    snippet.textContent = (s.snippet || s.summary || '').trim();
+    item.appendChild(path);
+    item.appendChild(title);
+    if (snippet.textContent) item.appendChild(snippet);
+    list.appendChild(item);
+  });
+
+  header.addEventListener('click', () => {
+    block.classList.toggle('open');
+  });
+
+  block.appendChild(header);
+  block.appendChild(list);
+  return block;
 }
 
 function addToolBadge(msgId, label) {
