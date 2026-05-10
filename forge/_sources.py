@@ -347,7 +347,7 @@ _USER_AGENT = (
 # Wikipedia / WMF endpoints reject generic UAs (403). Identify the tool per
 # https://meta.wikimedia.org/wiki/User-Agent_policy
 _WIKIPEDIA_USER_AGENT = (
-    "OCC-Forge/0.1 (https://github.com/VikFinlay/OCC; vickywensz@gmail.com) httpx"
+    "OCC-Forge/0.1 (https://github.com/VickyWenSZ/occ; vickywensz@gmail.com) httpx"
 )
 
 

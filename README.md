@@ -86,7 +86,7 @@ A lightweight FastAPI service running on shared infrastructure. Hosts the publis
 ### Installation
 
 ```bash
-git clone https://github.com/VikFinlay/occ.git
+git clone https://github.com/VickyWenSZ/occ.git
 cd occ
 ```
 
