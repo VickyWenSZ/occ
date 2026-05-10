@@ -82,42 +82,38 @@ def _fetch_wikipedia(url: str) -> str:
 # ── Generic URL ────────────────────────────────────────────────────────────────
 
 def _fetch_generic(url: str) -> str:
-    """Fetch a generic URL. Tries trafilatura first, falls back to BeautifulSoup."""
-    import httpx
+    """Fetch a generic URL. Uses trafilatura's fetcher (realistic headers),
+    falls back to httpx + BeautifulSoup if trafilatura is unavailable or blocked."""
 
+    # Primary: trafilatura fetch + extract (best headers, best content extraction)
+    try:
+        import trafilatura
+        html = trafilatura.fetch_url(url)
+        if html:
+            text = trafilatura.extract(
+                html,
+                include_comments=False,
+                include_tables=False,
+                no_fallback=False,
+            )
+            if text and len(text) > 200:
+                return text
+    except ImportError:
+        pass
+
+    # Fallback: httpx + BeautifulSoup
+    import httpx
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     resp = httpx.get(url, headers=headers, follow_redirects=True, timeout=30)
     resp.raise_for_status()
-    html = resp.text
-
-    # Try trafilatura — best for extracting main article content
-    text = _extract_trafilatura(html)
-    if text:
-        return text
-
-    # Fallback: BeautifulSoup
-    return _extract_beautifulsoup(html)
-
-
-def _extract_trafilatura(html: str) -> str | None:
-    try:
-        import trafilatura
-        text = trafilatura.extract(
-            html,
-            include_comments=False,
-            include_tables=False,
-            no_fallback=False,
-        )
-        if text and len(text) > 200:
-            return text
-    except ImportError:
-        pass
-    return None
+    return _extract_beautifulsoup(resp.text)
 
 
 def _extract_beautifulsoup(html: str) -> str:
