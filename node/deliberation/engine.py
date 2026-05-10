@@ -443,8 +443,9 @@ class DeliberationEngine:
             f"Original question: {query}\n\n"
             f"Initial answer:\n{expert_answer}\n\n"
             f"Critical review:\n{critique}\n\n"
-            "Produce the best possible answer, weighing both perspectives. "
-            "Cover all relevant aspects. Include details, examples, and commands where useful."
+            "Write the best possible final answer. "
+            "If the critical review identified gaps, errors, or missing points, incorporate them. "
+            "Cover the topic fully, with the depth and detail the question deserves."
         )
         for token in _provider_stream(
             messages=[
@@ -544,8 +545,9 @@ class DeliberationEngine:
             f"Original question: {query}\n\n"
             f"Initial answer:\n{expert_answer[:_synth_expert_cap]}\n\n"
             f"Critical review:\n{critique[:_synth_critique_cap]}\n\n"
-            "Produce the best possible answer, weighing both perspectives. "
-            "Cover all relevant aspects. Include details, examples, and commands where useful."
+            "Write the best possible final answer. "
+            "If the critical review identified gaps, errors, or missing points, incorporate them. "
+            "Cover the topic fully, with the depth and detail the question deserves."
         )
         try:
             for token in _provider_stream(
