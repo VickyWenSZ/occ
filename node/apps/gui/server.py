@@ -1415,14 +1415,9 @@ def _write_deliberation_log(query: str, peer_data: dict, answer: str):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import time
-    import webbrowser
     import uvicorn
 
-    def _open_browser():
-        time.sleep(1.5)
-        webbrowser.open("http://localhost:7891")
-
-    threading.Thread(target=_open_browser, daemon=True).start()
+    # Browser auto-open is handled by the launcher scripts (launch.bat / launch.sh).
+    # When run manually via `python server.py`, open the URL yourself.
     print("OCC Node GUI  →  http://localhost:7891")
     uvicorn.run(app, host="0.0.0.0", port=7891, log_level="warning")
