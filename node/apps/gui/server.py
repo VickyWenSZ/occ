@@ -262,7 +262,8 @@ async def get_config():
         "hardware_profile": _cfg.hardware_profile,
         "detected_vram_gb": _cfg.detected_vram_gb,
         "num_ctx_answer": _cfg.num_ctx_answer,
-        "openrouter_configured": bool(_cfg.openrouter_api_key),
+        "openrouter_configured": bool(_engine.or_key if _engine else _cfg.openrouter_api_key),
+        "openrouter_key_saved": bool(_cfg.openrouter_api_key),
         "openrouter_model": _cfg.openrouter_model,
         "packs": [{"name": p.name, "domains": p.domains} for p in (_retriever.packs if _retriever else [])],
         "local_mode": _cfg.local_mode,
@@ -305,6 +306,28 @@ async def set_local_mode(body: LocalModeBody):
     if _engine:
         _engine._local_mode = body.enabled
     return {"ok": True, "local_mode": body.enabled}
+
+
+class OpenRouterActiveBody(BaseModel):
+    active: bool
+
+
+@app.post("/api/config/openrouter/active")
+async def set_openrouter_active(body: OpenRouterActiveBody):
+    """Toggle OpenRouter on/off in the engine without touching the saved key on disk."""
+    global _cfg
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    if body.active:
+        _cfg = Config()
+        if _engine:
+            _engine.or_key = _cfg.openrouter_api_key
+            _engine.or_model = _cfg.openrouter_model
+        return {"ok": True, "active": bool(_cfg.openrouter_api_key), "model": _cfg.openrouter_model}
+    else:
+        if _engine:
+            _engine.or_key = ""
+        return {"ok": True, "active": False}
 
 
 # ── Routes — Update ───────────────────────────────────────────────────────────

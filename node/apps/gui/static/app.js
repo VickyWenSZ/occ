@@ -177,7 +177,7 @@ function setupEventListeners() {
   document.getElementById('send-btn').addEventListener('click', sendMessage);
 
   document.getElementById('btn-save-or').addEventListener('click', saveOpenRouter);
-  document.getElementById('btn-disable-or').addEventListener('click', disableOpenRouter);
+  document.getElementById('or-active-toggle')?.addEventListener('change', e => setOrActive(e.target.checked));
   document.getElementById('btn-update').addEventListener('click', runUpdate);
 
   // Close modals on overlay click
@@ -1340,8 +1340,8 @@ async function sendMessage() {
     });
     appendCommandResult(data?.output ?? 'No response from server.');
     if (message === '/clear') resetCtxBar();
-    if (message === '/openrouter on')  { const c = await apiFetch('/api/config'); if (c) updateProviderBadge(!!c.openrouter_configured, c.openrouter_model); }
-    if (message === '/openrouter off') updateProviderBadge(false);
+    if (message === '/openrouter on')  { const c = await apiFetch('/api/config'); if (c) { config = c; updateProviderBadge(!!c.openrouter_configured, c.openrouter_model); } }
+    if (message === '/openrouter off') { if (config) config.openrouter_configured = false; updateProviderBadge(false); }
     return;
   }
 
@@ -1546,32 +1546,58 @@ async function openSettings() {
   const cfg = await apiFetch('/api/config') || config;
   config = cfg;
 
+  // Node Info — model, hardware, context only
   const info = document.getElementById('settings-info');
   info.innerHTML = `
     <div class="settings-info-row"><span class="settings-info-key">Model</span><span class="settings-info-val">${cfg.model || '—'}</span></div>
     <div class="settings-info-row"><span class="settings-info-key">Hardware</span><span class="settings-info-val">${cfg.hardware_profile || '—'} · ${cfg.detected_vram_gb > 0 ? cfg.detected_vram_gb + 'GB VRAM' : 'CPU'}</span></div>
-    <div class="settings-info-row"><span class="settings-info-key">Context</span><span class="settings-info-val">${cfg.num_ctx_answer?.toLocaleString() || '—'} tokens</span></div>
-    <div class="settings-info-row" style="border:none"><span class="settings-info-key">Packs</span><span class="settings-info-val">${cfg.packs?.map(p => p.name).join(', ') || 'none'}</span></div>
+    <div class="settings-info-row" style="border:none"><span class="settings-info-key">Context</span><span class="settings-info-val">${cfg.num_ctx_answer?.toLocaleString() || '—'} tokens</span></div>
   `;
 
-  const orStatus = document.getElementById('or-status-line');
-  if (cfg.openrouter_configured) {
-    orStatus.className = 'or-status ok';
-    orStatus.textContent = `● Active — ${cfg.openrouter_model}`;
-  } else {
-    orStatus.className = 'or-status off';
-    orStatus.textContent = '○ Not configured';
-  }
+  // Knowledge Source
+  const localOn = !!cfg.local_mode;
+  const localToggle = document.getElementById('local-mode-toggle');
+  if (localToggle) localToggle.checked = localOn;
+  _updateSourceSides(localOn);
+  _renderPacksList(cfg);
 
+  // OpenRouter — form always visible; toggle = Node inference only
+  const orActive = !!cfg.openrouter_configured;
+  const orToggle = document.getElementById('or-active-toggle');
+  if (orToggle) orToggle.checked = orActive;
   document.getElementById('or-model').value = cfg.openrouter_model || 'qwen/qwen3.5-9b';
   const hint = document.getElementById('or-key-hint');
-  if (hint) hint.style.display = cfg.openrouter_configured ? 'block' : 'none';
-
-  const localToggle = document.getElementById('local-mode-toggle');
-  if (localToggle) localToggle.checked = !!cfg.local_mode;
-
+  if (hint) hint.style.display = cfg.openrouter_key_saved ? 'block' : 'none';
 
   document.getElementById('settings-modal').classList.remove('hidden');
+}
+
+function _updateSourceSides(localOn) {
+  document.getElementById('source-server-side')?.classList.toggle('active', !localOn);
+  document.getElementById('source-local-side')?.classList.toggle('active',  localOn);
+}
+
+function _renderPacksList(cfg) {
+  const list = document.getElementById('settings-packs-list');
+  if (!list) return;
+  const packs = cfg.packs || [];
+  const localOn = !!cfg.local_mode;
+
+  if (!packs.length) {
+    list.innerHTML = `<span class="settings-packs-note">No local packs — create one with Forge.</span>`;
+    return;
+  }
+
+  const prefix = localOn
+    ? ''
+    : `<span class="settings-packs-note" style="width:100%;margin-bottom:0.25rem;">Available locally (active when Local only is ON):</span>`;
+
+  const chips = packs.map(p => {
+    const dc = p.domains?.length || 0;
+    return `<span class="settings-pack-chip">${escapeHtml(p.name)}${dc ? `<span class="settings-pack-chip-count">${dc}d</span>` : ''}</span>`;
+  }).join('');
+
+  list.innerHTML = prefix + chips;
 }
 
 async function setLocalMode(enabled) {
@@ -1581,17 +1607,30 @@ async function setLocalMode(enabled) {
     body: JSON.stringify({ enabled }),
   });
   if (r?.ok) {
-    const label = document.getElementById('local-mode-label');
-    if (label) label.textContent = enabled ? 'On — using local packs only' : 'Off — using server packs';
+    _updateSourceSides(enabled);
+    if (config) { config.local_mode = enabled; _renderPacksList(config); }
+  }
+}
+
+async function setOrActive(enabled) {
+  const r = await apiFetch('/api/config/openrouter/active', {
+    method: 'POST', body: JSON.stringify({ active: enabled }),
+  });
+  if (!r?.ok) return;
+  if (enabled && r.active) {
+    updateProviderBadge(true, r.model || config?.openrouter_model);
+    if (config) config.openrouter_configured = true;
+  } else if (!enabled) {
+    updateProviderBadge(false);
+    if (config) config.openrouter_configured = false;
   }
 }
 
 async function saveOpenRouter() {
   const keyInput = document.getElementById('or-key').value.trim();
-  const model = document.getElementById('or-model').value;
+  const model    = document.getElementById('or-model').value;
   const alreadyConfigured = config?.openrouter_configured;
 
-  // If no key entered and one is already saved, only update the model
   const key = keyInput || (alreadyConfigured ? '__keep__' : '');
   if (!key) { alert('Enter an API key.'); return; }
 
@@ -1600,31 +1639,16 @@ async function saveOpenRouter() {
     : { api_key: key, model };
 
   const r = await apiFetch('/api/config/openrouter', {
-    method: 'POST',
-    body: JSON.stringify(payload),
+    method: 'POST', body: JSON.stringify(payload),
   });
   if (r?.ok) {
     document.getElementById('or-key').value = '';
-    config.openrouter_configured = true;
-    config.openrouter_model = model;
-    const orStatus = document.getElementById('or-status-line');
-    orStatus.className = 'or-status ok';
-    orStatus.textContent = `● Active — ${model}`;
+    if (config) { config.openrouter_configured = true; config.openrouter_model = model; }
+    const orToggle = document.getElementById('or-active-toggle');
+    if (orToggle) orToggle.checked = true;
+    const hint = document.getElementById('or-key-hint');
+    if (hint) hint.style.display = 'block';
     updateProviderBadge(true, model);
-  }
-}
-
-async function disableOpenRouter() {
-  const r = await apiFetch('/api/config/openrouter', {
-    method: 'POST',
-    body: JSON.stringify({ api_key: '', model: 'qwen/qwen3.5-9b' }),
-  });
-  if (r?.ok) {
-    config.openrouter_configured = false;
-    const orStatus = document.getElementById('or-status-line');
-    orStatus.className = 'or-status off';
-    orStatus.textContent = '○ Not configured';
-    updateProviderBadge(false);
   }
 }
 

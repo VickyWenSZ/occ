@@ -8,7 +8,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark-dimmed.min.css">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=17">
+  <link rel="stylesheet" href="/static/style.css?v=18">
   <!-- Critical input-area override — inline so it's never cached separately -->
   <style>
     :root { color-scheme: dark; }
@@ -344,60 +344,84 @@
       <button class="modal-close" id="close-settings">✕</button>
     </div>
     <div class="modal-body">
-      <div>
+
+      <!-- Node Info -->
+      <div class="settings-section">
         <div class="settings-section-label">Node Info</div>
         <div id="settings-info"></div>
       </div>
-      <div>
-        <div class="settings-section-label">Network</div>
-        <div style="display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0;">
+
+      <!-- Knowledge Source -->
+      <div class="settings-section">
+        <div class="settings-section-label">Knowledge Source</div>
+        <div class="settings-source-row">
+          <div class="settings-source-side" id="source-server-side">
+            <div class="settings-source-name">OCC Server</div>
+            <div class="settings-source-desc">Fetch from the network</div>
+          </div>
           <label class="toggle-switch">
             <input type="checkbox" id="local-mode-toggle">
             <span class="toggle-slider"></span>
           </label>
-          <div>
-            <div style="font-size:0.8125rem;color:var(--text-primary);font-weight:500;">Use local packs only</div>
-            <div id="local-mode-label" style="font-size:0.75rem;color:var(--text-faint);margin-top:0.125rem;">Off — using server packs</div>
+          <div class="settings-source-side settings-source-side-right" id="source-local-side">
+            <div class="settings-source-name">Local only</div>
+            <div class="settings-source-desc">Your private Forge packs</div>
           </div>
         </div>
+        <div id="settings-packs-list" class="settings-packs-list"></div>
       </div>
-      <div>
+
+      <!-- OpenRouter -->
+      <div class="settings-section">
         <div class="settings-section-label">OpenRouter</div>
-        <p style="font-size:0.8125rem;color:var(--text-faint);margin-bottom:0.75rem;">
-          Used for cloud queries and Forge pack creation.<br>
-          Get a free API key at <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--accent);text-decoration:none;">openrouter.ai/keys</a>.
-        </p>
-        <div id="or-status-line"></div>
-        <div class="form-group" style="margin-top:0.625rem;">
-          <label class="form-label">API Key</label>
-          <input class="form-input" type="password" id="or-key" placeholder="sk-or-...">
-          <div id="or-key-hint" style="display:none;font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Key saved — leave blank to keep it, or enter a new one to replace.</div>
+
+        <!-- Key + model — always visible, used by both Forge and Node -->
+        <div class="form-group">
+          <label class="form-label">
+            API Key &nbsp;<a href="https://openrouter.ai/keys" target="_blank" class="settings-link">openrouter.ai/keys &#8594;</a>
+          </label>
+          <input class="form-input" type="password" id="or-key" placeholder="sk-or-v1-...">
+          <div id="or-key-hint" style="display:none;font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Key saved &#8212; leave blank to keep it, or enter a new one to replace.</div>
         </div>
-        <div class="form-group" style="margin-top:0.625rem;">
-          <label class="form-label">Model</label>
+        <div class="form-group" style="margin-top:0.5rem;">
+          <label class="form-label">Model (used by Forge)</label>
           <select class="form-select" id="or-model">
-            <option value="qwen/qwen3.5-9b">qwen3.5-9b — Budget · <a href="https://openrouter.ai/qwen/qwen3.5-9b/pricing" target="_blank">pricing</a></option>
-            <option value="qwen/qwen3.5-35b-a3b">qwen3.5-35b-a3b — Strong</option>
+            <option value="qwen/qwen3.5-9b">qwen/qwen3.5-9b &#8212; Budget</option>
+            <option value="qwen/qwen3.5-35b-a3b">qwen/qwen3.5-35b-a3b &#8212; Strong</option>
           </select>
           <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">
             Pricing:
-            <a href="https://openrouter.ai/qwen/qwen3.5-9b/pricing" target="_blank" style="color:var(--accent);text-decoration:none;">qwen3.5-9b</a>
-            &nbsp;·&nbsp;
-            <a href="https://openrouter.ai/qwen/qwen3.5-35b-a3b/pricing" target="_blank" style="color:var(--accent);text-decoration:none;">qwen3.5-35b-a3b</a>
+            <a href="https://openrouter.ai/qwen/qwen3.5-9b/pricing" target="_blank" class="settings-link">qwen3.5-9b</a>
+            &nbsp;&#183;&nbsp;
+            <a href="https://openrouter.ai/qwen/qwen3.5-35b-a3b/pricing" target="_blank" class="settings-link">qwen3.5-35b-a3b</a>
           </div>
         </div>
-        <div class="form-actions" style="margin-top:0.875rem;">
+        <div class="form-actions" style="margin-top:0.625rem;">
           <button class="btn-primary" id="btn-save-or">Save</button>
-          <button class="btn-danger" id="btn-disable-or">Disable</button>
+        </div>
+
+        <!-- Node-only toggle — does NOT affect Forge -->
+        <div class="settings-or-node-row">
+          <div>
+            <div class="settings-source-name">Use OpenRouter for Node responses</div>
+            <div class="settings-source-desc">Forge always uses OpenRouter when a key is set. This only controls Node&#8217;s own inference.</div>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="or-active-toggle">
+            <span class="toggle-slider"></span>
+          </label>
         </div>
       </div>
-      <div>
+
+      <!-- Software -->
+      <div class="settings-section">
         <div class="settings-section-label">Software</div>
-        <div style="display:flex;align-items:center;gap:0.875rem;padding:0.5rem 0;">
+        <div style="display:flex;align-items:center;gap:0.875rem;padding:0.375rem 0;">
           <button class="btn-primary" id="btn-update">Update to latest</button>
           <span id="update-status" style="font-size:0.8125rem;color:var(--text-faint);"></span>
         </div>
       </div>
+
     </div>
   </div>
 </div>
@@ -405,6 +429,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.3/purify.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="/static/app.js?v=21"></script>
+<script src="/static/app.js?v=22"></script>
 </body>
 </html>

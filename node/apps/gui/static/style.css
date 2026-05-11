@@ -22,6 +22,7 @@
   --red:              #ef4444;
   --orange:           #f97316;
   --magenta:          #c084fc;
+  --accent:           #22c55e;
   --font-sans:        'Inter', system-ui, -apple-system, sans-serif;
   --font-mono:        'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
   --radius-sm:        4px;
@@ -1162,7 +1163,7 @@ html, body {
 .settings-section-label {
   font-family: var(--font-mono);
   font-size: 0.625rem;
-  color: var(--text-ghost);
+  color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.1em;
   margin-bottom: 0.625rem;
@@ -1290,12 +1291,97 @@ html, body {
 }
 .btn-danger:hover { background: #1a0000; border-color: #b91c1c; }
 
-.or-status {
-  font-size: 0.8125rem;
-  padding: 0.375rem 0;
+/* ── Settings — sections & layout ────────────────────────────────────────── */
+
+.settings-section + .settings-section {
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
 }
-.or-status.ok  { color: #4ade80; }
-.or-status.off { color: var(--text-faint); }
+
+/* ── Knowledge Source toggle row ────────────────────────────────────────── */
+
+.settings-source-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.375rem 0 0.625rem;
+}
+.settings-source-side {
+  flex: 1;
+  padding: 0.4375rem 0.625rem;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  transition: border-color var(--t-fast), background var(--t-fast);
+  text-align: right;
+}
+.settings-source-side-right {
+  text-align: left;
+}
+.settings-source-side.active {
+  border-color: var(--border-subtle);
+  background: var(--surface-hover);
+}
+.settings-source-name {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text-faint);
+  transition: color var(--t-fast);
+}
+.settings-source-side.active .settings-source-name {
+  color: var(--text);
+}
+.settings-source-desc {
+  font-size: 0.6875rem;
+  color: var(--text-ghost);
+  margin-top: 0.125rem;
+  line-height: 1.4;
+}
+
+.settings-packs-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin-top: 0.125rem;
+}
+.settings-pack-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1875rem 0.5rem;
+  background: var(--green-bg);
+  border: 1px solid var(--green-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: #4ade80;
+}
+.settings-pack-chip-count {
+  color: var(--text-ghost);
+  font-size: 0.625rem;
+}
+.settings-packs-note {
+  font-size: 0.6875rem;
+  color: var(--text-ghost);
+  font-style: italic;
+}
+
+/* ── OpenRouter section ──────────────────────────────────────────────────── */
+
+.settings-or-node-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1rem;
+  padding-top: 0.875rem;
+  border-top: 1px solid var(--border);
+}
+
+.settings-link {
+  color: var(--blue);
+  text-decoration: none;
+}
+.settings-link:hover { color: #7dd3fc; text-decoration: underline; }
 
 /* Commands table */
 .commands-table {
