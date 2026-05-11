@@ -3,33 +3,39 @@ import ollama
 
 _SYSTEM = (
     "You are a query router. Reply with ONLY the digit 0 or 1, nothing else.\n\n"
-    "1 = the user is asking about ANY specific topic, person, place, event, "
-    "concept, technology, technique, science, history, art, or how-to — in ANY "
-    "language. Anything where the answer benefits from real information rather "
-    "than a casual reply.\n\n"
-    "0 = pure social chitchat ONLY: greetings, thanks, jokes you initiate, or "
-    "meta-questions directly about the assistant itself (its name, what it can "
-    "do, who built it). Nothing else qualifies for 0.\n\n"
-    "DEFAULT TO 1 WHEN UNSURE. Asking about a person, period, technology, or "
-    "any factual question — even briefly, even controversially — is always 1."
+    "0 = route to CHAT mode. Two cases:\n"
+    "  (a) Social: greetings, thanks, jokes, meta-questions about the assistant.\n"
+    "  (b) Tool request: the user explicitly asks to search the web, look up "
+    "current/live information online, fetch a URL, write or read a file, "
+    "run or execute code — in ANY language.\n\n"
+    "1 = route to DELIBERATE mode: the user asks an informational question "
+    "about any topic, person, place, event, concept, technology, science, "
+    "history, or how-to. Answer benefits from deep knowledge retrieval.\n\n"
+    "KEY DISTINCTION: asking about weather → 1. Asking to search the web "
+    "for today's weather → 0. The word 'search', 'online', 'web', 'internet', "
+    "'fetch', 'file', 'run code' — or their equivalents in ANY language — "
+    "signals 0.\n\n"
+    "DEFAULT TO 1 WHEN UNSURE."
 )
 
 _EXAMPLES = (
     "Examples (all languages):\n"
     '"hello" → 0\n'
-    '"ciao" → 0\n'
     '"thanks" → 0\n'
     '"who are you" → 0\n'
     '"what can you do" → 0\n'
-    '"what is mcp" → 1\n'
-    '"how does docker work" → 1\n'
-    '"explain kubernetes networking" → 1\n'
-    '"Cesare era gay?" → 1\n'
-    '"come containerizzo un mcp in docker?" → 1\n'
-    '"chi era Napoleone" → 1\n'
-    '"compare Roman emperors with Neanderthals" → 1\n'
-    '"write me a python function" → 1\n'
-    '"what day is it" → 1\n'
+    '"search the web for the latest news on climate change" → 0\n'
+    '"look up current stock prices online" → 0\n'
+    '"fetch this url: https://example.com" → 0\n'
+    '"write a file called report.txt with this content" → 0\n'
+    '"run this python snippet" → 0\n'
+    '"execute this code and show the output" → 0\n'
+    '"what is the weather like in winter in Norway?" → 1\n'
+    '"how does TCP/IP work?" → 1\n'
+    '"who was Alexander the Great?" → 1\n'
+    '"explain quantum entanglement" → 1\n'
+    '"write me a sorting function in Python" → 1\n'
+    '"what is the capital of Brazil?" → 1\n'
 )
 
 

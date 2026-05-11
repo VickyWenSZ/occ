@@ -1208,6 +1208,14 @@ function buildSourcesPanel(data) {
   const panel = document.createElement('div');
   panel.className = 'sources-panel';
 
+  // ── Web search sources ────────────────────────────────────────────────────
+  if (data.mode === 'web') {
+    if (Array.isArray(data.web_sources) && data.web_sources.length > 0) {
+      panel.appendChild(buildWebSourcesBlock(data.web_sources));
+    }
+    return panel;
+  }
+
   // ── Retrieved sources (collapsible) ──────────────────────────────────────
   if (Array.isArray(data.sources) && data.sources.length > 0) {
     panel.appendChild(buildRetrievedSourcesBlock(data.sources));
@@ -1238,6 +1246,46 @@ function buildSourcesPanel(data) {
   });
 
   return panel;
+}
+
+function buildWebSourcesBlock(sources) {
+  const block = document.createElement('div');
+  block.className = 'source-block role-retrieved';
+
+  const header = document.createElement('button');
+  header.type = 'button';
+  header.className = 'retrieved-sources-toggle';
+  header.innerHTML =
+    `<span class="caret">▸</span>` +
+    `<span class="retrieved-sources-label">Web sources</span>` +
+    `<span class="retrieved-sources-count">${sources.length} result${sources.length === 1 ? '' : 's'}</span>`;
+
+  const list = document.createElement('div');
+  list.className = 'retrieved-sources-list';
+
+  sources.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'retrieved-source-item';
+    const link = document.createElement('a');
+    link.href = s.url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.className = 'retrieved-source-path';
+    link.textContent = s.url;
+    item.appendChild(link);
+    if (s.title && s.title !== s.url) {
+      const title = document.createElement('div');
+      title.className = 'retrieved-source-title';
+      title.textContent = s.title;
+      item.appendChild(title);
+    }
+    list.appendChild(item);
+  });
+
+  header.addEventListener('click', () => { block.classList.toggle('open'); });
+  block.appendChild(header);
+  block.appendChild(list);
+  return block;
 }
 
 function buildRetrievedSourcesBlock(sources) {

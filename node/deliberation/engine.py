@@ -143,12 +143,9 @@ class DeliberationEngine:
         parts.append(
             f"Workspace directory: {workspace_path}. "
             "Call any tool listed in your available tools when it helps answer the user. "
-            "Web tools (web_search, fetch_url) are gated: they appear in your tools list "
-            "ONLY when the user explicitly invokes the web (asks to search the web, "
-            "mentions online/internet content, or includes a URL). When web tools are "
-            "absent, do NOT invent web access — answer from the loaded knowledge packs "
-            "and your own knowledge instead. OCC's guarantee is that knowledge comes "
-            "from community-approved packs, not the open web."
+            "IMPORTANT: do NOT call web_search or fetch_url on your own initiative. "
+            "Use them ONLY when the user explicitly asks to search the web, look "
+            "something up online, or fetch a URL."
         )
         self._chat_system = " ".join(parts)
         self._history: list[dict] = []
@@ -1021,6 +1018,19 @@ class DeliberationEngine:
 
     # ─── Chat (tools) ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_web_sources(result: str) -> list[dict]:
+        sources = []
+        title = ""
+        for line in result.splitlines():
+            if line.startswith("**") and line.endswith("**"):
+                title = line.strip("*").strip()
+            elif line.startswith("Source: http"):
+                url = line[8:].strip()
+                sources.append({"title": title or url, "url": url})
+                title = ""
+        return sources
+
     def _stream_with_tools(self, system: str, prompt: str, temperature: float = 0.7, images: list | None = None):
         from node.deliberation.tools import TOOL_FUNCTIONS, get_allowed_tools
         from node.provider import call as _provider_call
@@ -1040,6 +1050,8 @@ class DeliberationEngine:
             user_msg,
         ]
 
+        web_sources: list[dict] = []
+
         while True:
             self._peak_ctx_used = self._measure_ctx(messages)
             resp = _provider_call(
@@ -1050,6 +1062,8 @@ class DeliberationEngine:
             messages.append(resp.assistant_message())
 
             if not resp.tool_calls:
+                if web_sources:
+                    yield ("peer_answers", {"mode": "web", "web_sources": web_sources})
                 yield ("token", resp.content)
                 return
 
@@ -1070,6 +1084,12 @@ class DeliberationEngine:
                     yield ("status", _tool_status(fn_name, fn_args))
                     yield ("tool_used", _tool_label(fn_name))
                     result = fn(**fn_args)
+                    if fn_name == "web_search":
+                        web_sources.extend(self._parse_web_sources(result))
+                    elif fn_name == "fetch_url":
+                        url = fn_args.get("url", "")
+                        if url:
+                            web_sources.append({"title": url, "url": url})
                 else:
                     result = f"Unknown tool: {fn_name}"
                 messages.append(resp.tool_result(tc, result))
