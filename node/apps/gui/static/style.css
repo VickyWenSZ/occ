@@ -1531,11 +1531,15 @@ html, body {
 
 .forge-section-label {
   font-family: var(--font-mono);
-  font-size: 0.625rem;
-  color: var(--text-faint);
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--green);
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.14em;
   user-select: none;
+  padding: 0.15rem 0 0.15rem 0.55rem;
+  border-left: 2px solid var(--green);
+  margin: 0.85rem 0 0.5rem;
 }
 
 .forge-row-2col {
