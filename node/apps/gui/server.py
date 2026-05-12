@@ -943,16 +943,18 @@ async def forge_lint(body: ForgeLintBody):
 def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
                    model: str, fix: bool = False, skip_semantic: bool = False):
     """
-    Two-phase lint:
-      1. Mechanical pre-screen (C1-C11 Karpathy + M1-M2 manifest + S1-S5 safety
-         + Q1-Q4 quality) — deterministic, optional auto-fix
-      2. Semantic LLM audit (safety legitimacy, topic coherence, contradictions,
-         coverage, staleness) — receives mechanical findings as context so the
-         LLM can judge whether each flag is legitimate content for the pack's
-         declared topic
+    Three-phase lint:
+      1. Mechanical pre-screen (C1-C11 + M1-M2 + S1-S5 + Q1-Q4) — deterministic,
+         optional auto-fix
+      2. LLM-powered fixes (when fix=True) — currently: regenerate manifest.summary
+         for packs that lack it. Uses the same model selected by the user.
+      3. Semantic LLM audit — receives mechanical findings + populated
+         manifest_summary as context. Ends with a clear visual VERDICT banner.
     """
     import forge._lint as lint
     import forge._llm as llm
+    import forge._manifest as manifest
+    import forge._wiki as wiki
     import yaml as _yaml
 
     # ── Phase 1: mechanical structural checks ─────────────────────────────────
@@ -969,15 +971,43 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
     if fix and summary["fixed"]:
         yield f"    ✅ Auto-fixed {summary['fixed']} issue(s)"
 
+    # ── Phase 2: LLM-powered fix for M2 (manifest.summary missing) ────────────
+    # Done before the structural report so the report shows M2 as fixed.
+    if fix and _cfg.openrouter_api_key:
+        m2_issues = [i for i in issues if i.get("code") == "M2" and not i.get("fixed")]
+        if m2_issues:
+            os.environ["OPENROUTER_API_KEY"] = _cfg.openrouter_api_key
+            yield f"\n🤖 M2 needs LLM fix — regenerating manifest.summary ({model})..."
+            try:
+                fresh_pages = wiki.scan_existing_pages(wiki_dir)
+                if not fresh_pages:
+                    yield "    ⚠️  Pack has no pages — cannot regenerate summary."
+                else:
+                    new_summary = llm.generate_pack_summary(pack_name, fresh_pages, model=model)
+                    if new_summary.strip():
+                        mf = manifest.load_or_create(pack_dir, pack_name)
+                        mf["summary"] = new_summary
+                        manifest.save(pack_dir, mf)
+                        for i in m2_issues:
+                            i["fixed"] = True
+                        summary["fixed"] += len(m2_issues)
+                        yield f"    ✅ Wrote manifest.summary ({len(new_summary)} chars): {new_summary[:100]}..."
+                    else:
+                        yield "    ⚠️  LLM returned empty summary — skipped."
+            except Exception as ex:
+                yield f"    ❌ LLM fix failed: {ex}"
+
     yield "\n" + lint.format_report(issues, summary, pack_name, fix_applied=fix)
 
-    # ── Phase 2: semantic LLM review ──────────────────────────────────────────
+    # ── Phase 3: semantic LLM review ──────────────────────────────────────────
     if skip_semantic:
+        yield from _emit_verdict_banner(None, summary)
         yield "✅ Lint complete (semantic phase skipped)."
         return
 
     if not _cfg.openrouter_api_key:
         yield "⚠️  Semantic phase skipped — OpenRouter API key not configured."
+        yield from _emit_verdict_banner(None, summary)
         return
 
     os.environ["OPENROUTER_API_KEY"] = _cfg.openrouter_api_key
@@ -986,8 +1016,7 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
     index_path = wiki_dir / "index.md"
     index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else "(no index.md found)"
 
-    # Load manifest.summary so the LLM knows the declared topic and can judge
-    # whether edgy/explicit content is contextually legitimate.
+    # Load manifest.summary (may have just been regenerated in Phase 2).
     manifest_summary = ""
     mf_path = pack_dir / "manifest.yaml"
     if mf_path.exists():
@@ -1023,7 +1052,60 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
         mechanical_findings=issues,
     )
     yield "\n" + report
+    yield from _emit_verdict_banner(report, summary)
     yield f"\n✅ Lint complete (mechanical + semantic)."
+
+
+def _extract_llm_verdict(report: str) -> tuple[str, str]:
+    """Parse the LLM's `## Overall Verdict` section. Returns (icon, label)."""
+    m = re.search(r"##\s*Overall Verdict\s*\n+([^\n]+)", report or "")
+    if not m:
+        return ("⚠️", "Verdict unclear (LLM didn't follow format)")
+    line = m.group(1).strip()
+    low = line.lower()
+    if "✅" in line or "safe to publish" in low:
+        return ("✅", "Safe to publish")
+    if "❌" in line or "do not publish" in low:
+        return ("❌", "Do not publish")
+    if "⚠️" in line or "concerns" in low:
+        return ("⚠️", "Concerns — review required")
+    return ("⚠️", "Verdict unclear")
+
+
+def _emit_verdict_banner(llm_report: str | None, mech_summary: dict):
+    """Emit a visually clear final banner with the lint verdict."""
+    if llm_report is None:
+        # Mechanical-only verdict, based purely on issue counts
+        if mech_summary["critical"] > 0:
+            icon, label = "❌", "Critical mechanical issues — do not publish"
+        elif mech_summary["warning"] >= 5:
+            icon, label = "⚠️", "Many warnings — review required"
+        elif mech_summary["total"] == 0:
+            icon, label = "✅", "Mechanical checks all clean"
+        else:
+            icon, label = "✅", "Minor warnings only — likely safe"
+    else:
+        icon, label = _extract_llm_verdict(llm_report)
+
+    bar = "═" * 60
+    yield ""
+    yield bar
+    yield ""
+    yield f"  VERDICT   {icon}  {label.upper()}"
+    yield ""
+    yield (
+        f"  Mechanical: {mech_summary['critical']} critical, "
+        f"{mech_summary['warning']} warnings, "
+        f"{mech_summary['suggestion']} suggestions"
+    )
+    if llm_report is not None:
+        yield f"  Semantic:   {label}"
+    if mech_summary.get("fixed", 0) > 0:
+        yield f"  Auto-fixed: {mech_summary['fixed']} issue(s) repaired in place"
+    yield ""
+    yield "  → Click \"download\" above to save the full report as Markdown."
+    yield ""
+    yield bar
 
 
 @app.post("/api/forge/reload-packs")
