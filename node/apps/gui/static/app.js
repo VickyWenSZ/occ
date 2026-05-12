@@ -268,6 +268,72 @@ function setupForgeListeners() {
   });
   const dlBtn = document.getElementById('forge-lint-download-btn');
   if (dlBtn) dlBtn.addEventListener('click', downloadLintReport);
+
+  initForgeResizer();
+}
+
+function initForgeResizer() {
+  const resizer = document.getElementById('forge-resizer');
+  const formArea = document.querySelector('.forge-form-area');
+  const layout = document.querySelector('.forge-layout');
+  if (!resizer || !formArea || !layout) return;
+
+  const STORAGE_KEY = 'occ_forge_form_height_px';
+  const MIN_FORM = 120;
+  const MIN_OUTPUT = 150;
+
+  // Restore the saved height on load
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (saved && !isNaN(parseFloat(saved))) {
+    formArea.style.height = `${parseFloat(saved)}px`;
+    formArea.style.maxHeight = 'none';
+  }
+
+  let dragging = false;
+  let startY = 0;
+  let startH = 0;
+
+  const onDown = (e) => {
+    dragging = true;
+    startY = e.clientY;
+    startH = formArea.getBoundingClientRect().height;
+    resizer.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  };
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    const layoutH = layout.getBoundingClientRect().height;
+    const delta = e.clientY - startY;
+    let newH = startH + delta;
+    newH = Math.max(MIN_FORM, Math.min(newH, layoutH - MIN_OUTPUT));
+    formArea.style.height = `${newH}px`;
+    formArea.style.maxHeight = 'none';
+  };
+
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    const h = parseFloat(formArea.style.height);
+    if (!isNaN(h)) localStorage.setItem(STORAGE_KEY, String(h));
+  };
+
+  // Double-click resets to the CSS default (clears inline height + storage)
+  const onDouble = () => {
+    formArea.style.height = '';
+    formArea.style.maxHeight = '';
+    localStorage.removeItem(STORAGE_KEY);
+  };
+
+  resizer.addEventListener('mousedown', onDown);
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+  resizer.addEventListener('dblclick', onDouble);
 }
 
 function addForgeFiles(fileList) {

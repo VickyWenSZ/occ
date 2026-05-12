@@ -1521,12 +1521,40 @@ html, body {
   flex: 0 0 auto;
   overflow-y: auto;
   max-height: 62%;
-  border-bottom: 1px solid var(--border);
   padding: 1.25rem 1.5rem;
   display: flex;
   flex-direction: column;
   gap: 0.875rem;
   background: var(--surface);
+}
+
+/* Draggable horizontal resizer between form-area and output-area.
+   6px hit-zone with a 1px visible divider centered; thickens and turns
+   green on hover/drag. No layout overlap with the neighbouring panels —
+   the form-area's last clickable pixels stay clickable. */
+.forge-resizer {
+  flex: 0 0 6px;
+  cursor: row-resize;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+  user-select: none;
+}
+.forge-resizer::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 1px;
+  background: var(--border);
+  transition: background 0.12s, height 0.12s, top 0.12s;
+}
+.forge-resizer:hover::before,
+.forge-resizer.dragging::before {
+  background: var(--green);
+  height: 2px;
+  top: 2px;
 }
 
 .forge-section-label {
