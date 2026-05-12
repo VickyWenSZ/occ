@@ -48,6 +48,15 @@ def run_structural_checks(wiki_dir: Path, pack_dir: Path, fix: bool = False) -> 
     _check_c4b_source_provenance(pack_dir, pages, raws, issues, fix)
     _check_c5_tag_hygiene(pages, issues, fix)
     _check_c11_placement(pages, raws, issues, fix)
+    _check_m1_manifest_exists(pack_dir, issues, fix)
+    _check_m2_manifest_summary(pack_dir, issues, fix)
+    _check_s1_prompt_injection(pages, issues, fix)
+    _check_s2_destructive_shell(pages, issues, fix)
+    _check_s3_suspicious_urls(pages, issues, fix)
+    _check_s5_control_chars(pages, issues, fix)
+    _check_q1_page_length(pages, issues, fix)
+    _check_q2_placeholders(pages, issues, fix)
+    _check_q4_index_summary_drift(wiki_dir, pages, issues, fix)
 
     summary = {
         "total":      len(issues),
@@ -690,6 +699,279 @@ def _check_c11_placement(pages: list[dict], raws: list[dict], issues: list[dict]
                 "message": f"File in `raw/articles/` has `type: {rtype}` (expected `articles`)",
                 "path": r["rel_path"], "fixed": False,
             })
+
+
+# ── M1, M2: Manifest ──────────────────────────────────────────────────────────
+
+def _check_m1_manifest_exists(pack_dir: Path, issues: list[dict], fix: bool):
+    mf_path = pack_dir / "manifest.yaml"
+    if not mf_path.exists():
+        issues.append({
+            "code": "M1", "severity": "critical",
+            "message": "Missing `manifest.yaml` at pack root — broker cannot read pack_summary",
+            "path": "manifest.yaml", "fixed": False,
+        })
+        return
+    try:
+        data = yaml.safe_load(mf_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not a YAML mapping")
+    except Exception as ex:
+        issues.append({
+            "code": "M1", "severity": "critical",
+            "message": f"`manifest.yaml` is not valid YAML: {ex}",
+            "path": "manifest.yaml", "fixed": False,
+        })
+
+
+def _check_m2_manifest_summary(pack_dir: Path, issues: list[dict], fix: bool):
+    mf_path = pack_dir / "manifest.yaml"
+    if not mf_path.exists():
+        return  # already flagged by M1
+    try:
+        data = yaml.safe_load(mf_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return  # already flagged by M1
+    summary = data.get("summary", "")
+    if not isinstance(summary, str) or not summary.strip():
+        issues.append({
+            "code": "M2", "severity": "warning",
+            "message": "Manifest `summary` is missing or empty — broker BM25 disambiguation degraded. Re-ingest the pack to regenerate.",
+            "path": "manifest.yaml", "fixed": False,
+        })
+        return
+    n = len(summary)
+    if n < 50:
+        issues.append({
+            "code": "M2", "severity": "warning",
+            "message": f"Manifest `summary` is suspiciously short ({n} chars; expected ~200-500)",
+            "path": "manifest.yaml", "fixed": False,
+        })
+    elif n > 2000:
+        issues.append({
+            "code": "M2", "severity": "warning",
+            "message": f"Manifest `summary` is suspiciously long ({n} chars; expected ~200-500)",
+            "path": "manifest.yaml", "fixed": False,
+        })
+
+
+# ── S1-S5: Safety pre-screen (regex) ──────────────────────────────────────────
+#
+# These are CONSERVATIVE pre-screens. Flagging is informational — the LLM
+# audit phase (in _llm.py:lint_wiki) decides whether flagged content is
+# legitimate in the pack's topic (e.g. a security pack discussing rm -rf
+# pedagogically) or actually malicious. A flag here is never a verdict.
+
+_S1_PATTERNS = [
+    # Direct jailbreak instructions
+    re.compile(r"ignore\s+(?:all\s+|the\s+)?previous\s+(?:instructions|prompts|rules)", re.IGNORECASE),
+    re.compile(r"disregard\s+(?:all\s+|the\s+)?(?:above|prior|previous)", re.IGNORECASE),
+    re.compile(r"forget\s+(?:everything|all\s+previous|all\s+instructions)", re.IGNORECASE),
+    # ChatML / instruction-tuned model markers leaked into content
+    re.compile(r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>"),
+    re.compile(r"\[INST\]|\[/INST\]"),
+    # Role-override attempts
+    re.compile(r"you\s+are\s+now\s+(?:a|an|the)\s+(?:DAN|jailbroken|unrestricted)", re.IGNORECASE),
+    re.compile(r"system\s*[:>]\s*you\s+(?:are|will|must)", re.IGNORECASE),
+]
+
+
+def _check_s1_prompt_injection(pages: list[dict], issues: list[dict], fix: bool):
+    for p in pages:
+        body = p.get("body", "") or ""
+        for pat in _S1_PATTERNS:
+            m = pat.search(body)
+            if m:
+                snippet = body[max(0, m.start()-30):m.end()+30].replace("\n", " ")
+                issues.append({
+                    "code": "S1", "severity": "warning",
+                    "message": f"Possible prompt-injection pattern: `…{snippet}…`",
+                    "path": p["rel_path"], "fixed": False,
+                })
+                break  # one flag per page is enough
+
+
+_S2_PATTERNS = [
+    re.compile(r"\brm\s+-rf\s+/(?:\s|$|[^a-zA-Z0-9._/-])"),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),  # fork bomb
+    re.compile(r"\bdd\s+if=.*\s+of=/dev/(?:sd|hd|nvme|disk)"),
+    re.compile(r"\bmkfs\.(?:ext[234]|btrfs|xfs|vfat|ntfs)\b"),
+    re.compile(r"\b(?:curl|wget)\b[^\n|]{0,80}\|\s*(?:bash|sh|zsh|fish)\b"),
+    re.compile(r"\bchmod\s+-R\s+777\s+/"),
+]
+
+
+def _check_s2_destructive_shell(pages: list[dict], issues: list[dict], fix: bool):
+    for p in pages:
+        body = p.get("body", "") or ""
+        for pat in _S2_PATTERNS:
+            m = pat.search(body)
+            if m:
+                snippet = body[max(0, m.start()-20):m.end()+20].replace("\n", " ")
+                issues.append({
+                    "code": "S2", "severity": "warning",
+                    "message": f"Destructive shell pattern found (may be pedagogical — LLM will judge): `{snippet}`",
+                    "path": p["rel_path"], "fixed": False,
+                })
+                break
+
+
+_S3_SHORTENERS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd",
+    "buff.ly", "rebrand.ly", "shorturl.at", "rb.gy",
+}
+_S3_RISKY_TLD = re.compile(r"https?://[^\s/]+\.(?:tk|ml|ga|cf|gq)(?:[/?#]|$)", re.IGNORECASE)
+_S3_PUNYCODE = re.compile(r"https?://[^\s/]*xn--[^\s/]*", re.IGNORECASE)
+_S3_URL_RE = re.compile(r"https?://([^\s/?#]+)", re.IGNORECASE)
+
+
+def _check_s3_suspicious_urls(pages: list[dict], issues: list[dict], fix: bool):
+    for p in pages:
+        body = p.get("body", "") or ""
+        for host in _S3_URL_RE.findall(body):
+            host_l = host.lower()
+            if host_l in _S3_SHORTENERS:
+                issues.append({
+                    "code": "S3", "severity": "warning",
+                    "message": f"URL shortener obscures target: `{host}`",
+                    "path": p["rel_path"], "fixed": False,
+                })
+        if _S3_RISKY_TLD.search(body):
+            issues.append({
+                "code": "S3", "severity": "warning",
+                "message": "URL uses a free TLD frequently abused for phishing (.tk/.ml/.ga/.cf/.gq)",
+                "path": p["rel_path"], "fixed": False,
+            })
+        if _S3_PUNYCODE.search(body):
+            issues.append({
+                "code": "S3", "severity": "warning",
+                "message": "URL contains punycode (xn--…) — possible homoglyph attack on legitimate domain",
+                "path": p["rel_path"], "fixed": False,
+            })
+
+
+# Zero-width and bidi-override characters used to hide payloads inside text
+_S5_FORBIDDEN_CHARS = "​‌‍‎‏‪‫‬‭‮⁦⁧⁨⁩᠎﻿"
+_S5_RE = re.compile(f"[{_S5_FORBIDDEN_CHARS}]")
+
+
+def _check_s5_control_chars(pages: list[dict], issues: list[dict], fix: bool):
+    for p in pages:
+        body = p.get("body", "") or ""
+        m = _S5_RE.search(body)
+        if not m:
+            continue
+        fixed = False
+        if fix:
+            try:
+                cleaned = _S5_RE.sub("", p["text"])
+                p["path"].write_text(cleaned, encoding="utf-8")
+                fixed = True
+            except Exception:
+                fixed = False
+        issues.append({
+            "code": "S5", "severity": "warning",
+            "message": "Page contains invisible/bidi-override Unicode (zero-width or RTL control chars)",
+            "path": p["rel_path"], "fixed": fixed,
+        })
+
+
+# ── Q1, Q2, Q4: Quality pre-screen (mechanical) ───────────────────────────────
+
+_Q1_MIN_BODY_CHARS = 200
+
+
+def _check_q1_page_length(pages: list[dict], issues: list[dict], fix: bool):
+    for p in pages:
+        body = p.get("body", "") or ""
+        # strip headers/blank lines for a fairer minimum
+        meat = "\n".join(
+            l for l in body.splitlines()
+            if l.strip() and not l.lstrip().startswith("#")
+        )
+        if len(meat) < _Q1_MIN_BODY_CHARS:
+            issues.append({
+                "code": "Q1", "severity": "warning",
+                "message": f"Page body is very short ({len(meat)} chars of substantive text)",
+                "path": p["rel_path"], "fixed": False,
+            })
+
+
+_Q2_PLACEHOLDERS = [
+    re.compile(r"\b(?:TODO|FIXME|XXX|TBD|TKTK)\b"),
+    re.compile(r"\[(?:TODO|FIXME|FILL[\s_-]?ME|PLACEHOLDER|INSERT[^\]]*)\]", re.IGNORECASE),
+    re.compile(r"lorem\s+ipsum", re.IGNORECASE),
+    re.compile(r"_To be linked after compilation\._"),  # leftover cross-link placeholder
+]
+
+
+def _check_q2_placeholders(pages: list[dict], issues: list[dict], fix: bool):
+    for p in pages:
+        body = p.get("body", "") or ""
+        for pat in _Q2_PLACEHOLDERS:
+            m = pat.search(body)
+            if m:
+                issues.append({
+                    "code": "Q2", "severity": "warning",
+                    "message": f"Unresolved placeholder: `{m.group(0)}`",
+                    "path": p["rel_path"], "fixed": False,
+                })
+                break
+
+
+def _check_q4_index_summary_drift(wiki_dir: Path, pages: list[dict], issues: list[dict], fix: bool):
+    index_path = wiki_dir / "index.md"
+    if not index_path.exists():
+        return  # flagged by C1
+    rows = _parse_index_rows_with_summary(index_path.read_text(encoding="utf-8"))
+    # Map: filename → summary in index
+    idx_summary = {Path(f).name: s for f, _, s in rows}
+    drift_count = 0
+    for p in pages:
+        if not p["frontmatter"]:
+            continue
+        page_summary = (p["frontmatter"].get("summary") or "").strip()
+        idx_s = idx_summary.get(p["path"].name, "").strip()
+        if not page_summary or not idx_s:
+            continue  # one is empty → C2/C3 covers it
+        # Drift detection: index summary differs substantially from frontmatter
+        if page_summary[:120] != idx_s[:120]:
+            drift_count += 1
+    if drift_count > 0:
+        fixed = False
+        if fix and drift_count > 0:
+            try:
+                import forge._wiki as wiki_mod
+                fresh = [{
+                    "slug": p["frontmatter"].get("slug", p["path"].stem) if p["frontmatter"] else p["path"].stem,
+                    "title": (p["frontmatter"].get("title", p["path"].stem) if p["frontmatter"] else p["path"].stem),
+                    "summary": (p["frontmatter"].get("summary", "") if p["frontmatter"] else ""),
+                } for p in pages]
+                wiki_mod.update_index(wiki_dir, fresh)
+                fixed = True
+            except Exception:
+                fixed = False
+        issues.append({
+            "code": "Q4", "severity": "warning",
+            "message": f"`wiki/index.md` summary drifted from page frontmatter for {drift_count} page(s) — broker FTS5 will index stale summaries",
+            "path": "wiki/index.md", "fixed": fixed,
+        })
+
+
+def _parse_index_rows_with_summary(text: str) -> list[tuple[str, str, str]]:
+    """Parse index.md table rows. Returns list of (file, title, summary)."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        parts = [p.strip() for p in line.strip("|").split("|")]
+        if len(parts) < 3:
+            continue
+        if parts[0].lower() == "file" or parts[0].startswith("-"):
+            continue
+        out.append((parts[0], parts[1], parts[2]))
+    return out
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
