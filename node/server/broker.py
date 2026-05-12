@@ -39,7 +39,13 @@ _REINDEX_TOKEN = os.environ.get("OCC_REINDEX_TOKEN", "")
 
 # FTS5 schema version — bump when columns or tokenizer change to force a rebuild.
 # Migration runs in _init_db() via PRAGMA user_version (DROP+CREATE if outdated).
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+
+# How many characters of each page's body to index. Title+summary cover the
+# topic shape; the body adds vocabulary the summary doesn't repeat (verbs,
+# proper names, dates), which is what catches paraphrased queries like
+# "how did X die" against a page whose summary says "killed".
+_BODY_INDEX_CHARS = 2000
 
 # Rate limit for /search: per-client sliding window. Defense vs DoS on the public
 # search endpoint. Behind a reverse proxy, request.client.host is the proxy IP —
@@ -231,6 +237,7 @@ def _init_db():
                     title,
                     summary,
                     pack_summary,
+                    body,
                     tokenize='trigram'
                 )
             """)
@@ -250,6 +257,20 @@ def _read_pack_summary(pack_dir: Path) -> str:
         return str(data.get("summary", "") or "")
     except Exception:
         return ""
+
+
+def _read_page_body(page_path: Path, max_chars: int = _BODY_INDEX_CHARS) -> str:
+    """Read a wiki page MD file, strip YAML frontmatter, return up to max_chars
+    of body text. Empty string on any failure or missing file."""
+    try:
+        text = page_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            text = text[end + 5:]
+    return text[:max_chars]
 
 
 _INDEX_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(.+?)\s*\|$")
@@ -314,12 +335,15 @@ def _reindex_all(only_pack: str | None = None) -> dict:
                 text = index_path.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
-            pack_summary = _read_pack_summary(index_path.parent.parent)
+            pack_dir = index_path.parent.parent
+            pack_summary = _read_pack_summary(pack_dir)
+            wiki_dir = index_path.parent
             for row in _parse_index_md(text):
+                page_body = _read_page_body(wiki_dir / row["page_file"])
                 conn.execute(
-                    "INSERT INTO pack_pages (pack_path, page_file, title, summary, pack_summary) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (pack_path, row["page_file"], row["title"], row["summary"], pack_summary),
+                    "INSERT INTO pack_pages (pack_path, page_file, title, summary, pack_summary, body) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (pack_path, row["page_file"], row["title"], row["summary"], pack_summary, page_body),
                 )
                 rows_inserted += 1
         conn.commit()
