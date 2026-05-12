@@ -944,14 +944,19 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
                    model: str, fix: bool = False, skip_semantic: bool = False):
     """
     Two-phase lint:
-      1. Mechanical Karpathy checks (C1, C2, C3, C4, C4b, C11) — deterministic, optional auto-fix
-      2. Semantic LLM review (Contradictions, Coverage Gaps, Staleness) — optional via skip_semantic
+      1. Mechanical pre-screen (C1-C11 Karpathy + M1-M2 manifest + S1-S5 safety
+         + Q1-Q4 quality) — deterministic, optional auto-fix
+      2. Semantic LLM audit (safety legitimacy, topic coherence, contradictions,
+         coverage, staleness) — receives mechanical findings as context so the
+         LLM can judge whether each flag is legitimate content for the pack's
+         declared topic
     """
     import forge._lint as lint
     import forge._llm as llm
+    import yaml as _yaml
 
     # ── Phase 1: mechanical structural checks ─────────────────────────────────
-    yield f"🔧 Running structural lint (Karpathy C1, C2, C3, C4, C4b, C11)..."
+    yield f"🔧 Running mechanical lint (structure, manifest, safety, quality)..."
     if fix:
         yield "    🛠️  Auto-fix enabled — fixable issues will be repaired in place"
 
@@ -977,9 +982,20 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
 
     os.environ["OPENROUTER_API_KEY"] = _cfg.openrouter_api_key
 
-    yield f"\n🤖 Running semantic review ({model})..."
+    yield f"\n🤖 Running semantic audit ({model}) — assessing safety, topic coherence, quality..."
     index_path = wiki_dir / "index.md"
     index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else "(no index.md found)"
+
+    # Load manifest.summary so the LLM knows the declared topic and can judge
+    # whether edgy/explicit content is contextually legitimate.
+    manifest_summary = ""
+    mf_path = pack_dir / "manifest.yaml"
+    if mf_path.exists():
+        try:
+            mf_data = _yaml.safe_load(mf_path.read_text(encoding="utf-8")) or {}
+            manifest_summary = str(mf_data.get("summary", "") or "")
+        except Exception:
+            pass
 
     concepts_dir = wiki_dir / "concepts"
     pages_parts = []
@@ -1000,9 +1016,14 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
 
     pages_content = "".join(pages_parts) or "(no pages found)"
 
-    report = llm.lint_wiki(pack_name, index_content, pages_content, model=model)
+    report = llm.lint_wiki(
+        pack_name, index_content, pages_content,
+        model=model,
+        manifest_summary=manifest_summary,
+        mechanical_findings=issues,
+    )
     yield "\n" + report
-    yield f"\n✅ Lint complete (structural + semantic)."
+    yield f"\n✅ Lint complete (mechanical + semantic)."
 
 
 @app.post("/api/forge/reload-packs")
