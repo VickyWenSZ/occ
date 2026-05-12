@@ -62,7 +62,11 @@ def _call(
     )
     if not resp.is_success:
         raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:600]}")
-    return resp.json()["choices"][0]["message"]["content"]
+    msg = resp.json()["choices"][0]["message"]
+    # Reasoning models (e.g. gpt-5-mini) sometimes put the answer in
+    # `reasoning_content` and leave `content` as null. Fall through so callers
+    # never receive None.
+    return msg.get("content") or msg.get("reasoning_content") or ""
 
 
 def _call_vision_for_pdf_transcription(
@@ -777,4 +781,4 @@ def generate_pack_summary(
         "Summary (2-3 sentences, same language as pages):"
     )
     raw = _call(model, system, user, json_mode=False, max_output_tokens=400)
-    return raw.strip()
+    return (raw or "").strip()
