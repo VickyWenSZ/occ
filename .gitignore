@@ -33,3 +33,6 @@ expert-packs/*
 # Per-session working drafts at the repo root (knowledge reports, scratch).
 # Pack files with similar names are still tracked normally inside packs.
 /occ-*.md
+
+# Local planning docs — never pushed
+docs/
