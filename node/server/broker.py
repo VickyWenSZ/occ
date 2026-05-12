@@ -4,6 +4,18 @@ OCC Broker — WebSocket broker + HTTP file serving + pack search
 Deploy: /opt/occ-broker/broker.py
 Run:    uvicorn broker:app --host 0.0.0.0 --port 8000
 Env:    OCC_REINDEX_TOKEN  (required for /admin/reindex)
+
+Security status — alpha. See SECURITY.md at the repo root for full threat model.
+- Public-by-design endpoints (unauthenticated): /tree, /packs/*, /search, /nodes.
+  Pack content is community-approved and meant to be world-readable.
+- Token-protected: /admin/reindex (X-OCC-Token header, OCC_REINDEX_TOKEN env).
+- Defensive measures in place:
+    * /search rate-limited per client IP (sliding window, see _check_rate_limit).
+    * `nodes` and `pending_queries` dicts have hard caps to bound memory.
+- Known gaps pending Sprint 4 PKI hardening:
+    * /ws `register` accepts any node_id and self-declared VRAM without signing.
+    * /admin/reindex token is a single static value (no rotation).
+  Do NOT run this broker in production without the hardening track.
 """
 import json
 import os
@@ -13,7 +25,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect
+import yaml
+from fastapi import FastAPI, HTTPException, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -24,15 +37,86 @@ SEARCH_DB = Path("/opt/occ-broker/pack_search.db")
 _NODE_TIMEOUT = 90  # seconds
 _REINDEX_TOKEN = os.environ.get("OCC_REINDEX_TOKEN", "")
 
+# FTS5 schema version — bump when columns or tokenizer change to force a rebuild.
+# Migration runs in _init_db() via PRAGMA user_version (DROP+CREATE if outdated).
+_SCHEMA_VERSION = 2
+
+# Rate limit for /search: per-client sliding window. Defense vs DoS on the public
+# search endpoint. Behind a reverse proxy, request.client.host is the proxy IP —
+# X-Forwarded-For handling is a deployment concern (see SECURITY.md).
+_RATE_LIMIT_MAX = 60          # requests per window
+_RATE_LIMIT_WINDOW = 60       # seconds
+_RATE_LIMIT_STATE_CAP = 10_000  # hard cap on distinct IPs tracked
+
+# Caps on in-memory registries to prevent memory exhaustion attacks.
+_NODES_CAP = 5_000
+_PENDING_QUERIES_CAP = 10_000
+
 # node_id → {ws, tier_name, vram_used_mb, public_key, last_seen, last_seen_ts}
 nodes: dict[str, dict] = {}
 
 # query_id → WebSocket of the requesting client (for routing responses back)
 pending_queries: dict[str, WebSocket] = {}
 
+# client_ip → list[timestamp] for rate limiting /search
+_rate_limit_state: dict[str, list[float]] = {}
+_rate_limit_last_cleanup: float = 0.0
+
 
 def _is_alive(info: dict) -> bool:
     return (time.time() - info.get("last_seen_ts", 0)) < _NODE_TIMEOUT
+
+
+def _check_rate_limit(client_ip: str) -> bool:
+    """
+    Sliding-window per-IP rate limit. Returns True if allowed, False if exceeded.
+    Self-prunes stale state once per window to keep memory bounded.
+    """
+    global _rate_limit_last_cleanup
+    now = time.time()
+    cutoff = now - _RATE_LIMIT_WINDOW
+
+    if now - _rate_limit_last_cleanup > _RATE_LIMIT_WINDOW:
+        for k in list(_rate_limit_state.keys()):
+            ts = _rate_limit_state[k]
+            while ts and ts[0] < cutoff:
+                ts.pop(0)
+            if not ts:
+                del _rate_limit_state[k]
+        _rate_limit_last_cleanup = now
+
+    if len(_rate_limit_state) >= _RATE_LIMIT_STATE_CAP and client_ip not in _rate_limit_state:
+        # State table full of active IPs — allow the request rather than tracking
+        # a new entry (fail-open under extreme load; SECURITY.md flags this).
+        return True
+
+    timestamps = _rate_limit_state.setdefault(client_ip, [])
+    while timestamps and timestamps[0] < cutoff:
+        timestamps.pop(0)
+    if len(timestamps) >= _RATE_LIMIT_MAX:
+        return False
+    timestamps.append(now)
+    return True
+
+
+def _evict_dead_nodes_if_full() -> bool:
+    """
+    If `nodes` is at cap, evict the oldest dead node. Returns True if there is
+    room for a new registration, False if every slot is alive (registration
+    must be rejected).
+    """
+    if len(nodes) < _NODES_CAP:
+        return True
+    now = time.time()
+    dead = sorted(
+        (info.get("last_seen_ts", 0), nid)
+        for nid, info in nodes.items()
+        if (now - info.get("last_seen_ts", 0)) >= _NODE_TIMEOUT
+    )
+    if dead:
+        nodes.pop(dead[0][1], None)
+        return True
+    return False
 
 
 def _select_target(requester_vram_mb: int, requester_id: str) -> str | None:
@@ -128,20 +212,44 @@ def _open_db() -> sqlite3.Connection:
 
 
 def _init_db():
+    """
+    Create or upgrade the FTS5 index. Uses PRAGMA user_version: if the stored
+    version is below _SCHEMA_VERSION, DROP+CREATE with the current schema and
+    bump the pragma. Reindex happens at startup (_on_startup), so a fresh table
+    after migration gets repopulated automatically.
+    """
     conn = _open_db()
     try:
-        conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS pack_pages USING fts5(
-                pack_path,
-                page_file,
-                title,
-                summary,
-                tokenize='porter unicode61'
-            )
-        """)
+        cur = conn.execute("PRAGMA user_version")
+        current = cur.fetchone()[0]
+        if current < _SCHEMA_VERSION:
+            conn.execute("DROP TABLE IF EXISTS pack_pages")
+            conn.execute("""
+                CREATE VIRTUAL TABLE pack_pages USING fts5(
+                    pack_path,
+                    page_file,
+                    title,
+                    summary,
+                    pack_summary,
+                    tokenize='trigram'
+                )
+            """)
+            conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
         conn.close()
+
+
+def _read_pack_summary(pack_dir: Path) -> str:
+    """Read manifest.yaml summary field; empty string if missing or malformed."""
+    mf_path = pack_dir / "manifest.yaml"
+    if not mf_path.exists():
+        return ""
+    try:
+        data = yaml.safe_load(mf_path.read_text(encoding="utf-8")) or {}
+        return str(data.get("summary", "") or "")
+    except Exception:
+        return ""
 
 
 _INDEX_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(.+?)\s*\|$")
@@ -206,10 +314,12 @@ def _reindex_all(only_pack: str | None = None) -> dict:
                 text = index_path.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
+            pack_summary = _read_pack_summary(index_path.parent.parent)
             for row in _parse_index_md(text):
                 conn.execute(
-                    "INSERT INTO pack_pages (pack_path, page_file, title, summary) VALUES (?, ?, ?, ?)",
-                    (pack_path, row["page_file"], row["title"], row["summary"]),
+                    "INSERT INTO pack_pages (pack_path, page_file, title, summary, pack_summary) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (pack_path, row["page_file"], row["title"], row["summary"], pack_summary),
                 )
                 rows_inserted += 1
         conn.commit()
@@ -218,30 +328,49 @@ def _reindex_all(only_pack: str | None = None) -> dict:
         conn.close()
 
 
-def _search_packs(q: str, k: int = 10) -> list[dict]:
-    """Run an FTS5 query and return top-K results ranked by BM25."""
+def _search_packs(q: str, k: int = 10, scope: str = "") -> list[dict]:
+    """
+    Run an FTS5 query and return top-K results ranked by BM25. If `scope` is
+    given (already sanitized by the endpoint), restrict matches to packs whose
+    pack_path equals `scope` exactly or starts with `scope/` — both shapes are
+    needed so a pack at the root of a domain is not missed by a prefix-only filter.
+    """
     if not q.strip():
         return []
     conn = _open_db()
     try:
         # FTS5: rank is bm25 score, ascending = better
-        cursor = conn.execute(
-            """
-            SELECT pack_path, page_file, title, summary, rank
-            FROM pack_pages
-            WHERE pack_pages MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (_fts_escape(q), k),
-        )
+        if scope:
+            cursor = conn.execute(
+                """
+                SELECT pack_path, page_file, title, summary, pack_summary, rank
+                FROM pack_pages
+                WHERE pack_pages MATCH ?
+                  AND (pack_path = ? OR pack_path LIKE ?)
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (_fts_escape(q), scope, f"{scope}/%", k),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                SELECT pack_path, page_file, title, summary, pack_summary, rank
+                FROM pack_pages
+                WHERE pack_pages MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (_fts_escape(q), k),
+            )
         return [
             {
                 "pack_path": row[0],
                 "page_file": row[1],
                 "title": row[2],
                 "summary": row[3],
-                "score": row[4],
+                "pack_summary": row[4],
+                "score": row[5],
             }
             for row in cursor.fetchall()
         ]
@@ -277,11 +406,29 @@ async def _on_startup():
 class SearchRequest(BaseModel):
     q: str
     k: int = 10
+    scope: str = ""
+
+
+_SCOPE_FORBIDDEN_RE = re.compile(r"[%_\\]|\.\.")
+
+
+def _sanitize_scope(scope: str) -> str:
+    """Lowercase + strip slashes; reject SQL LIKE wildcards and path traversal."""
+    scope = scope.strip().strip("/").lower()
+    if not scope:
+        return ""
+    if _SCOPE_FORBIDDEN_RE.search(scope):
+        raise HTTPException(400, "invalid scope")
+    return scope
 
 
 @app.post("/search")
-async def search(req: SearchRequest):
-    return {"results": _search_packs(req.q, k=max(1, min(req.k, 50)))}
+async def search(req: SearchRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        raise HTTPException(429, "rate limit exceeded")
+    scope = _sanitize_scope(req.scope)
+    return {"results": _search_packs(req.q, k=max(1, min(req.k, 50)), scope=scope)}
 
 
 class ReindexRequest(BaseModel):
@@ -317,6 +464,12 @@ async def websocket_endpoint(ws: WebSocket):
 
             if mtype == "register":
                 node_id = msg.get("node_id", "")
+                if not node_id:
+                    await ws.send_text(json.dumps({"type": "error", "error": "missing_node_id"}))
+                    continue
+                if node_id not in nodes and not _evict_dead_nodes_if_full():
+                    await ws.send_text(json.dumps({"type": "error", "error": "broker_at_capacity"}))
+                    continue
                 nodes[node_id] = {
                     "ws": ws,
                     "tier_name": msg.get("tier_name", "micro"),
@@ -337,6 +490,13 @@ async def websocket_endpoint(ws: WebSocket):
                 # Orchestrator → broker → Critic peer
                 to_node = msg.get("to")
                 query_id = msg.get("query_id", "")
+                if len(pending_queries) >= _PENDING_QUERIES_CAP:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "query_id": query_id,
+                        "error": "broker_busy",
+                    }))
+                    continue
                 if to_node and to_node in nodes and _is_alive(nodes[to_node]):
                     pending_queries[query_id] = ws
                     my_pending.add(query_id)
