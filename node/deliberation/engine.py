@@ -1,6 +1,20 @@
 from datetime import datetime
 from .roles import ROLES
 
+# When OpenRouter is active, retrieval budget jumps to ~600k chars (~170k tokens),
+# well within Qwen3.5's 262k native context. Local tier values stay untouched.
+_OR_RETRIEVAL_CHARS = 600_000
+
+
+def _log(msg: str) -> None:
+    """Write to the GUI log bus when available; no-op otherwise (e.g. tests).
+    Lets the user see deliberation progress in the Logs panel."""
+    try:
+        from node.apps.gui import log_bus
+        log_bus.write(msg)
+    except Exception:
+        pass
+
 
 def _tool_status(fn_name: str, fn_args: dict) -> str:
     if fn_name == "web_search":
@@ -129,7 +143,7 @@ class DeliberationEngine:
         self.vram_used_mb = vram_used_mb
         self.num_ctx_answer = num_ctx_answer
         self.num_ctx_synth = num_ctx_synth
-        self.retrieval_chars = retrieval_chars
+        self._retrieval_chars_local = retrieval_chars
 
         today = datetime.now().strftime("%B %d, %Y")
         parts = [_OCC_IDENTITY, f"Today's date is {today}."]
@@ -152,6 +166,10 @@ class DeliberationEngine:
         self._last_ctx_used: int = 0
         self._peak_ctx_used: int = 0
         self._ctx_limit: int = num_ctx_answer
+
+    @property
+    def retrieval_chars(self) -> int:
+        return _OR_RETRIEVAL_CHARS if self.or_key else self._retrieval_chars_local
 
     def _update_ctx(self, prompt_tokens: int, completion_tokens: int):
         self._last_ctx_used = prompt_tokens + completion_tokens
@@ -400,7 +418,9 @@ class DeliberationEngine:
                 return False
 
         # 1. Discriminate the three states of _decompose_query
+        _log(f"[retrieve] decompose: query={query[:80]!r}")
         decision = self._decompose_query(query)
+        _log(f"[retrieve] decompose result: {decision!r}")
 
         if decision == []:
             # Qwen said "no domain relevant" → no retrieval (Expert from base model)
@@ -421,18 +441,24 @@ class DeliberationEngine:
                 # Depth refinement: navigate inside the domain's sub-tree.
                 # Returns `domain` at worst, never None — safe to use as scope.
                 scope_path = self._navigate_within_scope(domain, query)
+                _log(f"[retrieve] domain={domain} scope={scope_path}")
                 sample = self._fetch_index_sample(scope_path)
                 if not sample:
+                    _log(f"[retrieve] no index sample for {scope_path} — skip")
                     continue
                 translated_q = self._translate_query_for_pack(query, sample)
+                _log(f"[retrieve] keywords for {scope_path}: {translated_q!r}")
                 d_results = self._server_search(translated_q, k=8, scope=scope_path)
                 # Safety net: if a deep scope returns nothing (tree-walk picked
                 # a wrong subtree, or content lives at the broader level),
                 # retry with the root domain so we never miss material that
                 # BM25 would have found at the wider scope.
                 if not d_results and scope_path != domain:
+                    _log(f"[retrieve] empty at {scope_path}, retry at {domain}")
                     d_results = self._server_search(translated_q, k=8, scope=domain)
                 d_results.sort(key=lambda r: r.get("score", 0))
+                _log(f"[retrieve] {len(d_results)} hits for {domain}; top: "
+                     f"{(d_results[0].get('page_file', '') if d_results else '-')}")
                 if d_results:
                     results_per_group.append(d_results)
 
@@ -786,9 +812,13 @@ class DeliberationEngine:
 
     def _translate_query_for_pack(self, query: str, index_content: str) -> str:
         """
-        Translate `query` into the language of the pack (detected from `index_content`).
-        Returns the query unchanged when it is already in the pack's language, when
-        `index_content` is empty, or on any failure — safe to call unconditionally.
+        Produce an FTS5-friendly keyword query in the pack's language. The LLM
+        sees a sample of the pack's index, detects the language, and returns a
+        short bag of 5-10 domain keywords (translations, synonyms, proper
+        names) that cover the question's intent. BM25 then matches even when
+        the user's phrasing doesn't share tokens with the page summaries — e.g.
+        "morto" → "assassination Ides March killed Brutus Cassius senate".
+        Falls back to the original query on any failure.
         """
         from node.provider import call as _provider_call
 
@@ -796,15 +826,18 @@ class DeliberationEngine:
             return query
 
         system = (
-            "You translate a question into the language of a knowledge base. "
-            "Detect the language from the index sample, translate the question. "
-            "If the question is already in the target language, return it unchanged. "
-            "Reply with the translated question only. No explanations."
+            "You build a keyword query for a BM25 full-text search. "
+            "Detect the language of the knowledge base from the index sample, "
+            "then output 5-10 keywords in THAT language that best cover the user's "
+            "question. Include synonyms, domain-specific terms, and proper names "
+            "that are likely to appear in page titles or summaries. "
+            "Reply with the keywords only, space-separated. No punctuation, no "
+            "explanations, no quotes, no operators."
         )
         user = (
-            f"Index sample (first 500 chars):\n{index_content[:500]}\n\n"
-            f"Question to translate: {query}\n"
-            "Translated question:"
+            f"Index sample (first 800 chars):\n{index_content[:800]}\n\n"
+            f"User question: {query}\n"
+            "Keywords:"
         )
         try:
             resp = _provider_call(
@@ -820,8 +853,10 @@ class DeliberationEngine:
                 num_ctx=1024,
             )
             out = (resp.content or "").strip()
-            # Reject pathological outputs (empty or 5x query length + 100 buffer)
-            if not out or len(out) > len(query) * 5 + 100:
+            # Strip surrounding quotes/braces the model sometimes adds; collapse
+            # to whitespace-separated tokens. Reject obviously pathological output.
+            out = out.strip('"').strip("'").strip("`")
+            if not out or len(out) > len(query) * 8 + 200:
                 return query
             return out
         except Exception:
@@ -1011,6 +1046,8 @@ class DeliberationEngine:
 
         # Call 1 — Expert
         yield ("status", "Expert analyzing...")
+        backend = "OR" if self.or_key else "ollama"
+        _log(f"[expert] start ({backend}, ctx_chars={len(context)})")
         if context:
             expert_prompt = (
                 f"[Knowledge context]\n{context}\n\n"
@@ -1033,8 +1070,10 @@ class DeliberationEngine:
                 num_ctx=self.num_ctx_answer,
             )
             expert_answer = expert_resp.content or ""
+            _log(f"[expert] done — {len(expert_answer)} chars")
         except Exception as e:
             expert_answer = ""
+            _log(f"[expert] FAILED: {e}")
             yield ("peer_answers", {"mode": "local", "expert_draft": "", "critic_review": f"[Expert call failed: {e}]"})
             yield ("token", f"*(Deliberation failed at Expert step: {e})*")
             return
@@ -1058,6 +1097,7 @@ class DeliberationEngine:
 
         # Run the Critic with manifest+fetch tool when retrieved_pages is available;
         # otherwise fall back to the legacy excerpt-only flow.
+        _log(f"[critic] start ({backend}, draft={len(critic_expert)} chars)")
         critique = ""
         try:
             for ev in self._run_critic(critic_excerpt, critic_expert, retrieved_pages):
@@ -1067,8 +1107,10 @@ class DeliberationEngine:
                     yield ev
                 elif ev[0] == "critique":
                     critique = ev[1]
-        except Exception:
+        except Exception as e:
+            _log(f"[critic] FAILED: {e}")
             critique = ""
+        _log(f"[critic] done — {len(critique)} chars")
 
         # Always emit peer_answers so Sources panel always appears in deliberate mode
         yield ("peer_answers", {
@@ -1095,6 +1137,7 @@ class DeliberationEngine:
             "answer with the specifics (names, dates, quotes, examples). Do not compress to a "
             "short paragraph if the material supports more."
         )
+        _log(f"[synth] start ({backend}, streaming)")
         try:
             for token in _provider_stream(
                 messages=[
@@ -1108,7 +1151,9 @@ class DeliberationEngine:
                 num_ctx=self.num_ctx_synth,
             ):
                 yield ("token", token)
+            _log("[synth] done")
         except Exception as e:
+            _log(f"[synth] FAILED: {e}")
             yield ("token", f"\n\n*(Synthesis failed: {e} — showing Expert answer)*\n\n{expert_answer}")
 
     # ─── Critic with manifest + fetch_full_page tool ──────────────────────────
