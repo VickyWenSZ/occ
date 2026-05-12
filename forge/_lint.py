@@ -70,15 +70,15 @@ def run_structural_checks(wiki_dir: Path, pack_dir: Path, fix: bool = False) -> 
 
 
 def format_report(issues: list[dict], summary: dict, pack_name: str, fix_applied: bool) -> str:
-    """Format issues as a human-readable markdown report."""
+    """Format issues as a human-readable markdown report. No internal codes."""
     from datetime import date
 
     lines = [
-        f"## Structural Lint — {pack_name} — {date.today().isoformat()}",
+        f"## Structural Checks — {pack_name} — {date.today().isoformat()}",
         "",
-        f"- Checks executed: C1, C2, C3, C4, C4b, C5, C11",
-        f"- Issues: **{summary['total']}** ({summary['critical']} critical, "
-        f"{summary['warning']} warning, {summary['suggestion']} suggestion, {summary['info']} info)",
+        f"- Issues found: **{summary['total']}** "
+        f"({summary['critical']} critical, {summary['warning']} warning, "
+        f"{summary['suggestion']} suggestion, {summary['info']} info)",
     ]
     if fix_applied:
         lines.append(f"- Auto-fixed: **{summary['fixed']}**")
@@ -98,8 +98,7 @@ def format_report(issues: list[dict], summary: dict, pack_name: str, fix_applied
         for i in bucket:
             tag = "✅ auto-fixed — " if i.get("fixed") else ""
             path = f" — `{i['path']}`" if i.get("path") else ""
-            code = f" *(C{i['code']})*" if i.get("code") else ""
-            lines.append(f"- {tag}{i['message']}{path}{code}")
+            lines.append(f"- {tag}{i['message']}{path}")
         lines.append("")
 
     if summary["total"] == 0:
@@ -708,7 +707,7 @@ def _check_m1_manifest_exists(pack_dir: Path, issues: list[dict], fix: bool):
     if not mf_path.exists():
         issues.append({
             "code": "M1", "severity": "critical",
-            "message": "Missing `manifest.yaml` at pack root — broker cannot read pack_summary",
+            "message": "Missing `manifest.yaml` at the pack's root directory. This file is required for the broker to register the pack.",
             "path": "manifest.yaml", "fixed": False,
         })
         return
@@ -736,7 +735,7 @@ def _check_m2_manifest_summary(pack_dir: Path, issues: list[dict], fix: bool):
     if not isinstance(summary, str) or not summary.strip():
         issues.append({
             "code": "M2", "severity": "warning",
-            "message": "Manifest `summary` is missing or empty — broker BM25 disambiguation degraded. Re-ingest the pack to regenerate.",
+            "message": "Pack-level summary is missing from `manifest.yaml`. The broker uses it to disambiguate packs during search; without it, search quality is reduced. Enable auto-fix to regenerate.",
             "path": "manifest.yaml", "fixed": False,
         })
         return
@@ -744,13 +743,13 @@ def _check_m2_manifest_summary(pack_dir: Path, issues: list[dict], fix: bool):
     if n < 50:
         issues.append({
             "code": "M2", "severity": "warning",
-            "message": f"Manifest `summary` is suspiciously short ({n} chars; expected ~200-500)",
+            "message": f"Pack-level summary is suspiciously short ({n} chars; expected ~200-500). Consider regenerating it with auto-fix.",
             "path": "manifest.yaml", "fixed": False,
         })
     elif n > 2000:
         issues.append({
             "code": "M2", "severity": "warning",
-            "message": f"Manifest `summary` is suspiciously long ({n} chars; expected ~200-500)",
+            "message": f"Pack-level summary is suspiciously long ({n} chars; expected ~200-500).",
             "path": "manifest.yaml", "fixed": False,
         })
 
@@ -953,7 +952,7 @@ def _check_q4_index_summary_drift(wiki_dir: Path, pages: list[dict], issues: lis
                 fixed = False
         issues.append({
             "code": "Q4", "severity": "warning",
-            "message": f"`wiki/index.md` summary drifted from page frontmatter for {drift_count} page(s) — broker FTS5 will index stale summaries",
+            "message": f"`wiki/index.md` summaries are out of sync with the page frontmatter for {drift_count} page(s). The broker would index outdated descriptions; auto-fix will regenerate the index.",
             "path": "wiki/index.md", "fixed": fixed,
         })
 

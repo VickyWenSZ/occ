@@ -1031,14 +1031,14 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
     MAX_TOTAL = 80_000
     total_chars = 0
     if concepts_dir.exists():
-        page_files = sorted(concepts_dir.glob("*.md"))
-        for pf in page_files:
-            if pf.name == "_index.md":
-                continue
+        # Exclude folder-meta files like _index.md so the count matches what
+        # index.md reports (only actual concept pages).
+        concept_files = [pf for pf in sorted(concepts_dir.glob("*.md")) if not pf.name.startswith("_")]
+        for pf in concept_files:
             content = pf.read_text(encoding="utf-8")
             chunk = f"\n### {pf.stem}\n{content}\n"
             if total_chars + len(chunk) > MAX_TOTAL:
-                pages_parts.append(f"\n### (truncated — {len(page_files)} total pages, limit reached)")
+                pages_parts.append(f"\n### (truncated — {len(concept_files)} total pages, limit reached)")
                 break
             pages_parts.append(chunk)
             total_chars += len(chunk)
@@ -1102,8 +1102,6 @@ def _emit_verdict_banner(llm_report: str | None, mech_summary: dict):
         yield f"  Semantic:   {label}"
     if mech_summary.get("fixed", 0) > 0:
         yield f"  Auto-fixed: {mech_summary['fixed']} issue(s) repaired in place"
-    yield ""
-    yield "  → Click \"download\" above to save the full report as Markdown."
     yield ""
     yield bar
 
