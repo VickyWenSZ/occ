@@ -993,7 +993,11 @@ def _lint_run_core(pack_name: str, wiki_dir: Path, pack_dir: Path,
                         summary["fixed"] += len(m2_issues)
                         yield f"    ✅ Wrote manifest.summary ({len(new_summary)} chars): {new_summary[:100]}..."
                     else:
-                        yield "    ⚠️  LLM returned empty summary — skipped."
+                        yield (
+                            "    ⚠️  LLM returned empty content — likely the model hit its "
+                            "internal token budget before emitting the answer. "
+                            "Try the Lint with a different model (e.g. GPT-5 instead of GPT-5 Mini)."
+                        )
             except Exception as ex:
                 yield f"    ❌ LLM fix failed: {ex}"
 

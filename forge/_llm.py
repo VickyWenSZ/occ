@@ -478,7 +478,9 @@ def suggest_cross_links(
         "  - note: a short clause (max 12 words) describing the relationship\n\n"
         "Only include entries you are confident about. Empty array is acceptable. Return valid JSON."
     )
-    raw = _call(model, system, user, json_mode=True, max_output_tokens=2000)
+    # 4000 tokens: gpt-5/gpt-5-mini reasoning models need room to think before
+    # emitting the JSON object. A tight cap can return an empty response.
+    raw = _call(model, system, user, json_mode=True, max_output_tokens=4000)
     try:
         data = json.loads(raw)
         if isinstance(data, list):
@@ -780,5 +782,10 @@ def generate_pack_summary(
         f"PAGES:\n{listed}\n\n"
         "Summary (2-3 sentences, same language as pages):"
     )
-    raw = _call(model, system, user, json_mode=False, max_output_tokens=400)
+    # 4000 token budget: gpt-5/gpt-5-mini are reasoning models — they spend
+    # most of the budget on internal chain-of-thought before producing the
+    # visible answer. A tight cap (e.g. 400) gets exhausted during reasoning
+    # and yields empty content. 4000 is comfortable headroom; the actual
+    # summary is short so unused tokens cost nothing.
+    raw = _call(model, system, user, json_mode=False, max_output_tokens=4000)
     return (raw or "").strip()
