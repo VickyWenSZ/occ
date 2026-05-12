@@ -17,6 +17,7 @@ def load_or_create(pack_dir: Path, pack_name: str) -> dict:
         "name": pack_name,
         "version": "1.0.0",
         "domains": [pack_name],
+        "summary": "",
         "language": "it",
         "sources": [],
         "signature": None,

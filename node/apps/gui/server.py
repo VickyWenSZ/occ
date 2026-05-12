@@ -774,6 +774,15 @@ def _forge_run_core(body: "ForgeRunBody"):
 
         fresh_pages = wiki.scan_existing_pages(wiki_dir)
         wiki.update_index(wiki_dir, fresh_pages)
+
+        if fresh_pages:
+            try:
+                yield f"\n📝 Generating pack summary ({extract_model})..."
+                mf["summary"] = llm.generate_pack_summary(pack_name, fresh_pages, model=extract_model)
+                yield f"  ✅ Pack summary: {mf['summary'][:80]}..."
+            except Exception as e:
+                yield f"  ⚠️ Pack summary generation failed: {e} — manifest keeps previous summary"
+
         manifest.save(pack_dir, mf)
 
         yield f"\n🎉 Done! {total_written} pages written to expert-packs/{pack_name}/wiki/concepts/"

@@ -683,3 +683,38 @@ def _format_available_images(available_images: list[dict] | None) -> str:
         "- Do NOT invent new images or paths. Use only what's listed.\n\n"
     )
     return "\n".join(lines)
+
+
+def generate_pack_summary(
+    pack_name: str,
+    pages: list[dict],
+    model: str = DEFAULT_EXTRACT_MODEL,
+) -> str:
+    """
+    Produce a 2-3 sentence summary of the whole pack from pages (title + summary).
+    Used by retrieval to disambiguate packs at the BM25 ranking layer.
+    Reply in the same language as the pages. Raises on LLM failure.
+    """
+    if not pages:
+        return ""
+
+    listed = "\n".join(
+        f"  - {p.get('title','').strip()}: {p.get('summary','').strip()}"
+        for p in pages
+    )
+    system = (
+        "You write dense, keyword-rich pack summaries for a knowledge retrieval system. "
+        "Given the list of pages in a pack (titles + summaries), produce a 2-3 sentence "
+        "description of the pack as a whole: what subject it covers, which key concepts, "
+        "people, periods, or themes are present. Be specific and concrete — this text is "
+        "used by BM25 to disambiguate this pack from others, so generic phrasing hurts. "
+        "Reply in the same language as the page titles and summaries. "
+        "Reply with the summary only — no preamble, no labels, no quotes."
+    )
+    user = (
+        f"PACK NAME: {pack_name}\n\n"
+        f"PAGES:\n{listed}\n\n"
+        "Summary (2-3 sentences, same language as pages):"
+    )
+    raw = _call(model, system, user, json_mode=False, max_output_tokens=400)
+    return raw.strip()
