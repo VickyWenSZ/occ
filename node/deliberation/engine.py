@@ -356,8 +356,12 @@ class DeliberationEngine:
           1. _decompose_query yields a 3-state decision:
                None       → legacy fallback (global BM25, no decomposition/translation)
                []         → no domain relevant; skip retrieval, return ("", {})
-               [d1, ...]  → scoped flow: per-domain language translation + scoped search
-          2. Run BM25 per group, grouped (no premature merge).
+               [d1, ...]  → scoped flow: per-domain depth refinement + translation + scoped search
+          2. For each chosen domain, walk the sub-tree via LLM
+             (_navigate_within_scope) to pick the right depth — overview vs leaf —
+             then translate the query into the pack's language and call /search
+             with the refined scope. Falls back to the root domain scope if
+             the deeper scope returns 0 results.
           3. Round-robin pick across groups (same logic as before; "group" replaces
              "sub_query" but the picking algorithm is identical).
           4. Multi-pack parallel fetch of the chosen pages.
@@ -411,14 +415,23 @@ class DeliberationEngine:
             if legacy:
                 results_per_group.append(legacy)
         else:
-            # Scoped flow: per-domain translate + scoped /search call
+            # Scoped flow: per-domain tree-walk to the right depth, then
+            # translate + scoped /search at that depth.
             for domain in decision:
-                sample = self._fetch_index_sample(domain)
+                # Depth refinement: navigate inside the domain's sub-tree.
+                # Returns `domain` at worst, never None — safe to use as scope.
+                scope_path = self._navigate_within_scope(domain, query)
+                sample = self._fetch_index_sample(scope_path)
                 if not sample:
-                    # Domain absent from tree (race with reindex, or typo'd in LLM output)
                     continue
                 translated_q = self._translate_query_for_pack(query, sample)
-                d_results = self._server_search(translated_q, k=8, scope=domain)
+                d_results = self._server_search(translated_q, k=8, scope=scope_path)
+                # Safety net: if a deep scope returns nothing (tree-walk picked
+                # a wrong subtree, or content lives at the broader level),
+                # retry with the root domain so we never miss material that
+                # BM25 would have found at the wider scope.
+                if not d_results and scope_path != domain:
+                    d_results = self._server_search(translated_q, k=8, scope=domain)
                 d_results.sort(key=lambda r: r.get("score", 0))
                 if d_results:
                     results_per_group.append(d_results)
@@ -693,6 +706,83 @@ class DeliberationEngine:
                     return text
 
         return " ".join(children) if children else ""
+
+    def _navigate_within_scope(self, domain: str, query: str) -> str:
+        """
+        Refine a root domain to the right depth via LLM tree-walk. Returns a
+        path like "history/ancient-civilizations/ancient-rome" or just `domain`
+        if Qwen stops at the overview level. Never returns None — falls back
+        to the input `domain` on any failure, so the caller can rely on a
+        usable scope value unconditionally.
+        """
+        import httpx
+        from node.provider import call as _provider_call
+        from node.retrieval.pack_cache import SERVER_URL
+
+        MAX_DEPTH = 4
+        current_path = domain
+
+        for _ in range(MAX_DEPTH):
+            try:
+                resp = httpx.get(f"{SERVER_URL}/tree/{current_path}", timeout=5.0)
+                if resp.status_code != 200:
+                    return current_path
+                data = resp.json()
+            except Exception:
+                return current_path
+
+            children = data.get("children", []) or []
+            has_pack = data.get("has_pack", False)
+
+            if not children:
+                return current_path
+
+            # When the current level has its own overview pack, Qwen may stop
+            # there. When not, it must descend (or admit no sub-topic fits).
+            stop_hint = (
+                " Or reply 'stop' to use this overview level."
+                if has_pack
+                else " Or reply 'none' if no sub-topic is relevant."
+            )
+            prompt = (
+                f"You are navigating a knowledge tree to find the right level "
+                f"for this question: \"{query}\"\n"
+                f"Current location: {current_path}\n"
+                + ("This location has its own overview pack.\n" if has_pack else "")
+                + f"Sub-topics available: {', '.join(children)}\n"
+                f"Which sub-topic is most relevant? Reply with exactly one name "
+                f"from the list.{stop_hint}"
+            )
+
+            try:
+                llm_resp = _provider_call(
+                    messages=[{"role": "user", "content": prompt}],
+                    model_local=self.model,
+                    or_key="",
+                    or_model="",
+                    tools=None,
+                    temperature=0.0,
+                    num_ctx=2048,
+                )
+                choice = (llm_resp.content or "").strip().rstrip(".").lower()
+            except Exception:
+                return current_path
+
+            if choice in ("none", "stop", ""):
+                return current_path
+
+            matched = next((c for c in children if c.lower() == choice), None)
+            if not matched:
+                matched = next(
+                    (c for c in children if choice in c.lower() or c.lower() in choice),
+                    None,
+                )
+            if not matched:
+                return current_path
+
+            current_path = f"{current_path}/{matched}"
+
+        return current_path
 
     def _translate_query_for_pack(self, query: str, index_content: str) -> str:
         """
