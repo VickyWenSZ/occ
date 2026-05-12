@@ -12,6 +12,11 @@ BUDGET_MODEL = "qwen/qwen3.5-9b"
 STRONG_MODEL = "qwen/qwen3.5-35b-a3b"
 _OR_BASE = "https://openrouter.ai/api/v1"
 _STOP = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+# Reasoning models on OR (Qwen3 family) generate <think> blocks server-side,
+# burning the completion budget. Disable thinking via chat_template_kwargs and
+# keep a generous output budget so a real answer always fits.
+_OR_MAX_TOKENS = 16384
+_OR_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 class _Fn:
@@ -106,7 +111,14 @@ def _extract_content(msg) -> str:
 def _or_call(messages, model, api_key, tools, temperature) -> ProviderResponse:
     from openai import OpenAI
     client = OpenAI(api_key=api_key, base_url=_OR_BASE, timeout=120.0)
-    kw: dict = {"model": model, "messages": messages, "temperature": temperature, "stop": _STOP}
+    kw: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stop": _STOP,
+        "max_tokens": _OR_MAX_TOKENS,
+        "extra_body": _OR_EXTRA_BODY,
+    }
     if tools:
         kw["tools"] = tools
         kw["tool_choice"] = "auto"
@@ -144,7 +156,13 @@ def _or_stream(messages, model, api_key, temperature) -> Iterator[str]:
     buf = ""
     header_stripped = False
     for chunk in client.chat.completions.create(
-        model=model, messages=messages, temperature=temperature, stop=_STOP, stream=True
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        stop=_STOP,
+        stream=True,
+        max_tokens=_OR_MAX_TOKENS,
+        extra_body=_OR_EXTRA_BODY,
     ):
         token = chunk.choices[0].delta.content or ""
         if not token:
