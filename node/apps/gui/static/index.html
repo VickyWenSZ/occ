@@ -300,6 +300,13 @@
           <div class="forge-lint-divider"></div>
 
           <div class="forge-section-label">Lint</div>
+          <div class="forge-lint-row" style="margin-bottom: 0.5rem;" title="Model used by the semantic audit (safety, topic coherence, contradictions) and — when auto-fix is enabled — by the LLM-powered repairs such as regenerating a missing manifest.summary.">
+            <select class="form-select forge-lint-select" id="forge-lint-model">
+              <option value="openai/gpt-5">GPT-5 — best quality (recommended for audit)</option>
+              <option value="openai/gpt-5-mini">GPT-5 Mini — fast &amp; cheap</option>
+              <option value="anthropic/claude-sonnet-4.6">Claude Sonnet 4.6 — alternative</option>
+            </select>
+          </div>
           <div class="forge-lint-row">
             <select class="form-select forge-lint-select" id="forge-lint-pack">
               <option value="">— select a pack —</option>
@@ -309,7 +316,7 @@
               Run Lint
             </button>
           </div>
-          <label class="forge-lint-fix-label" title="When enabled, fixable issues (missing indexes, missing title/summary, See Also back-links) are repaired in place. Default off — dry-run report only.">
+          <label class="forge-lint-fix-label" title="When enabled: structural fixes (regenerate indexes, normalize frontmatter, strip invisible Unicode) PLUS an LLM-powered fix for missing manifest.summary — useful for packs ingested before the pack_summary feature. The selected lint model is used for the LLM fix.">
             <input type="checkbox" id="forge-lint-fix">
             <span>Auto-fix repairable issues</span>
           </label>

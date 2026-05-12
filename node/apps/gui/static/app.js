@@ -536,7 +536,9 @@ async function runLint(packNameOverride = null) {
     return;
   }
 
-  const model = document.getElementById('forge-model').value;
+  const lintModelSelect = document.getElementById('forge-lint-model');
+  const model = (lintModelSelect && lintModelSelect.value)
+    || document.getElementById('forge-model').value;  // fallback to writing model
   const fixCheckbox = document.getElementById('forge-lint-fix');
   const fix = !!(fixCheckbox && fixCheckbox.checked);
   const lintBtn = document.getElementById('forge-lint-btn');
@@ -547,7 +549,7 @@ async function runLint(packNameOverride = null) {
   const downloadBtn = document.getElementById('forge-lint-download-btn');
   if (downloadBtn) downloadBtn.style.display = 'none';
   _lastLintReport = { packName, text: '' };
-  appendForgeOutput(`🔍 Linting pack: ${packName}${fix ? ' (auto-fix ON)' : ''}...`);
+  appendForgeOutput(`🔍 Linting pack: ${packName} with ${model}${fix ? ' (auto-fix ON)' : ''}...`);
 
   try {
     const resp = await fetch('/api/forge/lint', {
