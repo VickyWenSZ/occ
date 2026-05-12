@@ -350,30 +350,35 @@ class DeliberationEngine:
 
     def _retrieve_from_server(self, query: str) -> tuple:
         """
-        Multi-domain retrieval via broker /search.
+        Multi-domain retrieval via broker /search, with optional per-domain scoping.
 
         Flow:
-          1. Decompose the user query into 1-N sub-queries (one per logical domain).
-          2. For each sub-query, call /search → top-K page references across all packs.
-          3. Dedup + cap, group by pack, fetch pages (multi-pack parallel).
-          4. See Also expansion within each pack (one hop, capped).
-          5. Concatenate into context, labelled by pack/page, capped at retrieval_chars.
+          1. _decompose_query yields a 3-state decision:
+               None       → legacy fallback (global BM25, no decomposition/translation)
+               []         → no domain relevant; skip retrieval, return ("", {})
+               [d1, ...]  → scoped flow: per-domain language translation + scoped search
+          2. Run BM25 per group, grouped (no premature merge).
+          3. Round-robin pick across groups (same logic as before; "group" replaces
+             "sub_query" but the picking algorithm is identical).
+          4. Multi-pack parallel fetch of the chosen pages.
+          5. See Also expansion within each pack (capped per pack).
+          6. Assemble context with PER-DOMAIN budget (retrieval_chars / N_active_domains),
+             preserving round-robin emission order. Domain = pack_path top-level segment.
+          7. Build retrieved_pages for the Critic's manifest+fetch tool.
 
-        Returns a tuple `(context, retrieved_pages)` where:
-          - context: concatenated string passed to Expert (str | None | "")
-          - retrieved_pages: structured dict for the Critic's manifest+fetch tool
-            { (pack_path, page_file): {"title", "summary", "content"} }
-            Empty dict if no retrieval; None if broker unreachable.
-
-        Status semantics for `context`:
+        Returns `(context, retrieved_pages)`:
+          - context: str | None | ""
+          - retrieved_pages: dict | None | {}
+        Status semantics for context:
           - non-empty string → success
-          - "" → broker reachable but no relevant pages
+          - "" → broker reachable but no relevant pages OR no-retrieval decision
           - None → broker unreachable
         """
         import asyncio
         import concurrent.futures
+        import httpx as _httpx
         from node.retrieval.pack_cache import (
-            fetch_pages, ensure_pack_cached, CACHE_DIR,
+            fetch_pages, ensure_pack_cached, CACHE_DIR, SERVER_URL,
         )
 
         def _run_async(coro):
@@ -383,34 +388,49 @@ class DeliberationEngine:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     return pool.submit(asyncio.run, coro).result(timeout=30)
 
-        # 1. Decompose the query
-        sub_queries = self._decompose_query(query)
-
-        # 2. Search per sub-query, keep results grouped (no premature merge —
-        # we want each sub-query to contribute its share, not be drowned out
-        # by another sub-query whose top score happens to be higher)
-        results_per_sq: list[list[dict]] = []
-        for sq in sub_queries:
-            sq_results = self._server_search(sq, k=8)
-            # BM25 ranks ascending (lower = better) — sort within each sub-query
-            sq_results.sort(key=lambda r: r.get("score", 0))
-            results_per_sq.append(sq_results)
-
-        if not any(results_per_sq):
-            # No /search hits anywhere — broker up but no relevant pages, OR offline
-            from node.retrieval.pack_cache import SERVER_URL
-            import httpx
+        def _broker_reachable() -> bool:
             try:
-                httpx.get(f"{SERVER_URL}/tree", timeout=5).raise_for_status()
-                return ("", {})
+                _httpx.get(f"{SERVER_URL}/tree", timeout=5).raise_for_status()
+                return True
             except Exception:
-                return (None, None)
+                return False
 
-        # Build a (pack, file) → {title, summary} index from search results
-        # (See Also expansion pages fall back to frontmatter parsing below)
+        # 1. Discriminate the three states of _decompose_query
+        decision = self._decompose_query(query)
+
+        if decision == []:
+            # Qwen said "no domain relevant" → no retrieval (Expert from base model)
+            return ("", {}) if _broker_reachable() else (None, None)
+
+        results_per_group: list[list[dict]] = []
+        if decision is None:
+            # Legacy fallback: single global BM25 search, no decomposition/translation.
+            # Acts as a safety net when /tree is down or the decomposer crashed.
+            legacy = self._server_search(query, k=12)
+            legacy.sort(key=lambda r: r.get("score", 0))
+            if legacy:
+                results_per_group.append(legacy)
+        else:
+            # Scoped flow: per-domain translate + scoped /search call
+            for domain in decision:
+                sample = self._fetch_index_sample(domain)
+                if not sample:
+                    # Domain absent from tree (race with reindex, or typo'd in LLM output)
+                    continue
+                translated_q = self._translate_query_for_pack(query, sample)
+                d_results = self._server_search(translated_q, k=8, scope=domain)
+                d_results.sort(key=lambda r: r.get("score", 0))
+                if d_results:
+                    results_per_group.append(d_results)
+
+        if not results_per_group:
+            return ("", {}) if _broker_reachable() else (None, None)
+
+        # 2. Build (pack, file) → {title, summary} from search results.
+        # See Also pages fall back to frontmatter parsing later.
         page_meta: dict[tuple[str, str], dict] = {}
-        for sq_results in results_per_sq:
-            for r in sq_results:
+        for g_results in results_per_group:
+            for r in g_results:
                 k = (r.get("pack_path", ""), r.get("page_file", ""))
                 if k[0] and k[1] and k not in page_meta:
                     page_meta[k] = {
@@ -418,22 +438,21 @@ class DeliberationEngine:
                         "summary": r.get("summary", ""),
                     }
 
-        # 3. Round-robin over sub-queries: each contributes its top-PER_SQ
-        # before any sub-query gets a second pick. Dedup on (pack, file).
-        # We also track the round-robin order — used later when assembling
-        # the context so no single big pack starves the others' pages.
-        PER_SQ = 4
+        # 3. Round-robin across groups: each contributes its top-PER_GROUP before
+        # any group gets a second pick. Dedup on (pack, file). Track the order so
+        # context assembly stays fair across groups.
+        PER_GROUP = 4
         MAX_PAGES_TOTAL = 12
         seen: set[tuple[str, str]] = set()
         refs_by_pack: dict[str, list[str]] = {}
-        ordered_refs: list[tuple[str, str]] = []  # (pack, file) in round-robin order
-        for round_idx in range(PER_SQ):
-            for sq_results in results_per_sq:
+        ordered_refs: list[tuple[str, str]] = []
+        for round_idx in range(PER_GROUP):
+            for g_results in results_per_group:
                 if len(seen) >= MAX_PAGES_TOTAL:
                     break
-                if round_idx >= len(sq_results):
+                if round_idx >= len(g_results):
                     continue
-                r = sq_results[round_idx]
+                r = g_results[round_idx]
                 pack_path = r.get("pack_path", "")
                 page_file = r.get("page_file", "")
                 if not pack_path or not page_file:
@@ -462,9 +481,12 @@ class DeliberationEngine:
                 continue
 
         if not pages_by_pack:
-            return (None, None)  # all fetches failed → likely network issue
+            return (None, None)
 
-        # 5. See Also expansion per pack (one hop, capped per pack)
+        # 5. See Also expansion per pack — wikilinks are already pack-internal
+        # (see _expand_via_see_also: targets must exist in the pack's index),
+        # so the expansion is naturally scoped. Lower cap than the old global
+        # mode to leave room for other domains' content.
         for pack_path in list(pages_by_pack.keys()):
             if not ensure_pack_cached(pack_path):
                 continue
@@ -479,7 +501,7 @@ class DeliberationEngine:
             already = set(pages_by_pack[pack_path].keys())
             extra_refs = self._expand_via_see_also(
                 pages_by_pack[pack_path], pack_path, index_content,
-                already_fetched=already, cap=4,
+                already_fetched=already, cap=3,
             )
             if not extra_refs:
                 continue
@@ -490,40 +512,45 @@ class DeliberationEngine:
             except Exception:
                 pass
 
-        # 6. Assemble context, labelled by pack/page, capped at retrieval_chars.
-        # Order: original round-robin order first (so each sub-query is represented),
-        # then any See Also expansions appended at the end of their pack's slot.
-        parts = []
-        total = 0
+        # 6. Assemble context with per-domain budget so a single big pack does
+        # not starve another domain's content. Domain = top-level pack_path segment
+        # for both modes (scoped flow: equals the chosen domain; legacy fallback:
+        # derived from each result's pack_path, giving multi-area fairness too).
+        active_domains: set[str] = {pp.split("/", 1)[0] for pp in pages_by_pack}
+        budget_per_domain = self.retrieval_chars // max(len(active_domains), 1)
+        domain_spend: dict[str, int] = {d: 0 for d in active_domains}
+
+        parts: list[str] = []
         emitted: set[tuple[str, str]] = set()
-        # Pass 1: original picks in round-robin order
+        # Pass 1: original round-robin picks
         for (pack_path, filename) in ordered_refs:
             content = pages_by_pack.get(pack_path, {}).get(filename)
             if content is None:
                 continue
-            remaining = self.retrieval_chars - total
+            domain = pack_path.split("/", 1)[0]
+            remaining = budget_per_domain - domain_spend.get(domain, 0)
             if remaining <= 0:
-                break
+                continue
             chunk = content[:remaining]
             parts.append(f"[{pack_path}/{filename}]\n{chunk}")
-            total += len(chunk)
+            domain_spend[domain] = domain_spend.get(domain, 0) + len(chunk)
             emitted.add((pack_path, filename))
-        # Pass 2: See Also expansions (anything fetched but not in ordered_refs)
+        # Pass 2: See Also expansions appended at the tail of their pack's slot
         for pack_path, pages in pages_by_pack.items():
+            domain = pack_path.split("/", 1)[0]
             for filename, content in pages.items():
                 if (pack_path, filename) in emitted:
                     continue
-                remaining = self.retrieval_chars - total
+                remaining = budget_per_domain - domain_spend.get(domain, 0)
                 if remaining <= 0:
                     break
                 chunk = content[:remaining]
                 parts.append(f"[{pack_path}/{filename}]\n{chunk}")
-                total += len(chunk)
-            if total >= self.retrieval_chars:
-                break
+                domain_spend[domain] = domain_spend.get(domain, 0) + len(chunk)
 
-        # 7. Build retrieved_pages — flat (pack, file) → {title, summary, content}
-        # Used by the Critic to build a manifest and to serve fetch_full_page calls.
+        # 7. Build retrieved_pages — flat (pack, file) → {title, summary, content}.
+        # See Also pages weren't in the search results, so pull title/summary from
+        # their frontmatter as fallback.
         retrieved_pages: dict[tuple[str, str], dict] = {}
         for pack_path, pages in pages_by_pack.items():
             for filename, content in pages.items():
@@ -531,8 +558,6 @@ class DeliberationEngine:
                 title = meta.get("title", "")
                 summary = meta.get("summary", "")
                 if not title or not summary:
-                    # See Also pages aren't in the search results — get title/summary
-                    # from the page's frontmatter instead.
                     fm_title, fm_summary = _parse_frontmatter_brief(content)
                     title = title or fm_title
                     summary = summary or fm_summary
@@ -544,41 +569,51 @@ class DeliberationEngine:
 
         return ("\n\n".join(parts), retrieved_pages)
 
-    def _decompose_query(self, query: str) -> list[str]:
+    def _decompose_query(self, query: str) -> list[str] | None:
         """
-        Split a question into 1-N sub-queries, one per distinct topic/domain.
-        Single-topic questions return [query] (or a slightly rephrased single
-        sub-query). Multi-domain questions return 2-4 sub-queries that can be
-        searched independently.
-
-        Falls back to [query] on any LLM/parse failure — the system always has
-        at least one sub-query to retrieve on.
+        Identify which knowledge domains are needed to answer the question, constrained
+        to the broker's real root list. Three-state contract:
+          None       → /tree fetch or LLM call failed; caller falls back to global BM25
+          []         → Qwen judged no domain relevant (chitchat / meta); caller skips retrieval
+          [d1, ...]  → 1-4 valid root names (lowercase matched to broker's actual list)
         """
-        import json as _json
         import re as _re
+        import httpx
         from node.provider import call as _provider_call
+        from node.retrieval.pack_cache import SERVER_URL
 
-        prompt = (
-            "Break the user question into independent sub-queries, one per distinct "
-            "topic or domain. For simple single-topic questions, return just the "
-            "original question (translated to English keywords if needed for search). "
-            "For composite questions spanning multiple domains, return 2-4 short, "
-            "focused queries — one per domain.\n\n"
-            f"Question: {query}\n\n"
-            "Reply with JSON only, in this exact shape:\n"
-            '{"sub_queries": ["...", "..."]}\n\n'
-            "Examples:\n"
-            '  Q: "Was Caesar gay?"  →  {"sub_queries": ["Julius Caesar sexuality Nicomedes"]}\n'
-            '  Q: "How do I containerize an MCP server in Docker?"  →  '
-            '{"sub_queries": ["Docker containerization", "MCP server protocol"]}\n'
-            '  Q: "MCP in Docker with authentication?"  →  '
-            '{"sub_queries": ["Docker containerization", "MCP server", "authentication"]}\n'
-            '  Q: "What is photosynthesis?"  →  {"sub_queries": ["photosynthesis"]}\n\n'
-            "Output JSON only, no explanation. Maximum 4 sub-queries."
+        # 1. Fetch the real root list — constrained choice beats open-ended generation
+        try:
+            resp = httpx.get(f"{SERVER_URL}/tree", timeout=5.0)
+            if resp.status_code != 200:
+                return None
+            root_list = resp.json()
+            if not isinstance(root_list, list) or not root_list:
+                return None
+        except Exception:
+            return None
+
+        lower_to_orig = {str(r).lower(): str(r) for r in root_list if isinstance(r, str)}
+        if not lower_to_orig:
+            return None
+
+        # 2. Constrained LLM choice
+        system = (
+            "You identify which knowledge domains are needed to answer a question. "
+            "Reply only with names from the provided list, one per line. "
+            "Reply 'none' if nothing is relevant. Maximum 4 domains."
+        )
+        user = (
+            f"Question: {query}\n"
+            f"Available domains: {', '.join(root_list)}\n"
+            "Which domains are needed?"
         )
         try:
             resp = _provider_call(
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
                 model_local=self.model,
                 or_key="",
                 or_model="",
@@ -587,26 +622,132 @@ class DeliberationEngine:
                 num_ctx=2048,
             )
             raw = (resp.content or "").strip()
-            raw = _re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=_re.MULTILINE).strip()
-            # Find first {...} block in case the model added preamble
-            m = _re.search(r"\{.*\}", raw, flags=_re.DOTALL)
-            if m:
-                raw = m.group(0)
-            data = _json.loads(raw)
-            sqs = data.get("sub_queries") or []
-            sqs = [s.strip() for s in sqs if isinstance(s, str) and s.strip()][:4]
-            return sqs or [query]
         except Exception:
-            return [query]
+            return None
 
-    def _server_search(self, q: str, k: int = 8) -> list[dict]:
+        # 3. Tokenize the response and keep only tokens that match a real root.
+        # Tolerant to bullets, numbering, commas, and explanatory prose — relies
+        # on the membership check against `lower_to_orig` to reject hallucinations.
+        out: list[str] = []
+        seen: set[str] = set()
+        for token in _re.findall(r"[a-zA-Z0-9][a-zA-Z0-9\-_]*", raw):
+            t = token.lower()
+            if t == "none":
+                continue
+            if t in lower_to_orig and t not in seen:
+                seen.add(t)
+                out.append(lower_to_orig[t])
+                if len(out) >= 4:
+                    break
+        return out
+
+    def _fetch_index_sample(self, domain: str) -> str:
+        """
+        Fetch a text sample for `domain` to feed language detection.
+        Walks the broker tree up to 2 levels deep looking for a pack's index.md;
+        falls back to a list of children names when no index is reachable.
+        Returns "" when the domain itself is absent from the tree (silent skip).
+        """
+        import httpx
+        from node.retrieval.pack_cache import SERVER_URL
+
+        def _try_index(path: str) -> str:
+            try:
+                r = httpx.get(f"{SERVER_URL}/packs/{path}/wiki/index.md", timeout=5.0)
+                if r.status_code == 200:
+                    return r.text
+            except Exception:
+                pass
+            return ""
+
+        def _tree(path: str) -> dict | None:
+            try:
+                r = httpx.get(f"{SERVER_URL}/tree/{path}", timeout=5.0)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                pass
+            return None
+
+        text = _try_index(domain)
+        if text:
+            return text
+
+        tree = _tree(domain)
+        if tree is None:
+            return ""
+        children = tree.get("children", []) or []
+
+        for child in children:
+            text = _try_index(f"{domain}/{child}")
+            if text:
+                return text
+
+        for child in children:
+            sub_tree = _tree(f"{domain}/{child}")
+            if not sub_tree:
+                continue
+            for grandchild in sub_tree.get("children", []) or []:
+                text = _try_index(f"{domain}/{child}/{grandchild}")
+                if text:
+                    return text
+
+        return " ".join(children) if children else ""
+
+    def _translate_query_for_pack(self, query: str, index_content: str) -> str:
+        """
+        Translate `query` into the language of the pack (detected from `index_content`).
+        Returns the query unchanged when it is already in the pack's language, when
+        `index_content` is empty, or on any failure — safe to call unconditionally.
+        """
+        from node.provider import call as _provider_call
+
+        if not index_content:
+            return query
+
+        system = (
+            "You translate a question into the language of a knowledge base. "
+            "Detect the language from the index sample, translate the question. "
+            "If the question is already in the target language, return it unchanged. "
+            "Reply with the translated question only. No explanations."
+        )
+        user = (
+            f"Index sample (first 500 chars):\n{index_content[:500]}\n\n"
+            f"Question to translate: {query}\n"
+            "Translated question:"
+        )
+        try:
+            resp = _provider_call(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                model_local=self.model,
+                or_key="",
+                or_model="",
+                tools=None,
+                temperature=0.0,
+                num_ctx=1024,
+            )
+            out = (resp.content or "").strip()
+            # Reject pathological outputs (empty or 5x query length + 100 buffer)
+            if not out or len(out) > len(query) * 5 + 100:
+                return query
+            return out
+        except Exception:
+            return query
+
+    def _server_search(self, q: str, k: int = 8, scope: str = "") -> list[dict]:
         """Call broker /search and return top-K results. Empty list on any failure."""
         import httpx
         from node.retrieval.pack_cache import SERVER_URL
         try:
+            payload: dict = {"q": q, "k": k}
+            if scope:
+                payload["scope"] = scope
             resp = httpx.post(
                 f"{SERVER_URL}/search",
-                json={"q": q, "k": k},
+                json=payload,
                 timeout=8.0,
             )
             if resp.status_code != 200:
