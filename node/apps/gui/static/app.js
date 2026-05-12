@@ -262,12 +262,8 @@ function setupForgeListeners() {
   document.getElementById('forge-clear-output-btn').addEventListener('click', () => {
     document.getElementById('forge-output-body').innerHTML =
       '<span class="log-line system">Waiting for Forge run...</span>';
-    const dl = document.getElementById('forge-lint-download-btn');
-    if (dl) dl.style.display = 'none';
     _lastLintReport = { packName: '', text: '' };
   });
-  const dlBtn = document.getElementById('forge-lint-download-btn');
-  if (dlBtn) dlBtn.addEventListener('click', downloadLintReport);
 
   initForgeResizer();
 }
@@ -612,8 +608,6 @@ async function runLint(packNameOverride = null) {
 
   document.getElementById('forge-output-body').innerHTML = '';
   document.getElementById('forge-output-spinner').classList.add('active');
-  const downloadBtn = document.getElementById('forge-lint-download-btn');
-  if (downloadBtn) downloadBtn.style.display = 'none';
   _lastLintReport = { packName, text: '' };
   appendForgeOutput(`🔍 Linting pack: ${packName} with ${model}${fix ? ' (auto-fix ON)' : ''}...`);
 
@@ -657,18 +651,31 @@ async function runLint(packNameOverride = null) {
   } finally {
     if (lintBtn) { lintBtn.disabled = false; lintBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Run Lint'; }
     document.getElementById('forge-output-spinner').classList.remove('active');
-    if (downloadBtn && _lastLintReport.text.trim()) downloadBtn.style.display = '';
   }
 }
 
 function showLintComplete(packName) {
   const body = document.getElementById('forge-output-body');
-  const note = document.createElement('div');
-  note.className = 'forge-complete-note';
-  note.style.marginTop = '0.75rem';
-  note.textContent = `Lint complete for pack "${packName}". Click "download" above to save the report.`;
-  body.appendChild(note);
+  const panel = document.createElement('div');
+  panel.className = 'forge-complete-panel';
+  panel.innerHTML = `
+    <div class="forge-complete-title">Lint complete for <strong>${packName}</strong>.</div>
+    <div class="forge-complete-btns">
+      <button class="forge-act-btn forge-act-primary" id="lint-download-act">📥 Download report</button>
+      <button class="forge-act-btn" id="lint-rerun-act">↻ Re-run Lint</button>
+      <button class="forge-act-btn" id="lint-open-folder-act">⬚ Open Pack Folder</button>
+    </div>
+    <div class="forge-complete-note">Download the report as Markdown to share with collaborators or attach to a community vote.</div>
+  `;
+  body.appendChild(panel);
   body.scrollTop = body.scrollHeight;
+
+  const dl = document.getElementById('lint-download-act');
+  if (dl) dl.addEventListener('click', downloadLintReport);
+  const rerun = document.getElementById('lint-rerun-act');
+  if (rerun) rerun.addEventListener('click', () => runLint(packName));
+  const open = document.getElementById('lint-open-folder-act');
+  if (open) open.addEventListener('click', () => forgeOpenFolder(packName));
 }
 
 function downloadLintReport() {
