@@ -216,13 +216,13 @@
         <div class="forge-form-area">
 
           <div class="forge-section-label">Pack</div>
+          <div class="form-group">
+            <label class="form-label">Name</label>
+            <input class="form-input" id="forge-pack-name" placeholder="e.g. docker, python, git" list="forge-pack-list" autocomplete="off" spellcheck="false">
+            <datalist id="forge-pack-list"></datalist>
+            <div id="forge-pack-info" class="forge-pack-info"></div>
+          </div>
           <div class="forge-row-2col">
-            <div class="form-group">
-              <label class="form-label">Name</label>
-              <input class="form-input" id="forge-pack-name" placeholder="e.g. docker, python, git" list="forge-pack-list" autocomplete="off" spellcheck="false">
-              <datalist id="forge-pack-list"></datalist>
-              <div id="forge-pack-info" class="forge-pack-info"></div>
-            </div>
             <div class="form-group">
               <label class="form-label">Extraction model</label>
               <select class="form-select" id="forge-extract-model">
