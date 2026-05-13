@@ -378,6 +378,213 @@ def _restart_server():
     os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
 
 
+# ── Forge run registry ────────────────────────────────────────────────────────
+#
+# Long-running Forge / Scout-Forge / Lint runs live in an in-memory registry so
+# that:
+#   1. The browser can disconnect (tab switch / refresh) and reconnect later
+#      without losing progress visibility — events are buffered.
+#   2. A persistent UI banner can show "Forge running on pack X" across tabs.
+#   3. The user can cooperatively STOP a run between sources, saving spend.
+#
+# A run keeps every event in `buffer` and broadcasts new events to all
+# currently-attached subscriber queues. Stop is cooperative: the wrapper
+# generator checks `stop_event` between yields, so a current LLM call finishes
+# but no new ones are made.
+
+import time as _time
+import uuid as _uuid
+
+_FORGE_RUNS: dict[str, dict] = {}
+_RUNS_LOCK = threading.Lock()
+_RUN_RETENTION_AFTER_DONE = 600   # keep finished runs visible for 10 min
+
+
+def _evict_old_runs():
+    now = _time.time()
+    with _RUNS_LOCK:
+        expired = []
+        for rid, st in _FORGE_RUNS.items():
+            done_at = st.get("ended_at")
+            if done_at and (now - done_at) > _RUN_RETENTION_AFTER_DONE:
+                expired.append(rid)
+        for rid in expired:
+            _FORGE_RUNS.pop(rid, None)
+
+
+def _emit_run_event(state: dict, event: dict):
+    """Append to the run's buffer and broadcast to all subscriber queues."""
+    with _RUNS_LOCK:
+        state["buffer"].append(event)
+        subs = list(state["subscribers"])
+    for (loop, q) in subs:
+        try:
+            asyncio.run_coroutine_threadsafe(q.put(event), loop)
+        except Exception:
+            pass
+
+
+def _finalize_run(state: dict, terminal_status: str):
+    state["status"] = terminal_status
+    state["ended_at"] = _time.time()
+    with _RUNS_LOCK:
+        subs = list(state["subscribers"])
+    for (loop, q) in subs:
+        try:
+            asyncio.run_coroutine_threadsafe(q.put(None), loop)
+        except Exception:
+            pass
+
+
+def _start_managed_run(kind: str, pack_name: str, gen_factory) -> str:
+    """
+    Register a new run, start its thread, return the run_id.
+
+    `gen_factory()` must return an iterator yielding either:
+      - str  → wrapped as {"text": line}
+      - dict → emitted as-is (use this for {"type": "forge_complete", ...})
+    """
+    _evict_old_runs()
+    run_id = _uuid.uuid4().hex[:12]
+    state = {
+        "id":             run_id,
+        "kind":           kind,            # "forge" | "lint" | "scout_forge"
+        "pack_name":      pack_name,
+        "started_at":     _time.time(),
+        "ended_at":       None,
+        "status":         "running",       # running | completed | failed | stopped
+        "buffer":         [],
+        "subscribers":    [],              # list of (asyncio.AbstractEventLoop, asyncio.Queue)
+        "stop_event":     threading.Event(),
+    }
+    with _RUNS_LOCK:
+        _FORGE_RUNS[run_id] = state
+
+    def thread():
+        try:
+            for item in gen_factory():
+                ev = item if isinstance(item, dict) else {"text": item}
+                _emit_run_event(state, ev)
+                if state["stop_event"].is_set():
+                    _emit_run_event(state, {
+                        "text": "🛑 Stop requested — exiting after current step.",
+                    })
+                    _finalize_run(state, "stopped")
+                    return
+            _finalize_run(state, "completed")
+        except Exception as exc:
+            _emit_run_event(state, {"text": f"❌ Error: {exc}"})
+            _finalize_run(state, "failed")
+
+    threading.Thread(target=thread, daemon=True).start()
+    return run_id
+
+
+async def _stream_run_sse(run_id: str):
+    """SSE generator: replay the run's buffer, then tail live events."""
+    state = _FORGE_RUNS.get(run_id)
+    if not state:
+        yield f"data: {json.dumps({'type':'error','text':'Run not found.'})}\n\n"
+        return
+
+    # Announce the run on the wire first so the client always knows the id
+    yield f"data: {json.dumps({'type':'run_started','run_id':run_id,'kind':state['kind'],'pack_name':state['pack_name'],'started_at':state['started_at']})}\n\n"
+
+    loop = asyncio.get_event_loop()
+    q: asyncio.Queue = asyncio.Queue()
+
+    with _RUNS_LOCK:
+        snapshot = list(state["buffer"])
+        running = state["status"] == "running"
+        if running:
+            state["subscribers"].append((loop, q))
+
+    for ev in snapshot:
+        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+
+    if not running:
+        yield f"data: {json.dumps({'type':'run_ended','status':state['status']})}\n\n"
+        return
+
+    try:
+        while True:
+            ev = await q.get()
+            if ev is None:
+                break
+            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+    finally:
+        with _RUNS_LOCK:
+            try:
+                state["subscribers"].remove((loop, q))
+            except ValueError:
+                pass
+
+    yield f"data: {json.dumps({'type':'run_ended','status':state['status']})}\n\n"
+
+
+@app.get("/api/forge/runs")
+async def list_forge_runs():
+    """List active and recently-finished runs (used by the persistent banner)."""
+    _evict_old_runs()
+    now = _time.time()
+    with _RUNS_LOCK:
+        out = []
+        for st in _FORGE_RUNS.values():
+            elapsed = (st.get("ended_at") or now) - st["started_at"]
+            out.append({
+                "id":         st["id"],
+                "kind":       st["kind"],
+                "pack_name":  st["pack_name"],
+                "status":     st["status"],
+                "started_at": st["started_at"],
+                "ended_at":   st["ended_at"],
+                "elapsed_s":  int(elapsed),
+                "events":     len(st["buffer"]),
+            })
+    # Most recent first
+    out.sort(key=lambda r: r["started_at"], reverse=True)
+    return out
+
+
+@app.get("/api/forge/runs/{run_id}/status")
+async def get_forge_run_status(run_id: str):
+    state = _FORGE_RUNS.get(run_id)
+    if not state:
+        raise HTTPException(404, "Run not found.")
+    now = _time.time()
+    return {
+        "id":         state["id"],
+        "kind":       state["kind"],
+        "pack_name":  state["pack_name"],
+        "status":     state["status"],
+        "started_at": state["started_at"],
+        "ended_at":   state["ended_at"],
+        "elapsed_s":  int((state.get("ended_at") or now) - state["started_at"]),
+        "events":     len(state["buffer"]),
+    }
+
+
+@app.get("/api/forge/runs/{run_id}/stream")
+async def stream_forge_run(run_id: str):
+    """SSE: replay buffered events for this run, then tail live ones."""
+    return StreamingResponse(
+        _stream_run_sse(run_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/forge/runs/{run_id}/stop")
+async def stop_forge_run(run_id: str):
+    state = _FORGE_RUNS.get(run_id)
+    if not state:
+        raise HTTPException(404, "Run not found.")
+    if state["status"] != "running":
+        return {"ok": True, "already": state["status"]}
+    state["stop_event"].set()
+    return {"ok": True, "status": "stopping"}
+
+
 # ── Routes — Forge ────────────────────────────────────────────────────────────
 
 @app.get("/api/forge/packs")
@@ -412,7 +619,7 @@ class ForgeRunBody(BaseModel):
     pack_name: str
     mode: str = "add"
     extract_model: str = "openai/gpt-5-mini"
-    model: str = "openai/gpt-5"
+    model: str = "openai/gpt-5-mini"
     files: list[dict] = []
     urls: list[str] = []
     text: str = ""
@@ -429,38 +636,35 @@ async def forge_run(body: ForgeRunBody):
 
     pack_name_clean = re.sub(r'[^a-z0-9-]', '-', body.pack_name.strip().lower()).strip('-')
 
-    async def generate():
-        loop = asyncio.get_event_loop()
-        q: asyncio.Queue = asyncio.Queue()
+    def gen_factory():
+        for line in _forge_run_core(body):
+            yield line
+        yield {"type": "forge_complete", "pack_name": pack_name_clean}
 
-        def thread():
-            success = False
-            try:
-                for line in _forge_run_core(body):
-                    asyncio.run_coroutine_threadsafe(q.put({"text": line}), loop)
-                success = True
-            except Exception as exc:
-                asyncio.run_coroutine_threadsafe(q.put({"text": f"❌ Error: {exc}"}), loop)
-            finally:
-                if success:
-                    asyncio.run_coroutine_threadsafe(
-                        q.put({"type": "forge_complete", "pack_name": pack_name_clean}), loop
-                    )
-                asyncio.run_coroutine_threadsafe(q.put(None), loop)
-
-        threading.Thread(target=thread, daemon=True).start()
-
-        while True:
-            item = await q.get()
-            if item is None:
-                break
-            yield f"data: {json.dumps(item)}\n\n"
-
+    run_id = _start_managed_run("forge", pack_name_clean, gen_factory)
     return StreamingResponse(
-        generate(),
+        _stream_run_sse(run_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _render_pack_scope_text(scope_key: str) -> str:
+    """
+    Resolve a scope chip identifier (overview/deep_dive/critique/...) into the
+    descriptive paragraph Scout uses in its query-expansion prompts. Forge
+    passes this string to extract_concepts() so the LLM applies the same
+    filter at extraction time. Empty input → empty output (= no filter).
+    """
+    key = (scope_key or "").strip().lower()
+    if not key:
+        return ""
+    try:
+        from forge_scout.expand import SCOPE_RULES, _scope_block
+        # _scope_block falls back to "overview" rules if key is unknown
+        return _scope_block(key) if key in SCOPE_RULES else ""
+    except Exception:
+        return ""
 
 
 def _forge_run_core(body: "ForgeRunBody"):
@@ -483,6 +687,12 @@ def _forge_run_core(body: "ForgeRunBody"):
     pack_dir = ROOT / "expert-packs" / pack_name
     wiki_dir = pack_dir / "wiki"
     wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Sources too short produce hallucinated pages: LLM fills the gap from
+    # training data instead of the source. We refuse to extract concepts from
+    # raws with less than this many body chars. The raw stays on disk as a
+    # citable reference; it just doesn't get its own wiki pages.
+    MIN_RAW_CHARS_FOR_EXTRACTION = 1500
 
     rebuild   = body.mode == "rebuild"
     recompile = body.mode == "recompile"
@@ -517,6 +727,17 @@ def _forge_run_core(body: "ForgeRunBody"):
     wiki.ensure_schema(wiki_dir, pack_name)
     all_pages = wiki.scan_existing_pages(wiki_dir)
     existing_slugs = {p["slug"] for p in all_pages}
+
+    # ── Pack intent (scope + brief) drives scope-aware concept extraction.
+    # Scout writes these into the manifest at Fetch time; standalone Forge
+    # runs typically have neither, in which case extraction stays unbounded
+    # (same behaviour as before this fix).
+    pack_scope_text = _render_pack_scope_text(mf.get("scope") or "")
+    pack_brief      = str(mf.get("brief") or "")
+    if pack_scope_text or pack_brief:
+        scope_label = (mf.get("scope") or "").strip() or "(custom)"
+        brief_hint  = f", brief({len(pack_brief)} chars)" if pack_brief else ""
+        yield f"🎯 Pack scope active: {scope_label}{brief_hint} — Forge will skip off-scope concepts."
 
     raw_sources = []
     temp_files_cleanup = []
@@ -640,12 +861,29 @@ def _forge_run_core(body: "ForgeRunBody"):
                 else:
                     yield f"  ↪️ No image candidates ≥5KB"
 
+            # ── Min-length guard: refuse to extract concepts from raws that
+            # are too thin. Forces would-be hallucinations to remain just
+            # citable references, not invented wiki pages.
+            if len(text_content) < MIN_RAW_CHARS_FOR_EXTRACTION:
+                yield (
+                    f"⏭  Skipping concept extraction — source body is only "
+                    f"{len(text_content)} chars (<{MIN_RAW_CHARS_FOR_EXTRACTION}). "
+                    f"The raw stays as a citable reference; no wiki pages generated from it."
+                )
+                manifest.add_source(mf, source_url, sources.sha256(text_content))
+                wiki.append_log(wiki_dir, source_name, 0, source_url)
+                continue
+
             yield f"🔍 Extracting concepts ({extract_model})..."
             concepts = None
             for attempt in range(3):
                 try:
                     concepts = llm.extract_concepts(
-                        text_content, existing_concepts=all_pages, model=extract_model
+                        text_content,
+                        existing_concepts=all_pages,
+                        model=extract_model,
+                        pack_scope_text=pack_scope_text,
+                        pack_brief=pack_brief,
                     )
                     break
                 except Exception as e:
@@ -885,7 +1123,7 @@ def _load_existing_raws_as_sources(raw_articles_dir: Path) -> list[tuple]:
 
 class ForgeLintBody(BaseModel):
     pack_name: str
-    model: str = "gpt-5"
+    model: str = "gpt-5-mini"
     fix: bool = False
     skip_semantic: bool = False
 
@@ -906,35 +1144,17 @@ async def forge_lint(body: ForgeLintBody):
     if not wiki_dir.exists():
         raise HTTPException(404, f"Pack '{pack_name}' not found.")
 
-    async def generate():
-        loop = asyncio.get_event_loop()
-        q: asyncio.Queue = asyncio.Queue()
+    def gen_factory():
+        for line in _lint_run_core(
+            pack_name, wiki_dir, pack_dir,
+            model=body.model, fix=body.fix, skip_semantic=body.skip_semantic,
+        ):
+            yield line
+        yield {"type": "lint_complete", "pack_name": pack_name}
 
-        def thread():
-            try:
-                for line in _lint_run_core(
-                    pack_name, wiki_dir, pack_dir,
-                    model=body.model, fix=body.fix, skip_semantic=body.skip_semantic,
-                ):
-                    asyncio.run_coroutine_threadsafe(q.put({"text": line}), loop)
-                asyncio.run_coroutine_threadsafe(
-                    q.put({"type": "lint_complete", "pack_name": pack_name}), loop
-                )
-            except Exception as exc:
-                asyncio.run_coroutine_threadsafe(q.put({"text": f"❌ Error: {exc}"}), loop)
-            finally:
-                asyncio.run_coroutine_threadsafe(q.put(None), loop)
-
-        threading.Thread(target=thread, daemon=True).start()
-
-        while True:
-            item = await q.get()
-            if item is None:
-                break
-            yield f"data: {json.dumps(item)}\n\n"
-
+    run_id = _start_managed_run("lint", pack_name, gen_factory)
     return StreamingResponse(
-        generate(),
+        _stream_run_sse(run_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -1150,6 +1370,450 @@ async def forge_open_folder(pack_name: str):
     return {"ok": True}
 
 
+# ── Routes — Forge Scout ──────────────────────────────────────────────────────
+
+class ScoutSearchBody(BaseModel):
+    topic: str
+    mode: str = "wikipedia_first"           # wikipedia_first | multi_source
+    langs: list[str] = ["en"]
+    # Intent
+    scope: str = "overview"                 # overview | deep_dive | critique | comparison | practical | custom
+    brief: str = ""                         # free-text binding constraints
+    # Wikipedia-first only
+    depth: int = 1
+    max_pages: int = 30
+    include_internal_links: bool = False
+    use_wikidata: bool = True
+    # Multi-source only
+    sources: list[str] | None = None        # None = auto by detected domain
+    expand: bool = True
+    auto_detect_domain: bool = True
+    per_source_limit: int = 6
+    top_k: int = 40
+    # LLM picker (multi_source + auto modes)
+    llm_provider: str = "openrouter"        # openrouter | ollama
+    llm_model: str = "openai/gpt-5-mini"
+
+
+@app.get("/api/scout/installed_models")
+async def scout_installed_models():
+    """List local Ollama models so the GUI can populate the 'local model' dropdown."""
+    import ollama
+    try:
+        data = ollama.list()
+    except Exception as e:
+        return {"models": [], "error": str(e)}
+    out: list[dict] = []
+    for m in data.get("models", []) or []:
+        name = m.get("model") or m.get("name") or ""
+        if not name:
+            continue
+        size_b = m.get("size") or 0
+        size_gb = round(size_b / (1024 ** 3), 1) if size_b else None
+        out.append({"name": name, "size_gb": size_gb})
+    out.sort(key=lambda x: x["name"])
+    return {"models": out}
+
+
+class ScoutSuggestBody(BaseModel):
+    topic: str
+    scope: str = "overview"
+    language: str = "en"
+    llm_provider: str = "openrouter"
+    llm_model: str = "openai/gpt-5-mini"
+
+
+@app.post("/api/scout/suggest")
+async def scout_suggest(body: ScoutSuggestBody):
+    """
+    One-shot LLM call: given topic + scope chip + language, return suggested
+    brief + source set + depth knobs. The frontend uses this to populate the
+    form when the user clicks a scope chip or the dedicated regenerate button.
+    """
+    if not body.topic.strip():
+        raise HTTPException(400, "Topic is required.")
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+
+    if body.llm_provider == "openrouter":
+        if not _cfg.openrouter_api_key:
+            raise HTTPException(400,
+                "OpenRouter API key not configured. Switch the LLM picker to "
+                "'Local' or add a key in Settings.")
+        model_spec = {
+            "provider": "openrouter",
+            "model":    body.llm_model or "openai/gpt-5-mini",
+            "api_key":  _cfg.openrouter_api_key,
+        }
+    elif body.llm_provider == "ollama":
+        model_spec = {"provider": "ollama", "model": body.llm_model or _model}
+    else:
+        raise HTTPException(400, f"Unknown LLM provider: {body.llm_provider}")
+
+    from forge_scout.expand import suggest_pack_params
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, suggest_pack_params,
+            body.topic.strip(), body.scope, body.language, model_spec,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Suggest failed: {exc}")
+    if not result:
+        raise HTTPException(502, "LLM returned no usable JSON.")
+    return result
+
+
+class WikidataBody(BaseModel):
+    query: str
+    langs: list[str] = ["en", "it"]
+
+
+@app.post("/api/scout/wikidata")
+async def scout_wikidata(body: WikidataBody):
+    """Return Wikidata disambiguation candidates for a free-text query."""
+    from forge_scout.sources import wikidata as wd
+    try:
+        cands = wd.search(body.query, langs=body.langs, limit=7)
+    except Exception as e:
+        raise HTTPException(500, f"Wikidata error: {e}")
+    return {"candidates": [c.to_dict() for c in cands]}
+
+
+@app.post("/api/scout/search")
+async def scout_search(body: ScoutSearchBody):
+    """
+    Run a Scout search. SSE stream — events match `scout.scout` generator
+    output: log / domain / expanded / result / done.
+    """
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+
+    # Resolve model_spec from request + saved config
+    model_spec: dict
+    if body.llm_provider == "openrouter":
+        if not _cfg.openrouter_api_key:
+            raise HTTPException(400,
+                "OpenRouter API key not configured. Add it in Settings → OpenRouter, "
+                "or switch the Scout model picker to 'Local'.")
+        model_spec = {
+            "provider": "openrouter",
+            "model": body.llm_model or "openai/gpt-5",
+            "api_key": _cfg.openrouter_api_key,
+        }
+    elif body.llm_provider == "ollama":
+        model_spec = {
+            "provider": "ollama",
+            "model": body.llm_model or _model,
+        }
+    else:
+        raise HTTPException(400, f"Unknown llm_provider: {body.llm_provider}")
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def thread():
+            from forge_scout import scout as _scout
+            try:
+                if body.mode == "wikipedia_first":
+                    gen = _scout.wikipedia_first(
+                        body.topic,
+                        langs=body.langs,
+                        depth=body.depth,
+                        max_pages=body.max_pages,
+                        include_internal_links=body.include_internal_links,
+                        use_wikidata=body.use_wikidata,
+                    )
+                elif body.mode == "multi_source":
+                    gen = _scout.multi_source(
+                        body.topic,
+                        model_spec=model_spec,
+                        langs=body.langs,
+                        scope=body.scope,
+                        brief=body.brief,
+                        enabled_sources=body.sources,
+                        per_source_limit=body.per_source_limit,
+                        expand_n=6,
+                        auto_rank_top_k=body.top_k,
+                        auto_detect_domain=body.auto_detect_domain,
+                        with_query_expansion=body.expand,
+                    )
+                else:
+                    asyncio.run_coroutine_threadsafe(
+                        q.put({"type": "log",
+                               "text": f"Unknown mode: {body.mode}"}), loop)
+                    return
+                for ev in gen:
+                    asyncio.run_coroutine_threadsafe(q.put(ev), loop)
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "log", "text": f"❌ {exc}"}), loop)
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "done", "total": 0}), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(None), loop)
+
+        threading.Thread(target=thread, daemon=True).start()
+
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# In-memory cache of fetched Scout batches.
+# Token → {"folder": str, "payloads": [...], "urls": [...], "fetched_at": ts}
+# Auto-evicted after 1 hour to keep memory bounded.
+_SCOUT_BATCHES: dict[str, dict] = {}
+_SCOUT_BATCH_TTL = 3600
+
+
+def _scout_evict_old_batches():
+    import time
+    now = time.time()
+    expired = [k for k, v in _SCOUT_BATCHES.items()
+               if now - v.get("fetched_at", 0) > _SCOUT_BATCH_TTL]
+    for k in expired:
+        _SCOUT_BATCHES.pop(k, None)
+
+
+class ScoutFetchBody(BaseModel):
+    """Stage 1 — write selected sources straight into the target pack's raw/articles/."""
+    pack_name: str
+    selected: list[dict]
+    full_text_keys: list[str] = []   # opt-in heavy fetch for arXiv PDFs etc.
+    scope: str = ""                  # pack scope chip (overview/deep_dive/...) for manifest
+    brief: str = ""                  # user free-text brief for manifest
+
+
+@app.post("/api/scout/fetch")
+async def scout_fetch(body: ScoutFetchBody):
+    """
+    Materialise selected SourceResults into `expert-packs/<pack_name>/raw/articles/`
+    using Forge's own raw-source format. The user can inspect the pack folder
+    immediately. Run Forge then runs in "recompile" mode against those raws —
+    no double-write, no hidden staging.
+
+    SSE stream — terminal event is
+    {"type":"done", token, pack_dir, file_count, url_count, pack_existed}.
+    """
+    import time, uuid
+
+    if not body.selected:
+        raise HTTPException(400, "No sources selected.")
+
+    pack_name = re.sub(r'[^a-z0-9-]', '-', body.pack_name.strip().lower()).strip('-')
+    if not pack_name:
+        raise HTTPException(400, "Invalid pack name.")
+
+    from forge_scout.scout import fetch_into_pack
+    from forge_scout.types import SourceResult
+
+    _scout_evict_old_batches()
+
+    selected: list[SourceResult] = []
+    for d in body.selected:
+        try:
+            selected.append(SourceResult(**d))
+        except TypeError:
+            continue
+    if not selected:
+        raise HTTPException(400, "No valid sources in selection.")
+
+    pack_dir = ROOT / "expert-packs" / pack_name
+
+    async def generate():
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def thread():
+            try:
+                token = uuid.uuid4().hex[:12]
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "log",
+                           "text": f"📦 Writing {len(selected)} source(s) into "
+                                   f"expert-packs/{pack_name}/raw/articles/ ..."}),
+                    loop)
+                # Stream per-source progress back to the browser as it happens,
+                # so the user sees what's running and where (if anywhere) the
+                # fetch is stuck. Each `on_progress` call enqueues one log line.
+                def _on_fetch_progress(msg: str):
+                    asyncio.run_coroutine_threadsafe(
+                        q.put({"type": "log", "text": msg}), loop)
+
+                result = fetch_into_pack(
+                    selected, pack_dir,
+                    full_text_keys=set(body.full_text_keys),
+                    scope=body.scope,
+                    brief=body.brief,
+                    on_progress=_on_fetch_progress,
+                )
+                _SCOUT_BATCHES[token] = {
+                    "pack_name":   pack_name,
+                    "pack_dir":    str(result["pack_dir"]),
+                    "pack_existed": result["pack_existed"],
+                    "raw_paths":   result["raw_paths"],
+                    "urls":        result["passthrough_urls"],
+                    "fetched_at":  time.time(),
+                }
+                file_count = len(result["raw_paths"])
+                url_count  = len(result["passthrough_urls"])
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "log",
+                           "text": f"  → {file_count} raw file(s) written"}),
+                    loop)
+                if result["pack_existed"]:
+                    asyncio.run_coroutine_threadsafe(
+                        q.put({"type": "log",
+                               "text": f"  ⚠ Pack '{pack_name}' already exists — "
+                                       f"raws added alongside existing ones."}),
+                        loop)
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "done",
+                           "token": token,
+                           "pack_dir": str(result["pack_dir"]),
+                           "pack_name": pack_name,
+                           "pack_existed": result["pack_existed"],
+                           "file_count": file_count,
+                           "url_count":  url_count}),
+                    loop)
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "log", "text": f"❌ {exc}"}), loop)
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "done", "file_count": 0, "url_count": 0}), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(None), loop)
+
+        threading.Thread(target=thread, daemon=True).start()
+
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class ScoutForgeBatchBody(BaseModel):
+    """Stage 2 — run Forge over the pack populated by /api/scout/fetch."""
+    token: str
+    extract_model: str = "openai/gpt-5-mini"
+    model: str = "openai/gpt-5-mini"
+    fetch_images: bool = False
+    fetch_math: bool = False
+
+
+@app.post("/api/scout/forge_batch")
+async def scout_forge_batch(body: ScoutForgeBatchBody):
+    """
+    Compile the wiki from the raws Scout already wrote into the pack.
+    Single phase: Forge runs in "recompile" mode against raw/articles/.
+    """
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    if not _cfg.openrouter_api_key:
+        raise HTTPException(400,
+            "OpenRouter API key not configured. Forge needs it to compile the pack.")
+
+    batch = _SCOUT_BATCHES.get(body.token)
+    if not batch:
+        raise HTTPException(404,
+            "Batch expired or unknown. Re-fetch the sources and try again.")
+
+    pack_name = batch["pack_name"]
+    pack_name_clean = re.sub(r'[^a-z0-9-]', '-', pack_name.lower()).strip('-')
+
+    def gen_factory():
+        yield "▶ Compiling wiki from raw/articles/ (recompile mode)..."
+        recompile_body = ForgeRunBody(
+            pack_name=pack_name,
+            mode="recompile",
+            extract_model=body.extract_model,
+            model=body.model,
+            files=[],
+            urls=[],
+            text="",
+            fetch_images=False,
+            fetch_math=False,
+        )
+        for line in _forge_run_core(recompile_body):
+            yield line
+        yield {"type": "forge_complete", "pack_name": pack_name_clean}
+
+    run_id = _start_managed_run("scout_forge", pack_name_clean, gen_factory)
+    return StreamingResponse(
+        _stream_run_sse(run_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/scout/open-folder/{token}")
+async def scout_open_folder(token: str):
+    """Open the pack folder Scout populated, in the OS file manager."""
+    batch = _SCOUT_BATCHES.get(token)
+    if not batch:
+        raise HTTPException(404, "Batch not found.")
+    import platform, subprocess
+    folder = batch["pack_dir"]
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(folder)
+    elif system == "Darwin":
+        subprocess.Popen(["open", folder])
+    else:
+        subprocess.Popen(["xdg-open", folder])
+    return {"ok": True, "folder": folder}
+
+
+@app.delete("/api/scout/batch/{token}")
+async def scout_discard_batch(token: str):
+    """
+    Discard a fetched batch:
+    - Delete every raw file Scout wrote in this batch (preserves any others).
+    - If the pack folder is now empty AND Scout had created it, remove it.
+    """
+    batch = _SCOUT_BATCHES.pop(token, None)
+    if not batch:
+        return {"ok": True}
+
+    pack_dir = Path(batch["pack_dir"])
+    removed_files = 0
+    for rel in batch.get("raw_paths") or []:
+        try:
+            p = pack_dir / rel
+            if p.exists():
+                p.unlink()
+                removed_files += 1
+        except Exception:
+            pass
+
+    # If Scout created the pack folder and it's now effectively empty, remove it.
+    if not batch.get("pack_existed"):
+        try:
+            raw_articles = pack_dir / "raw" / "articles"
+            if raw_articles.exists() and not any(raw_articles.iterdir()):
+                shutil.rmtree(pack_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return {"ok": True, "removed_files": removed_files}
+
+
 # ── Routes — chats ────────────────────────────────────────────────────────────
 
 @app.get("/api/chats")
@@ -1230,6 +1894,21 @@ class QueryBody(BaseModel):
     attachments: list = []
 
 
+# Per-chat-id stop events. Set by POST /api/chats/{chat_id}/stop while a stream
+# is in flight; the chat_query stream thread checks this between engine events
+# and breaks the loop cleanly so the partial answer still gets saved.
+_CHAT_STOPS: dict[str, threading.Event] = {}
+
+
+@app.post("/api/chats/{chat_id}/stop")
+async def stop_chat_stream(chat_id: str):
+    ev = _CHAT_STOPS.get(chat_id)
+    if not ev:
+        return {"ok": True, "already_idle": True}
+    ev.set()
+    return {"ok": True, "status": "stopping"}
+
+
 @app.post("/api/chats/{chat_id}/query")
 async def chat_query(chat_id: str, body: QueryBody):
     if not _ready or not _engine:
@@ -1267,16 +1946,27 @@ async def chat_query(chat_id: str, body: QueryBody):
         if mode == "auto":
             mode = await loop.run_in_executor(None, classify, _model, full_query)
 
+        # Register a fresh stop event for this chat — overwrites any stale one.
+        stop_event = threading.Event()
+        _CHAT_STOPS[chat_id] = stop_event
+
         def stream_thread():
             try:
                 for kind, value in _engine.route_stream(
                     full_query, mode, images=images_b64 or None
                 ):
+                    if stop_event.is_set():
+                        asyncio.run_coroutine_threadsafe(
+                            q.put(("stopped", True)), loop)
+                        break
                     asyncio.run_coroutine_threadsafe(q.put((kind, value)), loop)
             except Exception as exc:
                 asyncio.run_coroutine_threadsafe(q.put(("error", str(exc))), loop)
             finally:
                 asyncio.run_coroutine_threadsafe(q.put(None), loop)
+                # Clean up only if we're still the registered event for this chat
+                if _CHAT_STOPS.get(chat_id) is stop_event:
+                    _CHAT_STOPS.pop(chat_id, None)
 
         threading.Thread(target=stream_thread, daemon=True).start()
 
@@ -1284,6 +1974,7 @@ async def chat_query(chat_id: str, body: QueryBody):
         routing_mode = ""
         peer_data: dict | None = None
         tools_used: list[str] = []
+        was_stopped = False
 
         while True:
             item = await q.get()
@@ -1298,10 +1989,14 @@ async def chat_query(chat_id: str, body: QueryBody):
                 peer_data = value
             elif kind == "tool_used" and value not in tools_used:
                 tools_used.append(value)
+            elif kind == "stopped":
+                was_stopped = True
 
             yield f"data: {json.dumps({'type': kind, 'value': value})}\n\n"
 
         answer = "".join(tokens).strip()
+        if was_stopped and answer:
+            answer += "\n\n_(stopped by user)_"
         if answer:
             _add_message_to_chat(chat_id, "assistant", answer, routing=routing_mode,
                                   tools=tools_used or None,

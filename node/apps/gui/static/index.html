@@ -8,7 +8,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark-dimmed.min.css">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=18">
+  <link rel="stylesheet" href="/static/style.css?v=39">
   <!-- Critical input-area override — inline so it's never cached separately -->
   <style>
     :root { color-scheme: dark; }
@@ -82,6 +82,17 @@
 </head>
 <body>
 
+<!-- ── Persistent run banner (Forge / Lint running across tabs) ─────────── -->
+<div id="run-banner" class="run-banner hidden">
+  <span class="run-banner-icon">🔨</span>
+  <span class="run-banner-text" id="run-banner-text">Forge running…</span>
+  <span class="run-banner-elapsed" id="run-banner-elapsed">00:00</span>
+  <div class="run-banner-actions">
+    <button class="run-banner-btn" id="run-banner-view">View</button>
+    <button class="run-banner-btn run-banner-stop" id="run-banner-stop">Stop</button>
+  </div>
+</div>
+
 <!-- ── Loading screen ──────────────────────────────────────────────────── -->
 <div id="loading-screen" class="loading-screen">
   <div class="loading-content">
@@ -126,6 +137,12 @@
     <div class="chat-list" id="chat-list"></div>
 
     <div class="sidebar-footer">
+      <button class="sidebar-footer-btn btn-scout" id="btn-scout" title="Find sources for a Forge pack — Wikipedia walk, multi-source curated, or full auto.">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        Scout
+      </button>
       <button class="sidebar-footer-btn btn-forge" id="btn-forge">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
@@ -178,8 +195,11 @@
           </button>
           <textarea id="message-input" placeholder="Ask anything…"></textarea>
           <button class="send-btn" id="send-btn" title="Send (Enter)" disabled>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <svg class="send-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+            <svg class="stop-icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="1.5"/>
             </svg>
           </button>
         </div>
@@ -235,11 +255,11 @@
             <div class="form-group">
               <label class="form-label">Writing model</label>
               <select class="form-select" id="forge-model">
+                <option value="openai/gpt-5-mini">GPT-5 Mini — fast &amp; cheap (default)</option>
                 <option value="openai/gpt-5">GPT-5 — best quality</option>
-                <option value="openai/gpt-5-mini">GPT-5 Mini — fast &amp; cheap</option>
                 <option value="anthropic/claude-sonnet-4.6">Claude Sonnet 4.6 — alternative</option>
               </select>
-              <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Writes the wiki pages.</div>
+              <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">Writes the wiki pages. Mini is plenty for most topics — switch to GPT-5 only for dense technical or code-heavy sources.</div>
             </div>
           </div>
 
@@ -302,8 +322,8 @@
           <div class="forge-section-label">Lint</div>
           <div class="forge-lint-row" style="margin-bottom: 0.5rem;" title="Model used by the semantic audit (safety, topic coherence, contradictions) and — when auto-fix is enabled — by the LLM-powered repairs such as regenerating a missing manifest.summary.">
             <select class="form-select forge-lint-select" id="forge-lint-model">
-              <option value="openai/gpt-5">GPT-5 — best quality (recommended for audit)</option>
-              <option value="openai/gpt-5-mini">GPT-5 Mini — fast &amp; cheap</option>
+              <option value="openai/gpt-5-mini">GPT-5 Mini — fast &amp; cheap (default)</option>
+              <option value="openai/gpt-5">GPT-5 — best quality (for thorough audit)</option>
               <option value="anthropic/claude-sonnet-4.6">Claude Sonnet 4.6 — alternative</option>
             </select>
           </div>
@@ -337,6 +357,322 @@
             </div>
             <div class="terminal-body" id="forge-output-body">
               <span class="log-line system">Waiting for Forge run...</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Scout panel -->
+    <div class="panel hidden panel-scout" id="panel-scout">
+      <div class="scout-layout">
+
+        <!-- Top: form -->
+        <div class="scout-form-area">
+
+          <div class="forge-section-label">Topic</div>
+          <div class="form-group">
+            <input class="form-input" id="scout-topic" placeholder="e.g. Julius Caesar, transformer attention, CRISPR-Cas9" spellcheck="false" autocomplete="off">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Scope</label>
+            <div class="scout-chips" id="scout-scope-chips">
+              <button type="button" class="scout-chip active" data-scope="overview"  title="Foundational overview — main schools, key figures, central concepts, historical context. Best for top-level / intermediate nodes in your knowledge tree.">📖 Overview</button>
+              <button type="button" class="scout-chip" data-scope="deep_dive"        title="Specialised material on this exact topic — sub-topics, primary sources, scholarly debates.">🎯 Deep dive</button>
+              <button type="button" class="scout-chip" data-scope="critique"         title="Debates, criticisms, controversies, modern reassessments.">⚖️ Critique</button>
+              <button type="button" class="scout-chip" data-scope="comparison"       title="Compares the topic with adjacent traditions or alternatives.">🔄 Comparison</button>
+              <button type="button" class="scout-chip" data-scope="practical"        title="Applied / how-to material — modern uses, exercises, real-world application.">🛠 Practical</button>
+              <button type="button" class="scout-chip" data-scope="custom"           title="Free-form — follow the Brief below literally, no scope template.">✏️ Custom</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">
+              Brief <span class="form-label-hint">— optional, free-text constraints</span>
+              <button type="button" class="scout-suggest-btn" id="scout-suggest-btn"
+                      title="Auto-fill the brief and source picks based on the topic + scope. Uses GPT-5 Mini (~€0.001).">
+                ✨ Suggest from topic
+              </button>
+              <span class="scout-suggest-spinner hidden" id="scout-suggest-spinner"></span>
+            </label>
+            <textarea class="form-input forge-textarea scout-brief" id="scout-brief" rows="3"
+              placeholder="What do you want this pack to cover, focus on, or exclude? Optional but powerful.&#10;Tip: type a topic above, click a Scope chip, and we'll auto-fill this for you.&#10;e.g. &quot;Overview of Stoic philosophy for beginners. Cover ancient schools, key figures, core ideas (eudaimonia, virtue, dichotomy of control). Exclude modern reinterpretations (Nietzsche, Foucault) and academic stoic logic.&quot;"
+              spellcheck="false"></textarea>
+            <div class="scout-suggest-note hidden" id="scout-suggest-note"></div>
+          </div>
+
+          <div class="scout-row-2col">
+            <div class="form-group">
+              <label class="form-label">Language</label>
+              <select class="form-select" id="scout-lang" title="The pack will be built in this language. Default is English — best coverage and easiest for LLMs. Switch only for locale-specific topics (e.g. 'ISEE' → Italian).">
+                <option value="en" selected>English — en</option>
+                <option value="de">Deutsch — de</option>
+                <option value="fr">Français — fr</option>
+                <option value="es">Español — es</option>
+                <option value="it">Italiano — it</option>
+                <option value="pt">Português — pt</option>
+                <option value="nl">Nederlands — nl</option>
+                <option value="ru">Русский — ru</option>
+                <option value="pl">Polski — pl</option>
+                <option value="uk">Українська — uk</option>
+                <option value="cs">Čeština — cs</option>
+                <option value="hu">Magyar — hu</option>
+                <option value="ro">Română — ro</option>
+                <option value="sv">Svenska — sv</option>
+                <option value="da">Dansk — da</option>
+                <option value="no">Norsk — no</option>
+                <option value="fi">Suomi — fi</option>
+                <option value="el">Ελληνικά — el</option>
+                <option value="tr">Türkçe — tr</option>
+                <option value="ar">العربية — ar</option>
+                <option value="he">עברית — he</option>
+                <option value="fa">فارسی — fa</option>
+                <option value="hi">हिन्दी — hi</option>
+                <option value="bn">বাংলা — bn</option>
+                <option value="ja">日本語 — ja</option>
+                <option value="zh">中文 — zh</option>
+                <option value="ko">한국어 — ko</option>
+                <option value="vi">Tiếng Việt — vi</option>
+                <option value="id">Bahasa Indonesia — id</option>
+                <option value="th">ไทย — th</option>
+                <option value="ca">Català — ca</option>
+                <option value="la">Latina — la (classical)</option>
+              </select>
+              <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">
+                One pack = one language. English is the default — switch only for locale-specific topics.
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Pack name (target)</label>
+              <input class="form-input" id="scout-pack-name" placeholder="e.g. caesar, attention" list="forge-pack-list" autocomplete="off" spellcheck="false">
+            </div>
+          </div>
+
+          <div class="forge-section-label">Mode</div>
+          <div class="forge-mode-group scout-mode-group">
+            <button class="forge-mode-btn active" data-scout-mode="wikipedia_first"
+                    title="Walk Wikipedia outward from the topic. Zero LLM cost. Best for well-covered encyclopedic subjects.">
+              Wikipedia-first &nbsp;<span class="cost-tag">€0</span>
+            </button>
+            <button class="forge-mode-btn" data-scout-mode="multi_source"
+                    title="Fan-out across Wikipedia, Wikisource, Internet Archive, OpenAlex, arXiv, Crossref, Project Gutenberg. LLM expands queries and ranks results. You review &amp; pick.">
+              Multi-source &nbsp;<span class="cost-tag">~€0.10</span>
+            </button>
+            <button class="forge-mode-btn" data-scout-mode="full_auto"
+                    title="Multi-source + auto-pick top results + Forge + Lint, all chained. No human review until the end.">
+              Full auto &nbsp;<span class="cost-tag">€0.30 + Forge</span>
+            </button>
+          </div>
+
+          <!-- Mode-specific options -->
+          <div class="scout-mode-options" id="scout-opts-wikipedia">
+            <div class="scout-row-3col">
+              <div class="form-group">
+                <label class="form-label">Walk depth</label>
+                <select class="form-select" id="scout-wiki-depth">
+                  <option value="1">1 hop — focused</option>
+                  <option value="2" selected>2 hops — balanced</option>
+                  <option value="3">3 hops — wide</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Max pages</label>
+                <select class="form-select" id="scout-wiki-max">
+                  <option value="15">15</option>
+                  <option value="30" selected>30</option>
+                  <option value="60">60</option>
+                  <option value="100">100</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Link strategy</label>
+                <select class="form-select" id="scout-wiki-links" title="'See also only' is cleaner and focused. 'See also + inline' is wider but noisier — useful for very deep packs.">
+                  <option value="see_also" selected>See also + categories</option>
+                  <option value="inline">See also + inline links</option>
+                </select>
+              </div>
+            </div>
+            <label class="forge-lint-fix-label" title="Resolve the topic via Wikidata first — distinguishes 'Cesare' (Giulio / Beccaria / Cremonini) and picks the right page in every language.">
+              <input type="checkbox" id="scout-wiki-wikidata" checked>
+              <span>Disambiguate via Wikidata first</span>
+            </label>
+          </div>
+
+          <div class="scout-mode-options hidden" id="scout-opts-multi">
+            <div class="form-group">
+              <label class="form-label">Sources</label>
+              <div class="scout-sources-grid" id="scout-sources-grid">
+                <label><input type="checkbox" value="wikipedia"     checked> Wikipedia</label>
+                <label><input type="checkbox" value="sep"           checked> SEP (Philosophy)</label>
+                <label><input type="checkbox" value="wikisource"    checked> Wikisource</label>
+                <label><input type="checkbox" value="archive_org"   checked> Internet Archive</label>
+                <label><input type="checkbox" value="openalex"      checked> OpenAlex</label>
+                <label><input type="checkbox" value="pubmed"        checked> PubMed</label>
+                <label><input type="checkbox" value="arxiv"         checked> arXiv</label>
+                <label><input type="checkbox" value="crossref"      checked> Crossref</label>
+                <label><input type="checkbox" value="mathworld"     checked> MathWorld</label>
+                <label><input type="checkbox" value="gutendex"      checked> Project Gutenberg</label>
+                <label><input type="checkbox" value="github"        checked> GitHub</label>
+                <label><input type="checkbox" value="stackexchange" checked> StackOverflow</label>
+                <label><input type="checkbox" value="hackernews"    checked> Hacker News</label>
+              </div>
+              <div style="font-size:0.75rem;color:var(--text-faint);margin-top:0.3rem;">
+                Auto-detect domain enables only the relevant sources. Uncheck below to query all.
+              </div>
+            </div>
+            <div class="scout-row-2col">
+              <div class="form-group">
+                <label class="form-label">Per-source results</label>
+                <select class="form-select" id="scout-per-source">
+                  <option value="4">4</option>
+                  <option value="6" selected>6</option>
+                  <option value="10">10</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Final top-K</label>
+                <select class="form-select" id="scout-top-k">
+                  <option value="20">20</option>
+                  <option value="40" selected>40</option>
+                  <option value="80">80</option>
+                </select>
+              </div>
+            </div>
+            <label class="forge-lint-fix-label">
+              <input type="checkbox" id="scout-expand" checked>
+              <span>Expand the topic into 6 angled sub-queries via LLM</span>
+            </label>
+            <label class="forge-lint-fix-label">
+              <input type="checkbox" id="scout-detect-domain" checked>
+              <span>Auto-detect domain → only query relevant sources</span>
+            </label>
+          </div>
+
+          <!-- LLM picker (shown for multi_source + full_auto) -->
+          <div class="scout-llm-row hidden" id="scout-llm-row">
+            <div class="forge-section-label">LLM</div>
+            <div class="scout-row-2col">
+              <div class="form-group">
+                <label class="form-label">Provider</label>
+                <select class="form-select" id="scout-llm-provider">
+                  <option value="openrouter" selected>Top-tier (OpenRouter) — recommended</option>
+                  <option value="ollama">Local (Ollama) — free</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Model</label>
+                <select class="form-select" id="scout-llm-model"></select>
+              </div>
+            </div>
+          </div>
+
+          <div class="scout-action-row">
+            <button class="forge-run-btn" id="scout-run-btn">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+              </svg>
+              Find Sources
+            </button>
+            <button class="forge-reset-btn" id="scout-reset-btn">Reset</button>
+            <span class="scout-progress-hint" id="scout-progress-hint"></span>
+          </div>
+        </div>
+
+        <!-- Draggable resizer between form and output -->
+        <div class="scout-resizer" id="scout-resizer" title="Drag to resize • double-click to reset"></div>
+
+        <!-- Bottom: candidates + terminal output -->
+        <div class="scout-output-area">
+          <div class="scout-tabs">
+            <button class="scout-tab active" data-scout-tab="results">
+              Candidates <span class="scout-tab-count" id="scout-results-count">0</span>
+            </button>
+            <button class="scout-tab" data-scout-tab="log">Activity log</button>
+          </div>
+
+          <!-- Candidates pane -->
+          <div class="scout-pane" id="scout-pane-results">
+            <div class="scout-results-toolbar">
+              <label class="scout-bulk-row">
+                <input type="checkbox" id="scout-select-all">
+                <span>Select all</span>
+              </label>
+              <span class="scout-selected-count" id="scout-selected-count">0 selected</span>
+              <div class="scout-spacer"></div>
+              <select class="form-select scout-filter-select" id="scout-filter-source">
+                <option value="">All sources</option>
+              </select>
+              <select class="form-select scout-filter-select" id="scout-filter-lang">
+                <option value="">All langs</option>
+              </select>
+              <!-- Stage 1: Fetch -->
+              <button class="forge-run-btn scout-fetch-btn" id="scout-fetch-btn" disabled
+                      title="Download/synthesize the selected sources into local markdown files. Forge is not run yet.">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                Fetch sources
+              </button>
+            </div>
+
+            <!-- Stage 2: post-fetch action bar (hidden until fetch completes) -->
+            <div class="scout-fetched-bar hidden" id="scout-fetched-bar">
+              <div class="scout-fetched-row">
+                <span class="scout-fetched-summary" id="scout-fetched-summary"></span>
+                <div class="scout-spacer"></div>
+                <button class="scout-link-btn" id="scout-open-folder-btn">⬚ Open folder</button>
+                <button class="scout-link-btn scout-discard-btn" id="scout-discard-btn" title="Throw away these fetched files and start over">↺ Discard</button>
+              </div>
+              <div class="scout-fetched-row scout-forge-controls">
+                <div class="scout-forge-model-pair">
+                  <label class="scout-mini-label" title="Identifies concepts from each source. Cheap is fine here.">Extract</label>
+                  <select class="form-select scout-mini-select" id="scout-forge-extract-model">
+                    <option value="openai/gpt-5-mini" selected>GPT-5 Mini — fast &amp; cheap</option>
+                    <option value="openai/gpt-5">GPT-5 — best quality</option>
+                    <option value="anthropic/claude-sonnet-4.6">Claude Sonnet 4.6</option>
+                  </select>
+                </div>
+                <div class="scout-forge-model-pair">
+                  <label class="scout-mini-label" title="Writes the wiki pages — this is the quality-critical call. GPT-5 is best but ~5× the cost of Mini.">Write</label>
+                  <select class="form-select scout-mini-select" id="scout-forge-write-model">
+                    <option value="openai/gpt-5-mini" selected>GPT-5 Mini — fast &amp; cheap</option>
+                    <option value="openai/gpt-5">GPT-5 — best quality</option>
+                    <option value="anthropic/claude-sonnet-4.6">Claude Sonnet 4.6</option>
+                  </select>
+                </div>
+                <span class="scout-cost-hint" id="scout-cost-hint">~€0.05 / source · Mini</span>
+                <div class="scout-spacer"></div>
+                <button class="forge-run-btn scout-runforge-btn" id="scout-runforge-btn">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                  </svg>
+                  Run Forge →
+                </button>
+              </div>
+            </div>
+            <div class="scout-results-list" id="scout-results-list">
+              <div class="scout-empty">
+                Run Find Sources to start. Candidates from each source will appear here.
+              </div>
+            </div>
+          </div>
+
+          <!-- Activity log pane -->
+          <div class="scout-pane hidden" id="scout-pane-log">
+            <div class="terminal scout-log-terminal">
+              <div class="terminal-chrome">
+                <div class="traffic-lights"><span></span><span></span><span></span></div>
+                <span class="terminal-title">scout activity</span>
+                <span class="terminal-spinner hidden" id="scout-log-spinner" aria-hidden="true"></span>
+                <button class="forge-clear-output-btn" id="scout-log-clear">clear</button>
+              </div>
+              <div class="terminal-body" id="scout-log-body">
+                <span class="log-line system">Waiting for Scout run...</span>
+              </div>
             </div>
           </div>
         </div>
@@ -439,6 +775,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.3/purify.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="/static/app.js?v=22"></script>
+<script src="/static/app.js?v=43"></script>
 </body>
 </html>

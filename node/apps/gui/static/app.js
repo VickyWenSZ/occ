@@ -155,6 +155,7 @@ function setupEventListeners() {
 
   document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('btn-forge').addEventListener('click', () => switchView('forge'));
+  document.getElementById('btn-scout')?.addEventListener('click', () => switchView('scout'));
   document.getElementById('close-settings').addEventListener('click', () => closeModal('settings-modal'));
   document.getElementById('local-mode-toggle')?.addEventListener('change', e => setLocalMode(e.target.checked));
   document.getElementById('tab-chat').addEventListener('click', () => switchTab('chat'));
@@ -174,7 +175,10 @@ function setupEventListeners() {
     if (!_cmdMouseDown) setTimeout(hideCommandTooltip, 100);
   });
 
-  document.getElementById('send-btn').addEventListener('click', sendMessage);
+  document.getElementById('send-btn').addEventListener('click', () => {
+    if (isStreaming) stopChatStream();
+    else             sendMessage();
+  });
 
   document.getElementById('btn-save-or').addEventListener('click', saveOpenRouter);
   document.getElementById('or-active-toggle')?.addEventListener('change', e => setOrActive(e.target.checked));
@@ -188,6 +192,7 @@ function setupEventListeners() {
   });
 
   setupForgeListeners();
+  setupScoutListeners();
 }
 
 // ── Forge ─────────────────────────────────────────────────────────────────────
@@ -195,29 +200,41 @@ function setupEventListeners() {
 function switchView(view) {
   activeView = view;
   const forgePanelEl = document.getElementById('panel-forge');
+  const scoutPanelEl = document.getElementById('panel-scout');
   const chatPanelEl  = document.getElementById('panel-chat');
   const logsPanelEl  = document.getElementById('panel-logs');
   const tabsEl       = document.getElementById('main-tabs');
   const titleEl      = document.getElementById('chat-title');
   const forgeBtn     = document.getElementById('btn-forge');
+  const scoutBtn     = document.getElementById('btn-scout');
+
+  // Hide everything first
+  chatPanelEl.classList.add('hidden');
+  logsPanelEl.classList.add('hidden');
+  forgePanelEl.classList.add('hidden');
+  scoutPanelEl?.classList.add('hidden');
+  forgeBtn.classList.remove('active-nav');
+  scoutBtn?.classList.remove('active-nav');
 
   if (view === 'forge') {
-    chatPanelEl.classList.add('hidden');
-    logsPanelEl.classList.add('hidden');
     forgePanelEl.classList.remove('hidden');
     tabsEl.classList.add('hidden');
     titleEl.textContent = 'Forge';
     forgeBtn.classList.add('active-nav');
     loadForgePackInfo();
     loadLintPacks();
+  } else if (view === 'scout') {
+    scoutPanelEl?.classList.remove('hidden');
+    tabsEl.classList.add('hidden');
+    titleEl.textContent = 'Scout';
+    scoutBtn?.classList.add('active-nav');
+    scoutInit();
   } else {
-    forgePanelEl.classList.add('hidden');
     tabsEl.classList.remove('hidden');
     chatPanelEl.classList.toggle('hidden', activeTab !== 'chat');
     logsPanelEl.classList.toggle('hidden', activeTab !== 'logs');
     const chat = allChats.find(c => c.id === currentChatId);
     titleEl.textContent = chat?.title || 'New Chat';
-    forgeBtn.classList.remove('active-nav');
     document.getElementById('message-input').focus();
   }
 }
@@ -500,7 +517,9 @@ async function runForge() {
         if (!line.startsWith('data: ')) continue;
         let data;
         try { data = JSON.parse(line.slice(6)); } catch { continue; }
-        if (data.text !== undefined) appendForgeOutput(data.text);
+        if (data.type === 'run_started')      onRunStarted(data);
+        else if (data.type === 'run_ended')   onRunEnded(data.status);
+        else if (data.text !== undefined)     appendForgeOutput(data.text);
         else if (data.type === 'forge_complete') showForgeActions(data.pack_name);
       }
     }
@@ -638,7 +657,9 @@ async function runLint(packNameOverride = null) {
         if (!line.startsWith('data: ')) continue;
         let data;
         try { data = JSON.parse(line.slice(6)); } catch { continue; }
-        if (data.text !== undefined) {
+        if (data.type === 'run_started')      onRunStarted(data);
+        else if (data.type === 'run_ended')   onRunEnded(data.status);
+        else if (data.text !== undefined) {
           appendForgeOutput(data.text);
           _lastLintReport.text += data.text + '\n';
         } else if (data.type === 'lint_complete') {
@@ -769,14 +790,36 @@ function updateSendButton() {
   const textarea = document.getElementById('message-input');
   const btn = document.getElementById('send-btn');
   const hasContent = textarea.value.trim().length > 0 || attachments.length > 0;
-  btn.disabled = isStreaming || !hasContent;
+  if (isStreaming) {
+    // Show as STOP — always enabled, always clickable
+    btn.disabled = false;
+    btn.title = 'Stop generation';
+  } else {
+    btn.disabled = !hasContent;
+    btn.title = 'Send (Enter)';
+  }
 }
 
 function setStreamingState(active) {
   isStreaming = active;
+  const btn = document.getElementById('send-btn');
+  if (btn) btn.classList.toggle('is-stop', active);
   updateSendButton();
   const sidebar = document.querySelector('.sidebar');
   if (sidebar) sidebar.classList.toggle('is-streaming', active);
+}
+
+async function stopChatStream() {
+  if (!currentChatId) return;
+  const btn = document.getElementById('send-btn');
+  if (btn) btn.disabled = true;          // brief disable while server cleans up
+  try {
+    await fetch(`/api/chats/${currentChatId}/stop`, { method: 'POST' });
+  } catch (e) {
+    // ignore — the stream may already be ending
+  }
+  // setStreamingState(false) will be called by the existing finally{} once the
+  // server closes the stream cleanly with the partial answer saved.
 }
 
 // ── File attachments ─────────────────────────────────────────────────────────
@@ -1951,6 +1994,1205 @@ function icon(emoji) {
   return s;
 }
 
+// ── Scout ─────────────────────────────────────────────────────────────────────
+
+const SCOUT_TOPTIER_MODELS = [
+  { value: 'openai/gpt-5-mini',         label: 'GPT-5 Mini — fast & cheap (default)' },
+  { value: 'openai/gpt-5',              label: 'GPT-5 — best quality' },
+  { value: 'anthropic/claude-sonnet-4.6', label: 'Claude Sonnet 4.6' },
+];
+
+let scoutMode = 'wikipedia_first';
+let scoutScope = 'overview';
+let scoutResults = [];          // array of SourceResult dicts
+let scoutSelected = new Set();  // dedup keys (source|url)
+let scoutFullText = new Set();  // dedup keys of arXiv cards toggled to "Full PDF"
+let scoutInited = false;
+let scoutEvtSource = null;
+
+// Track whether the current brief content was AI-generated. If the user has
+// typed a brief manually, we never silently overwrite it on chip click.
+let scoutBriefIsAuto = false;
+let scoutSuggestInFlight = false;
+
+// Books — heavy, excluded from "Select all", selection triggers confirm dialog.
+function isBookResult(r) {
+  return r.kind === 'book' || r.source === 'gutendex' || r.source === 'archive_org';
+}
+// Sources that support an opt-in "full text" download (independent of selection).
+// arXiv: PDF download. PubMed: PubMed Central open-access XML (only when pmc_id present).
+function supportsFullText(r) {
+  if (r.source === 'arxiv') return true;
+  if (r.source === 'pubmed' && r.extra && r.extra.pmc_id) return true;
+  return false;
+}
+function fullTextLabel(r) {
+  if (r.source === 'arxiv') return '📑 Download full PDF';
+  if (r.source === 'pubmed') return '📄 Download full text (PMC)';
+  return '📑 Download full text';
+}
+
+function scoutDedupKey(r) {
+  const doi = (r.extra && r.extra.doi) ? String(r.extra.doi).toLowerCase().trim() : '';
+  if (doi) return 'doi:' + doi;
+  let u = (r.url || '').toLowerCase().trim();
+  u = u.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '');
+  return 'url:' + u;
+}
+
+function setupScoutListeners() {
+  if (!document.getElementById('panel-scout')) return;
+
+  // Mode buttons
+  document.querySelectorAll('[data-scout-mode]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-scout-mode]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      scoutMode = btn.dataset.scoutMode;
+      scoutUpdateModeOptions();
+    });
+  });
+
+  // Scope chips — clicking one also auto-fills brief + sources unless the user
+  // has typed a brief manually (we don't clobber custom briefs silently).
+  document.querySelectorAll('[data-scope]').forEach(chip => {
+    chip.addEventListener('click', () => {
+      document.querySelectorAll('[data-scope]').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      scoutScope = chip.dataset.scope;
+      maybeAutoFillFromScope();
+    });
+  });
+
+  // Manual edit of the brief textarea: mark as "user-owned" so subsequent
+  // chip clicks won't silently overwrite.
+  document.getElementById('scout-brief')?.addEventListener('input', () => {
+    scoutBriefIsAuto = false;
+  });
+
+  // Explicit regenerate button.
+  document.getElementById('scout-suggest-btn')?.addEventListener('click', () => {
+    runScoutSuggest({ force: true });
+  });
+
+  // Tabs (results / log)
+  document.querySelectorAll('[data-scout-tab]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-scout-tab]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const tab = btn.dataset.scoutTab;
+      document.getElementById('scout-pane-results').classList.toggle('hidden', tab !== 'results');
+      document.getElementById('scout-pane-log').classList.toggle('hidden', tab !== 'log');
+    });
+  });
+
+  // LLM provider switch
+  document.getElementById('scout-llm-provider')?.addEventListener('change', scoutLoadModels);
+
+  // Filter dropdowns
+  document.getElementById('scout-filter-source')?.addEventListener('change', renderScoutResults);
+  document.getElementById('scout-filter-lang')?.addEventListener('change', renderScoutResults);
+
+  // Select all — explicitly EXCLUDES books. Books must be picked manually
+  // (each one triggers a confirm dialog). Already-selected books are left as-is
+  // on toggle off.
+  document.getElementById('scout-select-all')?.addEventListener('change', e => {
+    const checked = e.target.checked;
+    const visibleNonBook = scoutResults.filter(r => {
+      const fs = document.getElementById('scout-filter-source').value;
+      const fl = document.getElementById('scout-filter-lang').value;
+      if (fs && r.source !== fs) return false;
+      if (fl && (r.lang || '') !== fl) return false;
+      return !isBookResult(r);
+    });
+    const keys = visibleNonBook.map(scoutDedupKey);
+    if (checked) keys.forEach(k => scoutSelected.add(k));
+    else         keys.forEach(k => scoutSelected.delete(k));
+    renderScoutResults();
+  });
+
+  // Action buttons
+  document.getElementById('scout-run-btn')?.addEventListener('click', runScout);
+  document.getElementById('scout-reset-btn')?.addEventListener('click', resetScout);
+  document.getElementById('scout-fetch-btn')?.addEventListener('click', fetchSelectedScout);
+  document.getElementById('scout-runforge-btn')?.addEventListener('click', () => runForgeOnFetched());
+  document.getElementById('scout-open-folder-btn')?.addEventListener('click', openScoutFolder);
+  document.getElementById('scout-discard-btn')?.addEventListener('click', discardScoutFetch);
+  document.getElementById('scout-forge-extract-model')?.addEventListener('change', updateScoutCostHint);
+  document.getElementById('scout-forge-write-model')?.addEventListener('change', updateScoutCostHint);
+  document.getElementById('scout-log-clear')?.addEventListener('click', () => {
+    document.getElementById('scout-log-body').innerHTML = '';
+  });
+}
+
+// Current fetched batch: {token, folder, file_count, url_count} or null
+let scoutBatch = null;
+
+function scoutInit() {
+  if (scoutInited) return;
+  scoutInited = true;
+  scoutUpdateModeOptions();
+  scoutLoadModels();
+  initScoutResizer();
+}
+
+function initScoutResizer() {
+  const resizer = document.getElementById('scout-resizer');
+  const formArea = document.querySelector('.scout-form-area');
+  const layout = document.querySelector('.scout-layout');
+  if (!resizer || !formArea || !layout) return;
+  if (resizer.dataset.bound === '1') return;
+  resizer.dataset.bound = '1';
+
+  const STORAGE_KEY = 'occ_scout_form_height_px';
+  const MIN_FORM = 120;
+  const MIN_OUTPUT = 150;
+
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (saved && !isNaN(parseFloat(saved))) {
+    formArea.style.height = `${parseFloat(saved)}px`;
+    formArea.style.maxHeight = 'none';
+  }
+
+  let dragging = false;
+  let startY = 0;
+  let startH = 0;
+
+  const onDown = (e) => {
+    dragging = true;
+    startY = e.clientY;
+    startH = formArea.getBoundingClientRect().height;
+    resizer.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  };
+  const onMove = (e) => {
+    if (!dragging) return;
+    const layoutH = layout.getBoundingClientRect().height;
+    const delta = e.clientY - startY;
+    let newH = startH + delta;
+    newH = Math.max(MIN_FORM, Math.min(newH, layoutH - MIN_OUTPUT));
+    formArea.style.height = `${newH}px`;
+    formArea.style.maxHeight = 'none';
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    const h = parseFloat(formArea.style.height);
+    if (!isNaN(h)) localStorage.setItem(STORAGE_KEY, String(h));
+  };
+  const onDouble = () => {
+    formArea.style.height = '';
+    formArea.style.maxHeight = '';
+    localStorage.removeItem(STORAGE_KEY);
+  };
+
+  resizer.addEventListener('mousedown', onDown);
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+  resizer.addEventListener('dblclick', onDouble);
+}
+
+function scoutUpdateModeOptions() {
+  const wikiOpts = document.getElementById('scout-opts-wikipedia');
+  const multiOpts = document.getElementById('scout-opts-multi');
+  const llmRow = document.getElementById('scout-llm-row');
+  wikiOpts.classList.toggle('hidden', scoutMode !== 'wikipedia_first');
+  multiOpts.classList.toggle('hidden', scoutMode === 'wikipedia_first');
+  llmRow.classList.toggle('hidden', scoutMode === 'wikipedia_first');
+}
+
+async function scoutLoadModels() {
+  const provider = document.getElementById('scout-llm-provider').value;
+  const sel = document.getElementById('scout-llm-model');
+  sel.innerHTML = '';
+  if (provider === 'openrouter') {
+    for (const m of SCOUT_TOPTIER_MODELS) {
+      const o = document.createElement('option');
+      o.value = m.value; o.textContent = m.label;
+      sel.appendChild(o);
+    }
+  } else {
+    const o = document.createElement('option');
+    o.textContent = 'loading...'; o.disabled = true;
+    sel.appendChild(o);
+    try {
+      const r = await apiFetch('/api/scout/installed_models');
+      sel.innerHTML = '';
+      if (!r || !r.models || !r.models.length) {
+        const e = document.createElement('option');
+        e.textContent = 'No local models found'; e.disabled = true;
+        sel.appendChild(e);
+        return;
+      }
+      for (const m of r.models) {
+        const o2 = document.createElement('option');
+        o2.value = m.name;
+        o2.textContent = m.size_gb ? `${m.name} — ${m.size_gb} GB` : m.name;
+        sel.appendChild(o2);
+      }
+    } catch (e) {
+      sel.innerHTML = '';
+      const o3 = document.createElement('option');
+      o3.textContent = 'Error loading models'; o3.disabled = true;
+      sel.appendChild(o3);
+    }
+  }
+}
+
+function scoutGetLangs() {
+  const v = document.getElementById('scout-lang')?.value || 'en';
+  return [v];
+}
+
+function scoutGetEnabledSources() {
+  return Array.from(document.querySelectorAll('#scout-sources-grid input:checked'))
+    .map(i => i.value);
+}
+
+function resetScout() {
+  if (scoutEvtSource) { scoutEvtSource.close(); scoutEvtSource = null; }
+  scoutResults = [];
+  scoutSelected.clear();
+  scoutFullText.clear();
+  document.getElementById('scout-results-list').innerHTML =
+    '<div class="scout-empty">Run Find Sources to start. Candidates from each source will appear here.</div>';
+  document.getElementById('scout-log-body').innerHTML =
+    '<span class="log-line system">Waiting for Scout run...</span>';
+  document.getElementById('scout-progress-hint').textContent = '';
+  document.getElementById('scout-log-spinner').classList.add('hidden');
+  document.getElementById('scout-results-count').textContent = '0';
+  hideFetchedBar();
+  scoutBatch = null;
+  updateScoutSelectedCount();
+  updateScoutFilterDropdowns();
+}
+
+function showFetchedBar() {
+  document.getElementById('scout-fetched-bar').classList.remove('hidden');
+  updateScoutCostHint();
+}
+function hideFetchedBar() {
+  document.getElementById('scout-fetched-bar').classList.add('hidden');
+  document.getElementById('scout-fetched-summary').textContent = '';
+}
+
+// Real-cost estimates per WRITE CALL (one concept = one write call).
+// Numbers in EUR cents, based on OpenRouter list pricing for typical input/output sizes.
+// Forge produces ~5-10 concepts per source on average; we use 7 as the multiplier.
+const SCOUT_AVG_CONCEPTS_PER_SOURCE = 7;
+const SCOUT_COST_PER_CONCEPT_CENTS = {
+  'openai/gpt-5-mini':           0.7,   // ~€0.007 / write call (~3k in, ~2k out)
+  'openai/gpt-5':                3.5,   // ~€0.035 / write call (5× Mini on output)
+  'anthropic/claude-sonnet-4.6': 1.8,   // ~€0.018 / write call (between Mini and GPT-5)
+};
+// Extract-pass cost per source (just one call per source, regardless of concept count).
+const SCOUT_EXTRACT_COST_PER_SOURCE_CENTS = {
+  'openai/gpt-5-mini':           0.3,
+  'openai/gpt-5':                1.5,
+  'anthropic/claude-sonnet-4.6': 0.8,
+};
+
+function updateScoutCostHint() {
+  const hint = document.getElementById('scout-cost-hint');
+  if (!hint) return;
+  const ex = document.getElementById('scout-forge-extract-model')?.value || '';
+  const wr = document.getElementById('scout-forge-write-model')?.value || '';
+  const sources = scoutBatch ? scoutBatch.file_count : 0;
+
+  const exPerSrc = SCOUT_EXTRACT_COST_PER_SOURCE_CENTS[ex] ?? 0.3;
+  const wrPerConcept = SCOUT_COST_PER_CONCEPT_CENTS[wr] ?? 0.7;
+  const perSrc = exPerSrc + wrPerConcept * SCOUT_AVG_CONCEPTS_PER_SOURCE;
+  const totalCents = Math.max(1, Math.round(perSrc * sources));
+  const totalEur = (totalCents / 100).toFixed(2);
+
+  const label = (m) => m.includes('gpt-5-mini') ? 'Mini'
+                    : m.includes('gpt-5')      ? 'GPT-5'
+                    : m.includes('claude')     ? 'Claude'
+                    : m;
+  if (sources > 0) {
+    hint.textContent =
+      `~€${totalEur} · ${sources}src × ~${SCOUT_AVG_CONCEPTS_PER_SOURCE} concepts · ${label(ex)}+${label(wr)}`;
+  } else {
+    hint.textContent =
+      `~€${(perSrc/100).toFixed(2)} / source · ${label(ex)}+${label(wr)} · assumes ~${SCOUT_AVG_CONCEPTS_PER_SOURCE} concepts/src`;
+  }
+  hint.classList.toggle('warn', totalCents >= 500);
+}
+
+// Fired on scope chip click: auto-fill the form only when it's safe
+// (topic provided AND brief is empty or previously auto-generated).
+// The Custom chip is explicitly user-driven — no auto-fill, just a hint.
+function maybeAutoFillFromScope() {
+  if (scoutScope === 'custom') {
+    flashSuggestNote(
+      "✏️ Custom scope — no template applied. Write your own brief below " +
+      "(this is the 'do whatever you want' mode). To get an AI starting draft, " +
+      "either pick a different scope or click ✨ Suggest from topic.",
+      false
+    );
+    return;
+  }
+  const topic = document.getElementById('scout-topic').value.trim();
+  if (!topic) return;
+  const brief = document.getElementById('scout-brief').value;
+  if (brief.trim() && !scoutBriefIsAuto) return;  // don't clobber user-owned briefs
+  runScoutSuggest({ force: false });
+}
+
+// Calls /api/scout/suggest and applies the returned JSON to the form fields.
+// Used by both the chip auto-trigger and the explicit ✨ Suggest button.
+async function runScoutSuggest({ force = false } = {}) {
+  if (scoutSuggestInFlight) return;
+  const topic = document.getElementById('scout-topic').value.trim();
+  if (!topic) {
+    flashSuggestNote('Type a topic first, then click Suggest.', /*error*/ true);
+    return;
+  }
+  // If user has typed a brief and this isn't a forced regenerate, ask first.
+  const briefEl = document.getElementById('scout-brief');
+  const hasManualBrief = briefEl.value.trim() && !scoutBriefIsAuto;
+  if (hasManualBrief && force) {
+    if (!confirm('Replace your current brief with an AI-suggested one?')) return;
+  }
+
+  const language = document.getElementById('scout-lang')?.value || 'en';
+  const provider = document.getElementById('scout-llm-provider')?.value || 'openrouter';
+  const model    = document.getElementById('scout-llm-model')?.value || 'openai/gpt-5-mini';
+
+  scoutSuggestInFlight = true;
+  const btn = document.getElementById('scout-suggest-btn');
+  const spinner = document.getElementById('scout-suggest-spinner');
+  if (btn) btn.disabled = true;
+  if (spinner) spinner.classList.remove('hidden');
+
+  let data = null;
+  try {
+    const r = await fetch('/api/scout/suggest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        topic,
+        scope: scoutScope,
+        language,
+        llm_provider: provider,
+        llm_model: model,
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      flashSuggestNote(`Suggest failed (${r.status}): ${txt.slice(0, 200)}`, true);
+      return;
+    }
+    data = await r.json();
+  } catch (e) {
+    flashSuggestNote(`Network error: ${e.message}`, true);
+    return;
+  } finally {
+    scoutSuggestInFlight = false;
+    if (btn) btn.disabled = false;
+    if (spinner) spinner.classList.add('hidden');
+  }
+
+  if (!data) return;
+  applyScoutSuggestion(data);
+}
+
+// Apply the suggestion JSON to the form fields.
+function applyScoutSuggestion(data) {
+  // 0. The suggestion populates multi-source-specific fields (source list,
+  //    per-source limit, top-K). Force the Mode selector to Multi-source so
+  //    the user sees the populated fields and the chosen mode lines up with
+  //    what will actually run.
+  setScoutMode('multi_source');
+
+  // 1. Brief
+  if (typeof data.brief === 'string' && data.brief.trim()) {
+    const briefEl = document.getElementById('scout-brief');
+    briefEl.value = data.brief.trim();
+    scoutBriefIsAuto = true;
+  }
+  // 1b. Pack name slug — only if the user hasn't typed one yet (we don't
+  //     clobber a manually-typed name).
+  if (typeof data.pack_name === 'string' && data.pack_name.trim()) {
+    const packEl = document.getElementById('scout-pack-name');
+    if (packEl && !packEl.value.trim()) {
+      packEl.value = data.pack_name.trim();
+    }
+  }
+  // 2. Source toggles
+  if (Array.isArray(data.sources)) {
+    const want = new Set(data.sources);
+    document.querySelectorAll('#scout-sources-grid input').forEach(cb => {
+      cb.checked = want.has(cb.value);
+    });
+  }
+  // 3. Per-source limit + top-K — snap to nearest available option
+  setDropdownNearest('scout-per-source', data.per_source_limit);
+  setDropdownNearest('scout-top-k', data.top_k);
+  // 4. Show the rationale as a soft note
+  const note = (data.explanation || '').trim();
+  if (note) flashSuggestNote(`✨ ${note}`, false);
+}
+
+// Switch the Mode buttons + scoutMode state in lockstep. Used by the auto-fill
+// flow and could be called elsewhere if we add other mode-switching triggers.
+function setScoutMode(mode) {
+  if (mode !== scoutMode) {
+    scoutMode = mode;
+  }
+  document.querySelectorAll('[data-scout-mode]').forEach(b => {
+    b.classList.toggle('active', b.dataset.scoutMode === mode);
+  });
+  scoutUpdateModeOptions();
+}
+
+function setDropdownNearest(selectId, target) {
+  if (target == null || isNaN(target)) return;
+  const sel = document.getElementById(selectId);
+  if (!sel) return;
+  const options = Array.from(sel.options).map(o => parseInt(o.value, 10)).filter(n => !isNaN(n));
+  if (!options.length) return;
+  let best = options[0];
+  let bestDist = Math.abs(best - target);
+  for (const o of options) {
+    const d = Math.abs(o - target);
+    if (d < bestDist) { best = o; bestDist = d; }
+  }
+  sel.value = String(best);
+}
+
+function flashSuggestNote(text, isError) {
+  const el = document.getElementById('scout-suggest-note');
+  if (!el) return;
+  // Inject text + a small × dismiss button. Stays visible until the user
+  // dismisses it OR a new suggestion replaces the content. (Was auto-hiding
+  // after 8s before — too fast for the user to actually read the rationale.)
+  el.innerHTML = '';
+  const textEl = document.createElement('span');
+  textEl.className = 'scout-suggest-note-text';
+  textEl.textContent = text;
+  el.appendChild(textEl);
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = 'scout-suggest-dismiss';
+  dismiss.title = 'Dismiss';
+  dismiss.textContent = '×';
+  dismiss.addEventListener('click', () => el.classList.add('hidden'));
+  el.appendChild(dismiss);
+  el.classList.remove('hidden');
+  el.style.color = isError ? '#fca5a5' : '';
+}
+
+async function runScout() {
+  const topic = document.getElementById('scout-topic').value.trim();
+  if (!topic) {
+    appendScoutLog('❌ Enter a topic first.', 'error');
+    switchScoutTab('log');
+    return;
+  }
+  const langs = scoutGetLangs();
+
+  // Reset state but keep terminal open
+  scoutResults = [];
+  scoutSelected.clear();
+  scoutFullText.clear();
+  document.getElementById('scout-results-list').innerHTML = '';
+  document.getElementById('scout-log-body').innerHTML = '';
+  document.getElementById('scout-results-count').textContent = '0';
+  updateScoutSelectedCount();
+  document.getElementById('scout-log-spinner').classList.remove('hidden');
+  document.getElementById('scout-progress-hint').textContent = 'searching...';
+  document.getElementById('scout-run-btn').disabled = true;
+
+  // Build payload
+  const isFullAuto = scoutMode === 'full_auto';
+  const apiMode = isFullAuto ? 'multi_source' : scoutMode;
+  const brief = document.getElementById('scout-brief').value.trim();
+  const payload = {
+    topic,
+    mode: apiMode,
+    langs,
+    scope: scoutScope,
+    brief,
+    depth: parseInt(document.getElementById('scout-wiki-depth').value, 10) || 2,
+    max_pages: parseInt(document.getElementById('scout-wiki-max').value, 10) || 30,
+    include_internal_links: document.getElementById('scout-wiki-links').value === 'inline',
+    use_wikidata: document.getElementById('scout-wiki-wikidata').checked,
+    sources: scoutGetEnabledSources(),
+    expand: document.getElementById('scout-expand').checked,
+    auto_detect_domain: document.getElementById('scout-detect-domain').checked,
+    per_source_limit: parseInt(document.getElementById('scout-per-source').value, 10) || 6,
+    top_k: parseInt(document.getElementById('scout-top-k').value, 10) || 40,
+    llm_provider: document.getElementById('scout-llm-provider').value,
+    llm_model:    document.getElementById('scout-llm-model').value,
+  };
+
+  // For wikipedia_first, send empty source list (irrelevant) and skip LLM provider check
+  appendScoutLog(`▶ Starting Scout (${scoutMode}) — topic: "${topic}"`, 'system');
+
+  let body;
+  try {
+    const r = await fetch('/api/scout/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      appendScoutLog(`❌ ${r.status}: ${txt}`, 'error');
+      finishScoutRun();
+      return;
+    }
+    body = r.body;
+  } catch (e) {
+    appendScoutLog(`❌ Network error: ${e.message}`, 'error');
+    finishScoutRun();
+    return;
+  }
+
+  await consumeSse(body, ev => {
+    if (ev.type === 'log')      appendScoutLog(ev.text);
+    else if (ev.type === 'domain') appendScoutLog(`  domain → ${ev.domain}`, 'ok');
+    else if (ev.type === 'expanded') {
+      // already logged item-by-item in scout.py
+    }
+    else if (ev.type === 'result') addScoutResult(ev.result);
+    else if (ev.type === 'done') {
+      appendScoutLog(`✅ Done — ${ev.total} candidate(s) found.`, 'ok');
+      finishScoutRun(isFullAuto);
+    }
+  });
+}
+
+async function consumeSse(stream, onEvent) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6).trim();
+      if (!payload) continue;
+      try {
+        onEvent(JSON.parse(payload));
+      } catch (e) {
+        // ignore malformed events
+      }
+    }
+  }
+}
+
+function finishScoutRun(autoForge = false) {
+  document.getElementById('scout-log-spinner').classList.add('hidden');
+  document.getElementById('scout-progress-hint').textContent = `${scoutResults.length} candidate(s)`;
+  document.getElementById('scout-run-btn').disabled = false;
+  if (autoForge && scoutResults.length) {
+    // Full-auto: select top half (capped at 15), then fetch + forge + lint sequentially
+    const ranked = [...scoutResults].sort((a, b) => (b.score || 0) - (a.score || 0));
+    const pickN = Math.min(15, Math.max(5, Math.ceil(ranked.length / 2)));
+    scoutSelected = new Set(ranked.slice(0, pickN).map(r => scoutDedupKey(r)));
+    renderScoutResults();
+    appendScoutLog(`▶ Full-auto: auto-selected top ${pickN} candidates — fetching...`, 'system');
+    fetchSelectedScout({ chainForge: true, autoLint: true });
+  }
+}
+
+function addScoutResult(r) {
+  scoutResults.push(r);
+  document.getElementById('scout-results-count').textContent = String(scoutResults.length);
+  // Streaming-render: append a single card rather than re-render the whole list
+  const listEl = document.getElementById('scout-results-list');
+  if (scoutResults.length === 1) listEl.innerHTML = '';   // clear empty state on first hit
+  listEl.appendChild(scoutCardElement(r));
+  updateScoutFilterDropdowns();
+}
+
+function scoutCardElement(r) {
+  const key = scoutDedupKey(r);
+  const book = isBookResult(r);
+  const card = document.createElement('div');
+  card.className = 'scout-card' + (book ? ' is-book' : '');
+  card.dataset.key = key;
+  card.dataset.source = r.source || '';
+  card.dataset.lang = r.lang || '';
+
+  if (scoutSelected.has(key)) card.classList.add('selected');
+
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'scout-card-check';
+  cb.checked = scoutSelected.has(key);
+  cb.addEventListener('change', () => {
+    if (cb.checked && book) {
+      // Confirm before adding a full-book download to the selection
+      const ok = confirmBookSelection(r);
+      if (!ok) {
+        cb.checked = false;
+        return;
+      }
+    }
+    if (cb.checked) scoutSelected.add(key);
+    else scoutSelected.delete(key);
+    card.classList.toggle('selected', cb.checked);
+    updateScoutSelectedCount();
+  });
+
+  const body = document.createElement('div');
+  body.className = 'scout-card-body';
+
+  const title = document.createElement('div');
+  title.className = 'scout-card-title';
+  const a = document.createElement('a');
+  a.href = r.url || '#';
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = r.title || '(untitled)';
+  title.appendChild(a);
+
+  const meta = document.createElement('div');
+  meta.className = 'scout-card-meta';
+  const src = document.createElement('span');
+  src.className = 'src-tag kind-' + (r.kind || 'general');
+  src.textContent = (r.source || '?') + (r.kind ? ' · ' + r.kind : '');
+  meta.appendChild(src);
+  if (r.lang) {
+    const lg = document.createElement('span'); lg.textContent = r.lang; meta.appendChild(lg);
+  }
+  if (r.size_hint) {
+    const sz = document.createElement('span');
+    sz.textContent = (r.size_hint >= 1000 ? Math.round(r.size_hint / 1000) + 'k' : r.size_hint) + ' chars';
+    meta.appendChild(sz);
+  }
+  if (r.score) {
+    const sc = document.createElement('span');
+    sc.className = 'score-tag';
+    sc.textContent = '★ ' + (r.score).toFixed(2);
+    meta.appendChild(sc);
+  }
+
+  const snip = document.createElement('div');
+  snip.className = 'scout-card-snippet';
+  snip.textContent = r.snippet || '';
+
+  body.appendChild(title);
+  body.appendChild(meta);
+  if (r.snippet) body.appendChild(snip);
+
+  // Books: extra inline warning banner
+  if (book) {
+    const warn = document.createElement('div');
+    warn.className = 'scout-card-book-warn';
+    warn.textContent = '⚠️ Full book — selecting downloads the entire text. Heavy. Not included in "Select all".';
+    body.appendChild(warn);
+  }
+
+  // arXiv: optional "Download full PDF" toggle. Default OFF = abstract only.
+  // ON = downloads PDF and extracts text via pymupdf (heavier, more cost).
+  if (supportsFullText(r)) {
+    const ftRow = document.createElement('label');
+    ftRow.className = 'scout-card-fulltext';
+    const ftCb = document.createElement('input');
+    ftCb.type = 'checkbox';
+    ftCb.checked = scoutFullText.has(key);
+    ftCb.addEventListener('change', (e) => {
+      e.stopPropagation();
+      if (ftCb.checked) scoutFullText.add(key);
+      else              scoutFullText.delete(key);
+    });
+    ftRow.appendChild(ftCb);
+    const ftLabel = document.createElement('span');
+    ftLabel.textContent = fullTextLabel(r);
+    ftLabel.title = r.source === 'pubmed'
+      ? 'OFF: only abstract + metadata. ON: Scout downloads the full open-access article body from PubMed Central. Costs more in Forge processing — but the abstract alone is often enough for concept extraction.'
+      : 'OFF: only the paper abstract is fetched (cheap, often enough). ON: Scout downloads the full PDF and extracts text via pymupdf. Costs ~5-10× more in Forge processing.';
+    ftRow.appendChild(ftLabel);
+    body.appendChild(ftRow);
+  }
+
+  card.appendChild(cb);
+  card.appendChild(body);
+  return card;
+}
+
+// Confirm modal (native) for book selection — explains cost.
+function confirmBookSelection(r) {
+  // Roughly: a typical book ~500k chars → ~12 Forge chunks × ~7 concepts ≈ 80 concepts.
+  // With Mini that's ~€0.60 on writes; with GPT-5 ~€3. Show a range.
+  const sizeWords = (r.size_hint && r.size_hint > 0) ? Math.round(r.size_hint / 6) : 0;
+  const sizeHint = sizeWords > 0 ? ` (~${sizeWords.toLocaleString()} words)` : '';
+  const msg =
+    `Heads up — this is a full book${sizeHint}.\n\n` +
+    `If selected, Scout will download the entire text and Forge will process it. ` +
+    `One book typically produces 50-150 wiki pages on its own, which will dominate ` +
+    `the rest of the pack.\n\n` +
+    `Estimated extra cost: ~€0.50–€1 with GPT-5 Mini, ~€2–€5 with GPT-5.\n\n` +
+    `Source: ${r.title}\n\n` +
+    `Include in the selection?`;
+  return confirm(msg);
+}
+
+function renderScoutResults() {
+  const listEl = document.getElementById('scout-results-list');
+  listEl.innerHTML = '';
+  const filterSource = document.getElementById('scout-filter-source').value;
+  const filterLang   = document.getElementById('scout-filter-lang').value;
+  const visible = scoutResults.filter(r =>
+    (!filterSource || r.source === filterSource) &&
+    (!filterLang   || (r.lang || '') === filterLang)
+  );
+  if (!visible.length) {
+    listEl.innerHTML = '<div class="scout-empty">No candidates match the current filters.</div>';
+  } else {
+    for (const r of visible) listEl.appendChild(scoutCardElement(r));
+  }
+  updateScoutSelectedCount();
+}
+
+function currentVisibleScoutKeys() {
+  const filterSource = document.getElementById('scout-filter-source').value;
+  const filterLang   = document.getElementById('scout-filter-lang').value;
+  return scoutResults
+    .filter(r => (!filterSource || r.source === filterSource) && (!filterLang || (r.lang || '') === filterLang))
+    .map(scoutDedupKey);
+}
+
+function updateScoutSelectedCount() {
+  document.getElementById('scout-selected-count').textContent =
+    `${scoutSelected.size} selected`;
+  document.getElementById('scout-fetch-btn').disabled = scoutSelected.size === 0;
+}
+
+function updateScoutFilterDropdowns() {
+  const srcSel = document.getElementById('scout-filter-source');
+  const langSel = document.getElementById('scout-filter-lang');
+  const prevSrc = srcSel.value;
+  const prevLang = langSel.value;
+  const sources = Array.from(new Set(scoutResults.map(r => r.source))).filter(Boolean).sort();
+  const langs   = Array.from(new Set(scoutResults.map(r => r.lang)))  .filter(Boolean).sort();
+  srcSel.innerHTML = '<option value="">All sources</option>';
+  for (const s of sources) {
+    const o = document.createElement('option');
+    o.value = s; o.textContent = s; srcSel.appendChild(o);
+  }
+  if (sources.includes(prevSrc)) srcSel.value = prevSrc;
+
+  langSel.innerHTML = '<option value="">All langs</option>';
+  for (const l of langs) {
+    const o = document.createElement('option');
+    o.value = l; o.textContent = l; langSel.appendChild(o);
+  }
+  if (langs.includes(prevLang)) langSel.value = prevLang;
+}
+
+function appendScoutLog(text, kind = '') {
+  const body = document.getElementById('scout-log-body');
+  const line = document.createElement('span');
+  let cls = 'log-line system';
+  if (kind === 'error' || text.includes('❌'))      cls = 'log-line error';
+  else if (kind === 'ok' || text.includes('✅') || text.includes('🎉')) cls = 'log-line ok';
+  else if (text.includes('⚠')) cls = 'log-line warn';
+  line.className = cls;
+  line.textContent = text;
+  body.appendChild(line);
+  body.appendChild(document.createTextNode('\n'));
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+  if (nearBottom) body.scrollTop = body.scrollHeight;
+}
+
+function switchScoutTab(tab) {
+  document.querySelectorAll('[data-scout-tab]').forEach(b => {
+    b.classList.toggle('active', b.dataset.scoutTab === tab);
+  });
+  document.getElementById('scout-pane-results').classList.toggle('hidden', tab !== 'results');
+  document.getElementById('scout-pane-log').classList.toggle('hidden', tab !== 'log');
+}
+
+// Stage 1 — Fetch only. Writes selected sources straight into the target
+// pack's raw/articles/ folder using Forge's raw format. Does NOT run Forge.
+async function fetchSelectedScout(opts = {}) {
+  const selected = scoutResults.filter(r => scoutSelected.has(scoutDedupKey(r)));
+  if (!selected.length) {
+    appendScoutLog('❌ No sources selected.', 'error');
+    switchScoutTab('log');
+    return;
+  }
+  const packName = document.getElementById('scout-pack-name').value.trim();
+  if (!packName) {
+    appendScoutLog('❌ Enter a target pack name first.', 'error');
+    switchScoutTab('log');
+    return;
+  }
+
+  // Lock UI during fetch
+  const fetchBtn = document.getElementById('scout-fetch-btn');
+  fetchBtn.disabled = true;
+  document.getElementById('scout-log-spinner').classList.remove('hidden');
+  appendScoutLog(`▶ Fetching ${selected.length} selected source(s) into "${packName}"...`, 'system');
+  switchScoutTab('log');
+
+  let stream;
+  try {
+    const fullTextKeys = selected
+      .map(s => scoutDedupKey(s))
+      .filter(k => scoutFullText.has(k));
+    // Propagate the user's intent (scope chip + brief textarea) into the pack
+    // manifest, so Forge can apply the same scope filter at extraction time.
+    const briefForManifest = document.getElementById('scout-brief').value.trim();
+    const r = await fetch('/api/scout/fetch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pack_name: packName,
+        selected,
+        full_text_keys: fullTextKeys,
+        scope: scoutScope,
+        brief: briefForManifest,
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      appendScoutLog(`❌ ${r.status}: ${txt}`, 'error');
+      fetchBtn.disabled = false;
+      document.getElementById('scout-log-spinner').classList.add('hidden');
+      return;
+    }
+    stream = r.body;
+  } catch (e) {
+    appendScoutLog(`❌ Network: ${e.message}`, 'error');
+    fetchBtn.disabled = false;
+    document.getElementById('scout-log-spinner').classList.add('hidden');
+    return;
+  }
+
+  let finalEvent = null;
+  await consumeSse(stream, ev => {
+    if (ev.type === 'log') appendScoutLog(ev.text);
+    else if (ev.type === 'done') finalEvent = ev;
+  });
+  document.getElementById('scout-log-spinner').classList.add('hidden');
+  fetchBtn.disabled = scoutSelected.size === 0;
+
+  if (!finalEvent || !finalEvent.token) {
+    appendScoutLog('❌ Fetch did not complete (no batch produced).', 'error');
+    return;
+  }
+
+  scoutBatch = {
+    token:        finalEvent.token,
+    pack_name:    finalEvent.pack_name,
+    pack_dir:     finalEvent.pack_dir,
+    pack_existed: finalEvent.pack_existed,
+    file_count:   finalEvent.file_count,
+    url_count:    finalEvent.url_count,
+  };
+  const inWord = scoutBatch.pack_existed ? 'added to' : 'created in';
+  document.getElementById('scout-fetched-summary').textContent =
+    `✅ ${scoutBatch.file_count} raw file(s) ${inWord} ${scoutBatch.pack_dir}`;
+  showFetchedBar();
+  appendScoutLog(`✅ Ready to forge. Inspect the pack folder or click "Run Forge →".`, 'ok');
+  switchScoutTab('results');
+
+  if (opts.chainForge) {
+    runForgeOnFetched({ autoLint: !!opts.autoLint });
+  }
+}
+
+// Stage 2 — Forge the pack Scout already populated.
+async function runForgeOnFetched(opts = {}) {
+  if (!scoutBatch || !scoutBatch.token) {
+    appendScoutLog('❌ No fetched batch — run "Fetch sources" first.', 'error');
+    return;
+  }
+
+  const extractModel = document.getElementById('scout-forge-extract-model')?.value || 'openai/gpt-5-mini';
+  const writeModel   = document.getElementById('scout-forge-write-model')?.value   || 'openai/gpt-5-mini';
+  const hintEl = document.getElementById('scout-cost-hint');
+
+  // Confirm if the projected total triggers the warn state (≥ €5).
+  if (!opts.autoLint && !opts.skipConfirm && hintEl && hintEl.classList.contains('warn')) {
+    const ok = confirm(
+      `Heads up — Forge with these models on ${scoutBatch.file_count + scoutBatch.url_count} source(s) ` +
+      `will likely cost more than €5 (${hintEl.textContent}).\n\nProceed?`
+    );
+    if (!ok) return;
+  }
+
+  const payload = {
+    token: scoutBatch.token,
+    extract_model: extractModel,
+    model: writeModel,
+    fetch_images: false,
+    fetch_math: false,
+  };
+
+  // Pop to Forge view so user sees the familiar Forge output stream
+  switchView('forge');
+  const out = document.getElementById('forge-output-body');
+  out.innerHTML = '';
+  appendForgeOutput(`▶ Forge from Scout — pack "${scoutBatch.pack_name}"`);
+
+  let stream;
+  try {
+    const r = await fetch('/api/scout/forge_batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      appendForgeOutput(`❌ ${r.status}: ${txt}`);
+      return;
+    }
+    stream = r.body;
+  } catch (e) {
+    appendForgeOutput(`❌ Network: ${e.message}`);
+    return;
+  }
+
+  let completedPack = '';
+  await consumeSse(stream, ev => {
+    if (ev.type === 'run_started')        onRunStarted(ev);
+    else if (ev.type === 'run_ended')     onRunEnded(ev.status);
+    else if (ev.text)                     appendForgeOutput(ev.text);
+    if (ev.type === 'forge_complete') completedPack = ev.pack_name;
+  });
+  if (completedPack) {
+    showForgeActions(completedPack);
+    if (opts.autoLint) {
+      appendForgeOutput('\n▶ Full-auto: chaining Lint...');
+      runLint(completedPack);
+    }
+  }
+}
+
+async function openScoutFolder() {
+  if (!scoutBatch || !scoutBatch.token) return;
+  await apiFetch(`/api/scout/open-folder/${scoutBatch.token}`, { method: 'POST' });
+}
+
+async function discardScoutFetch() {
+  if (!scoutBatch || !scoutBatch.token) return;
+  const token = scoutBatch.token;
+  try {
+    await fetch(`/api/scout/batch/${token}`, { method: 'DELETE' });
+  } catch (e) { /* ignore */ }
+  scoutBatch = null;
+  hideFetchedBar();
+  appendScoutLog('↺ Fetched batch discarded.', 'system');
+}
+
+
+// ── Persistent run banner + reconnect ─────────────────────────────────────────
+//
+// State machine: while a Forge run is alive, we keep `activeRun` = {id, kind,
+// pack_name, status, started_at} in memory AND in localStorage. The banner
+// shows whenever activeRun exists. On page load we try to reconnect to the
+// stored run_id — if the server says it's still running, we tail it again.
+
+const RUN_BANNER_STORAGE_KEY = 'occ_active_forge_run';
+let activeRun = null;             // {id, kind, pack_name, status, started_at}
+let activeRunStream = null;       // AbortController for the SSE fetch
+let activeRunTicker = null;       // setInterval handle for elapsed updater
+
+function saveActiveRunToStorage() {
+  if (activeRun) {
+    try { localStorage.setItem(RUN_BANNER_STORAGE_KEY, JSON.stringify(activeRun)); }
+    catch (e) {}
+  } else {
+    localStorage.removeItem(RUN_BANNER_STORAGE_KEY);
+  }
+}
+
+function loadActiveRunFromStorage() {
+  try {
+    const raw = localStorage.getItem(RUN_BANNER_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function fmtElapsed(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  const m = Math.floor(s / 60), r = s % 60;
+  return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+}
+
+function renderRunBanner() {
+  const el = document.getElementById('run-banner');
+  if (!el) return;
+  if (!activeRun) {
+    el.classList.add('hidden');
+    document.body.classList.remove('has-run-banner');
+    return;
+  }
+  el.classList.remove('hidden');
+  document.body.classList.add('has-run-banner');
+  el.classList.remove('status-stopping','status-completed','status-failed','status-stopped');
+  if (activeRun.status && activeRun.status !== 'running') {
+    el.classList.add(`status-${activeRun.status}`);
+  }
+  const kindLabel = activeRun.kind === 'lint' ? 'Lint' : 'Forge';
+  const verb = activeRun.status === 'running' ? 'running on'
+             : activeRun.status === 'stopping' ? 'stopping on'
+             : activeRun.status === 'completed' ? 'completed —'
+             : activeRun.status === 'failed' ? 'failed on'
+             : activeRun.status === 'stopped' ? 'stopped on'
+             : 'on';
+  document.getElementById('run-banner-text').innerHTML =
+    `${kindLabel} ${verb} <strong>${activeRun.pack_name || '(?)'}</strong>`;
+  const elapsed = (Date.now() / 1000) - (activeRun.started_at || Date.now() / 1000);
+  document.getElementById('run-banner-elapsed').textContent = fmtElapsed(elapsed);
+  // Stop button only when actively running
+  const stopBtn = document.getElementById('run-banner-stop');
+  stopBtn.style.display = (activeRun.status === 'running') ? '' : 'none';
+}
+
+function startRunTicker() {
+  if (activeRunTicker) return;
+  activeRunTicker = setInterval(renderRunBanner, 1000);
+}
+function stopRunTicker() {
+  if (activeRunTicker) { clearInterval(activeRunTicker); activeRunTicker = null; }
+}
+
+function setActiveRun(run) {
+  activeRun = run;
+  saveActiveRunToStorage();
+  renderRunBanner();
+  if (run && run.status === 'running') startRunTicker();
+  else                                   stopRunTicker();
+}
+
+// Mark the current activeRun as terminal and schedule a hide after a few seconds
+function finalizeActiveRun(status) {
+  if (!activeRun) return;
+  activeRun.status = status;
+  saveActiveRunToStorage();
+  renderRunBanner();
+  stopRunTicker();
+  // Auto-hide after 8s on terminal status
+  setTimeout(() => {
+    if (activeRun && activeRun.status !== 'running') setActiveRun(null);
+  }, 8000);
+}
+
+async function stopActiveRun() {
+  if (!activeRun || !activeRun.id) return;
+  if (!confirm('Stop the running Forge?\n\nForge will exit cleanly after the current source finishes (up to ~60s). LLM calls already in flight will complete and be charged; future sources are saved.')) return;
+  try {
+    await fetch(`/api/forge/runs/${activeRun.id}/stop`, { method: 'POST' });
+    activeRun.status = 'stopping';
+    saveActiveRunToStorage();
+    renderRunBanner();
+  } catch (e) {
+    alert('Stop request failed: ' + e.message);
+  }
+}
+
+function viewActiveRun() {
+  if (!activeRun) return;
+  // Forge and scout_forge both render into the Forge output panel.
+  switchView('forge');
+}
+
+// Called by the SSE consumers in forgeRun / runForgeOnFetched / runLint when
+// they receive a `run_started` event. Wires the banner to the new run.
+function onRunStarted(ev) {
+  setActiveRun({
+    id:         ev.run_id,
+    kind:       ev.kind || 'forge',
+    pack_name:  ev.pack_name || '',
+    status:     'running',
+    started_at: ev.started_at || (Date.now() / 1000),
+  });
+}
+
+function onRunEnded(status) {
+  finalizeActiveRun(status || 'completed');
+}
+
+// On page load, if we have a stored run_id, try to reconnect to its stream.
+async function tryReconnectActiveRun() {
+  const stored = loadActiveRunFromStorage();
+  if (!stored || !stored.id) return;
+  let info;
+  try {
+    const r = await fetch(`/api/forge/runs/${stored.id}/status`);
+    if (!r.ok) {
+      // Run no longer exists on server — clear localStorage
+      setActiveRun(null);
+      return;
+    }
+    info = await r.json();
+  } catch (e) {
+    setActiveRun(null);
+    return;
+  }
+  setActiveRun({
+    id:         info.id,
+    kind:       info.kind,
+    pack_name:  info.pack_name,
+    status:     info.status,
+    started_at: info.started_at,
+  });
+  if (info.status !== 'running') {
+    // Don't bother reconnecting — final status visible, banner auto-hides
+    finalizeActiveRun(info.status);
+    return;
+  }
+  // Reconnect to its SSE stream and pipe events into the Forge output panel.
+  await streamExistingRun(info.id);
+}
+
+async function streamExistingRun(runId) {
+  // Show Forge view so the user sees the log streaming back
+  switchView('forge');
+  const out = document.getElementById('forge-output-body');
+  out.innerHTML = '';
+  appendForgeOutput(`▶ Reconnected to in-progress run ${runId}`);
+
+  if (activeRunStream) { try { activeRunStream.abort(); } catch(e){} }
+  activeRunStream = new AbortController();
+  let stream;
+  try {
+    const r = await fetch(`/api/forge/runs/${runId}/stream`, { signal: activeRunStream.signal });
+    if (!r.ok) {
+      appendForgeOutput(`❌ Could not reconnect: ${r.status}`);
+      return;
+    }
+    stream = r.body;
+  } catch (e) {
+    appendForgeOutput(`❌ Reconnect failed: ${e.message}`);
+    return;
+  }
+  let completedPack = '';
+  await consumeSse(stream, ev => {
+    if (ev.type === 'run_started') onRunStarted(ev);
+    else if (ev.type === 'run_ended') onRunEnded(ev.status);
+    else if (ev.text) appendForgeOutput(ev.text);
+    if (ev.type === 'forge_complete' || ev.type === 'lint_complete') completedPack = ev.pack_name;
+  });
+  if (completedPack) showForgeActions(completedPack);
+}
+
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', init);
+function initBanner() {
+  document.getElementById('run-banner-view')?.addEventListener('click', viewActiveRun);
+  document.getElementById('run-banner-stop')?.addEventListener('click', stopActiveRun);
+  tryReconnectActiveRun();
+}
+
+document.addEventListener('DOMContentLoaded', () => { init(); initBanner(); });
