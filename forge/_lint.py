@@ -1003,6 +1003,11 @@ def _scan_md_with_frontmatter(directory: Path) -> list[dict]:
         else:
             fm = None
             body = text
+        if isinstance(fm, dict):
+            for k in ("title", "summary", "slug"):
+                v = fm.get(k)
+                if v is not None and not isinstance(v, str):
+                    fm[k] = "; ".join(str(x).strip() for x in v if x is not None) if isinstance(v, list) else str(v)
         try:
             rel = str(f.relative_to(pack_root)).replace("\\", "/")
         except ValueError:

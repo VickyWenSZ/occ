@@ -224,25 +224,31 @@ def extract_concepts(
     source_text: str,
     existing_concepts: list[dict] | None = None,
     model: str = DEFAULT_EXTRACT_MODEL,
+    pack_scope_text: str = "",
+    pack_brief: str = "",
 ) -> list[dict]:
     """
     Identify wiki concepts from a source document, deduping against existing pages.
 
-    For sources ≥ _CHUNK_LARGE_THRESHOLD chars, the document is split into
-    overlapping chunks and each chunk runs through extraction with the running
-    concept set as `existing_concepts` — so duplicates across chunks are
-    auto-collapsed via `match_existing`.
-
-    Returns list of {slug, title, summary, match_existing, aliases, confidence}.
+    `pack_scope_text` and `pack_brief` are optional binding constraints — when
+    Scout creates the pack, it writes the user's chosen scope and brief into
+    the pack's manifest.yaml; Forge reads them and passes them through here so
+    the extractor only proposes concepts that fit the declared scope. When
+    Forge is used standalone (no Scout, no manifest scope), both stay empty
+    and the prompt reverts to the original "extract everything" behaviour.
     """
     if len(source_text) <= _CHUNK_LARGE_THRESHOLD:
-        return _extract_concepts_single(source_text, existing_concepts, model)
+        return _extract_concepts_single(source_text, existing_concepts, model,
+                                        pack_scope_text=pack_scope_text,
+                                        pack_brief=pack_brief)
 
     chunks = _chunk_text(source_text, _CHUNK_TARGET_SIZE, _CHUNK_OVERLAP)
     accumulated = list(existing_concepts or [])
     new_concepts: list[dict] = []
     for i, chunk in enumerate(chunks):
-        proposed = _extract_concepts_single(chunk, accumulated, model)
+        proposed = _extract_concepts_single(chunk, accumulated, model,
+                                            pack_scope_text=pack_scope_text,
+                                            pack_brief=pack_brief)
         for c in proposed:
             slug = (c.get("slug") or "").strip()
             match = c.get("match_existing")
@@ -266,6 +272,8 @@ def _extract_concepts_single(
     source_text: str,
     existing_concepts: list[dict] | None,
     model: str,
+    pack_scope_text: str = "",
+    pack_brief: str = "",
 ) -> list[dict]:
     """Single-shot extraction (no chunking). Used directly or per-chunk by extract_concepts."""
     existing_block = ""
@@ -283,14 +291,51 @@ def _extract_concepts_single(
             f"EXISTING CONCEPTS:\n{listed}\n"
         )
 
-    system = (
-        "You are a knowledge compiler. Analyze documents and identify distinct concepts "
-        "that deserve their own wiki page. Avoid duplicating concepts that already exist. "
-        "Output valid JSON only."
-    )
+    scope_block = ""
+    if pack_scope_text.strip() or pack_brief.strip():
+        scope_parts = ["\nPACK CONTEXT (binding scope — every concept you extract MUST fit this):"]
+        if pack_scope_text.strip():
+            scope_parts.append(pack_scope_text.strip())
+        if pack_brief.strip():
+            scope_parts.append(f'\nUser brief:\n"""\n{pack_brief.strip()}\n"""')
+        scope_parts.append(
+            "\nIf the document mentions ideas from RELATED-BUT-DISTINCT topics — other "
+            "traditions, rival schools, namesakes from unrelated fields, adjacent disciplines — "
+            "DO NOT extract them as standalone concepts. They can be referenced inside a "
+            "scope-relevant concept's body if needed, but they do NOT deserve their own page "
+            "in this pack. When in doubt, prefer to SKIP the concept over including off-scope "
+            "material."
+        )
+        scope_block = "\n".join(scope_parts) + "\n"
+
+    has_scope = bool(scope_block)
+    if has_scope:
+        system = (
+            "You are a knowledge compiler. Analyze documents and identify distinct concepts "
+            "that deserve their own wiki page. Avoid duplicating concepts that already exist. "
+            "When a PACK CONTEXT block is present, treat it as a hard filter — only concepts "
+            "directly within that scope get a page. Output valid JSON only."
+        )
+        tail = (
+            "Aim for 5-15 focused, non-overlapping concepts per source. Prefer fewer, deeper "
+            "concepts over many shallow ones. If the PACK CONTEXT filter leaves you with fewer "
+            "than 5 in-scope concepts, return ONLY those — do not pad with off-scope material. "
+            "Return valid JSON."
+        )
+    else:
+        system = (
+            "You are a knowledge compiler. Analyze documents and identify distinct concepts "
+            "that deserve their own wiki page. Avoid duplicating concepts that already exist. "
+            "Output valid JSON only."
+        )
+        tail = (
+            "Aim for 5-15 focused, non-overlapping concepts. Prefer fewer, deeper concepts "
+            "over many shallow ones. Return valid JSON."
+        )
     user = (
         "Analyze this document and return a JSON object with a 'concepts' key.\n\n"
         f"DOCUMENT:\n---\n{source_text}\n---\n"
+        f"{scope_block}"
         f"{existing_block}\n"
         "Each concept in the array must have:\n"
         "  - slug: lowercase-hyphenated identifier (e.g. 'docker-volumes')\n"
@@ -302,8 +347,7 @@ def _extract_concepts_single(
         "  - confidence: 'high' | 'medium' | 'low' — set 'high' only when the source is "
         "authoritative and the concept is well-established; 'medium' for single-source claims; "
         "'low' for anecdotal or contested material\n\n"
-        "Aim for 5-15 focused, non-overlapping concepts. Prefer fewer, deeper concepts over many "
-        "shallow ones. Return valid JSON."
+        + tail
     )
     raw = _call(model, system, user, json_mode=True, max_output_tokens=32000)
     try:
@@ -533,7 +577,13 @@ def synthesize_wiki_page(
         "You are an expert knowledge compiler. Re-synthesize a wiki page from multiple "
         "raw sources. Your job is to produce a coherent, factual page that integrates "
         "ALL provided sources — not to merge or update an existing page. Follow the "
-        "Karpathy LLM-wiki structure: abstract, body, See Also, Sources, Key Points."
+        "Karpathy LLM-wiki structure: abstract, body, See Also, Sources, Key Points.\n\n"
+        "CRITICAL YAML RULES for the frontmatter block:\n"
+        "- `summary` MUST be ONE quoted string on a single key — never a YAML list, "
+        "never a multi-line block, never bullet points. Wrong: `summary:\\n  - foo\\n  - bar`. "
+        "Right: `summary: \"foo; bar\"`.\n"
+        "- `title` MUST be a plain string (quote it if it contains `:` or other YAML-special chars).\n"
+        "- Only `aliases`, `sources`, and `tags` may be YAML lists. Nothing else."
     )
     user = (
         f"Re-synthesize the wiki page for: \"{concept['title']}\"\n\n"
@@ -551,7 +601,7 @@ def synthesize_wiki_page(
         f"confidence: {confidence}\n"
         f"created: {date.today().isoformat()}\n"
         f"updated: {date.today().isoformat()}\n"
-        f"summary: [one sentence describing this concept, drawn from all sources]\n"
+        f"summary: \"REPLACE WITH ONE SENTENCE — must be a single quoted string, NEVER a YAML list or bullet block. Inside the quotes use no double-quote characters.\"\n"
         f"tags: [3-5 relevant lowercase keywords]\n"
         f"---\n\n"
         f"# {concept['title']}\n\n"
@@ -692,7 +742,13 @@ def write_wiki_page(
         "You are an expert knowledge compiler. Write dense, factual wiki pages "
         "optimized for LLM consumption. Be precise, complete, and technical. Use markdown. "
         "Every page must follow the Karpathy LLM-wiki structure: abstract paragraph, body, "
-        "See Also, Sources, Key Points."
+        "See Also, Sources, Key Points.\n\n"
+        "CRITICAL YAML RULES for the frontmatter block:\n"
+        "- `summary` MUST be ONE quoted string on a single key — never a YAML list, "
+        "never a multi-line block, never bullet points. Wrong: `summary:\\n  - foo\\n  - bar`. "
+        "Right: `summary: \"foo; bar\"`.\n"
+        "- `title` MUST be a plain string (quote it if it contains `:` or other YAML-special chars).\n"
+        "- Only `aliases`, `sources`, and `tags` may be YAML lists. Nothing else."
     )
     user = (
         f"Write a comprehensive wiki page for the concept: \"{concept['title']}\"\n\n"
@@ -708,7 +764,7 @@ def write_wiki_page(
         f"confidence: {confidence}\n"
         f"created: {date.today().isoformat()}\n"
         f"updated: {date.today().isoformat()}\n"
-        f"summary: [replace with one sentence describing this concept]\n"
+        f"summary: \"REPLACE WITH ONE SENTENCE — must be a single quoted string, NEVER a YAML list or bullet block. Inside the quotes use no double-quote characters.\"\n"
         f"tags: [replace with 3-5 relevant lowercase keywords]\n"
         f"---\n\n"
         f"# {concept['title']}\n\n"

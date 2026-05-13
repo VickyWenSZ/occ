@@ -141,11 +141,22 @@ def scan_existing_pages(wiki_dir: Path) -> list[dict]:
         text = md_file.read_text(encoding="utf-8", errors="replace")
         fm = _parse_frontmatter(text)
         pages.append({
-            "slug": fm.get("slug", md_file.stem),
-            "title": fm.get("title", md_file.stem),
-            "summary": fm.get("summary", ""),
+            "slug": _coerce_str(fm.get("slug"), md_file.stem),
+            "title": _coerce_str(fm.get("title"), md_file.stem),
+            "summary": _coerce_str(fm.get("summary"), ""),
         })
     return pages
+
+
+def _coerce_str(value, fallback: str) -> str:
+    """LLMs occasionally emit summary/title as a YAML list of bullets. Flatten."""
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "; ".join(str(x).strip() for x in value if x is not None)
+    return str(value)
 
 
 def update_index(wiki_dir: Path, pages: list[dict]):
