@@ -38,8 +38,8 @@ def run_structural_checks(wiki_dir: Path, pack_dir: Path, fix: bool = False) -> 
     concepts_dir = wiki_dir / "concepts"
     raw_articles_dir = pack_dir / "raw" / "articles"
 
-    pages = _scan_md_with_frontmatter(concepts_dir) if concepts_dir.exists() else []
-    raws = _scan_md_with_frontmatter(raw_articles_dir) if raw_articles_dir.exists() else []
+    pages = _scan_md_with_frontmatter(concepts_dir, pack_dir) if concepts_dir.exists() else []
+    raws = _scan_md_with_frontmatter(raw_articles_dir, pack_dir) if raw_articles_dir.exists() else []
 
     _check_c1_structure(wiki_dir, pack_dir, pages, issues, fix)
     _check_c2_frontmatter(pages, raws, issues, fix)
@@ -56,6 +56,7 @@ def run_structural_checks(wiki_dir: Path, pack_dir: Path, fix: bool = False) -> 
     _check_s5_control_chars(pages, issues, fix)
     _check_q1_page_length(pages, issues, fix)
     _check_q2_placeholders(pages, issues, fix)
+    _check_q3_template_leakage(pages, issues, fix)
     _check_q4_index_summary_drift(wiki_dir, pages, issues, fix)
 
     summary = {
@@ -918,6 +919,95 @@ def _check_q2_placeholders(pages: list[dict], issues: list[dict], fix: bool):
                 break
 
 
+# Patterns that indicate the LLM copied the prompt template verbatim into
+# user-visible frontmatter fields. Symptom of a prompt-engineering bug;
+# discovered 2026-05-14 after a real run produced 100/162 pages with the
+# placeholder string surviving as `summary` or `tags`.
+_Q3_LEAKAGE_PATTERNS = [
+    re.compile(r"REPLACE\s+WITH", re.IGNORECASE),
+    re.compile(r"<<\s*WRITE", re.IGNORECASE),
+    re.compile(r"<<\s*TAG\d*\s*>>", re.IGNORECASE),
+    re.compile(r"<<\s*SUMMARY", re.IGNORECASE),
+    re.compile(r"<<\s*TITLE", re.IGNORECASE),
+    re.compile(r"must\s+be\s+a\s+single\s+quoted\s+string", re.IGNORECASE),
+    re.compile(r"3-?5\s+relevant\s+lowercase\s+keywords?", re.IGNORECASE),
+    re.compile(r"^\s*replace\s+with", re.IGNORECASE),
+    re.compile(r"never\s+a\s+yaml\s+list", re.IGNORECASE),
+]
+
+# Stale `### See Also` (three hashes) sub-subsection containing the cross-link
+# placeholder. The proper section is `## See Also` (two hashes); the cross-link
+# pass only fills the two-hash variant, leaving the three-hash stray with its
+# placeholder intact.
+_Q3_STALE_SEE_ALSO_RE = re.compile(
+    r"^###\s+See\s+Also\s*$.*?_To be linked after compilation\._",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+
+
+def _check_q3_template_leakage(pages: list[dict], issues: list[dict], fix: bool):
+    """Detect prompt-template text leaking into user-visible frontmatter.
+
+    These cases survive C2 (frontmatter present) and Q2 (placeholder in body)
+    because they are syntactically valid YAML strings that just happen to be
+    the LLM's verbatim copy of the prompt template. Severity is critical:
+    they degrade retrieval quality severely (the broker indexes summaries).
+    Not auto-fixable from inside the lint — see `repair_placeholders.py`
+    or re-run the page with the post-2026-05-14 prompts.
+    """
+    for p in pages:
+        fm = p.get("frontmatter")
+        if not isinstance(fm, dict):
+            continue
+        rel = p["rel_path"]
+
+        for field in ("summary", "title"):
+            v = fm.get(field)
+            if v is None:
+                continue
+            s = str(v)
+            for pat in _Q3_LEAKAGE_PATTERNS:
+                if pat.search(s):
+                    issues.append({
+                        "code": "Q3", "severity": "critical",
+                        "message": f"Frontmatter `{field}` contains prompt-template text "
+                                   f"(LLM did not replace the placeholder): {s[:80]!r}",
+                        "path": rel, "fixed": False,
+                    })
+                    break
+
+        tags = fm.get("tags") or []
+        if isinstance(tags, list):
+            for t in tags:
+                ts = str(t).strip()
+                leaked = False
+                for pat in _Q3_LEAKAGE_PATTERNS:
+                    if pat.search(ts):
+                        leaked = True
+                        break
+                if not leaked and " " in ts and len(ts.split()) > 4:
+                    leaked = True
+                if leaked:
+                    issues.append({
+                        "code": "Q3", "severity": "critical",
+                        "message": f"Frontmatter `tags` contains a placeholder/instructional "
+                                   f"string instead of a keyword: {ts!r}",
+                        "path": rel, "fixed": False,
+                    })
+                    break
+
+        body = p.get("body", "") or ""
+        if _Q3_STALE_SEE_ALSO_RE.search(body):
+            issues.append({
+                "code": "Q3", "severity": "warning",
+                "message": "Body contains a stray `### See Also` (three hashes) section "
+                           "with the cross-link placeholder. The cross-link pass only fills "
+                           "`## See Also` (two hashes); this stray subsection must be removed "
+                           "or merged.",
+                "path": rel, "fixed": False,
+            })
+
+
 def _check_q4_index_summary_drift(wiki_dir: Path, pages: list[dict], issues: list[dict], fix: bool):
     index_path = wiki_dir / "index.md"
     if not index_path.exists():
@@ -978,15 +1068,16 @@ def _parse_index_rows_with_summary(text: str) -> list[tuple[str, str, str]]:
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 
 
-def _scan_md_with_frontmatter(directory: Path) -> list[dict]:
-    """Return list of {path, rel_path, text, frontmatter (dict|None), body}."""
+def _scan_md_with_frontmatter(directory: Path, pack_dir: Path) -> list[dict]:
+    """
+    Return list of {path, rel_path, text, frontmatter (dict|None), body}.
+    `rel_path` is relative to `pack_dir` (e.g. "raw/articles/foo.md" or
+    "wiki/concepts/foo.md"), matching the convention used by frontmatter
+    `sources:` entries so provenance checks compare equal strings.
+    """
     out = []
     if not directory.exists():
         return out
-    pack_root = directory
-    while pack_root.parent.name not in ("expert-packs", "") and pack_root.parent != pack_root:
-        pack_root = pack_root.parent
-    pack_root = pack_root.parent if pack_root.parent.name == "expert-packs" else directory.parent.parent
     for f in sorted(directory.glob("*.md")):
         if f.name in ("_index.md", "index.md", "schema.md", "log.md"):
             continue
@@ -1009,7 +1100,7 @@ def _scan_md_with_frontmatter(directory: Path) -> list[dict]:
                 if v is not None and not isinstance(v, str):
                     fm[k] = "; ".join(str(x).strip() for x in v if x is not None) if isinstance(v, list) else str(v)
         try:
-            rel = str(f.relative_to(pack_root)).replace("\\", "/")
+            rel = str(f.resolve().relative_to(pack_dir.resolve())).replace("\\", "/")
         except ValueError:
             rel = f.name
         out.append({"path": f, "rel_path": rel, "text": text, "frontmatter": fm, "body": body})

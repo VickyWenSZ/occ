@@ -418,6 +418,40 @@ def _fts_escape(q: str) -> str:
     return " OR ".join(f'"{w}"' for w in words)
 
 
+def _lookup_entity(term: str, limit: int = 5) -> list[dict]:
+    """
+    Find which packs contain pages mentioning `term`. Used by skills (e.g.
+    creative_writer) that have an entity name from the user but don't know
+    which installed pack covers it.
+
+    Returns a list of {pack_path, match_count} sorted by match_count desc.
+    Empty list when no pack matches or the FTS5 query is malformed.
+    """
+    if not term.strip():
+        return []
+    conn = _open_db()
+    try:
+        cursor = conn.execute(
+            """
+            SELECT pack_path, COUNT(*) AS match_count
+            FROM pack_pages
+            WHERE pack_pages MATCH ?
+            GROUP BY pack_path
+            ORDER BY match_count DESC
+            LIMIT ?
+            """,
+            (_fts_escape(term), limit),
+        )
+        return [
+            {"pack_path": row[0], "match_count": row[1]}
+            for row in cursor.fetchall()
+        ]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
 @app.on_event("startup")
 async def _on_startup():
     try:
@@ -453,6 +487,22 @@ async def search(req: SearchRequest, request: Request):
         raise HTTPException(429, "rate limit exceeded")
     scope = _sanitize_scope(req.scope)
     return {"results": _search_packs(req.q, k=max(1, min(req.k, 50)), scope=scope)}
+
+
+class LookupEntityRequest(BaseModel):
+    term: str
+    limit: int = 5
+
+
+@app.post("/lookup_entity")
+async def lookup_entity(req: LookupEntityRequest, request: Request):
+    """Find which installed packs contain pages mentioning `term`.
+    Used by skills that need to discover the right scope from a named entity
+    (e.g. creative_writer extracting 'Voldemort' → harry-potter)."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        raise HTTPException(429, "rate limit exceeded")
+    return {"results": _lookup_entity(req.term, limit=max(1, min(req.limit, 20)))}
 
 
 class ReindexRequest(BaseModel):

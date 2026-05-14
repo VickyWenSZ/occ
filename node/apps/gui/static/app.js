@@ -164,6 +164,40 @@ function setupEventListeners() {
   document.getElementById('attach-btn').addEventListener('click', () => document.getElementById('file-input').click());
   document.getElementById('file-input').addEventListener('change', e => handleFiles(e.target.files));
 
+  // Drag-and-drop: drop files anywhere on the page (only in chat view) to attach.
+  // Uses a counter to handle dragenter/dragleave firing on every child element.
+  const dropOverlay = document.getElementById('drop-overlay');
+  let _dragCounter = 0;
+  const _isFileDrag = e => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  window.addEventListener('dragenter', e => {
+    if (!_isFileDrag(e) || activeView !== 'chat') return;
+    e.preventDefault();
+    _dragCounter++;
+    dropOverlay.classList.add('active');
+  });
+  window.addEventListener('dragleave', e => {
+    if (!_isFileDrag(e)) return;
+    _dragCounter--;
+    if (_dragCounter <= 0) {
+      _dragCounter = 0;
+      dropOverlay.classList.remove('active');
+    }
+  });
+  window.addEventListener('dragover', e => {
+    if (!_isFileDrag(e) || activeView !== 'chat') return;
+    e.preventDefault();
+  });
+  window.addEventListener('drop', e => {
+    if (!_isFileDrag(e)) return;
+    e.preventDefault();
+    _dragCounter = 0;
+    dropOverlay.classList.remove('active');
+    if (activeView !== 'chat') return;
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleFiles(e.dataTransfer.files);
+    }
+  });
+
   const textarea = document.getElementById('message-input');
   textarea.addEventListener('input', () => {
     autoResize(textarea);
@@ -446,7 +480,9 @@ async function loadForgePackInfo() {
 
   if (!pack.source_count) {
     infoEl.className = 'forge-pack-info';
-    infoEl.textContent = '● Pack exists — no sources yet.';
+    infoEl.textContent = pack.raw_count
+      ? `● Pack exists — ${pack.raw_count} raw source${pack.raw_count !== 1 ? 's' : ''} ready (use Recompile from Raw).`
+      : '● Pack exists — no sources yet.';
     return;
   }
 
@@ -476,7 +512,8 @@ async function runForge() {
     .split('\n').map(u => u.trim()).filter(Boolean);
   const text   = document.getElementById('forge-text').value.trim();
 
-  if (!forgeFiles.length && !urls.length && !text) {
+  const modeReusesDiskRaws = forgeMode === 'recompile' || forgeMode === 'resume';
+  if (!modeReusesDiskRaws && !forgeFiles.length && !urls.length && !text) {
     appendForgeOutput('❌ No sources provided. Add files, URLs, or paste text.', 'error');
     return;
   }

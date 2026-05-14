@@ -184,7 +184,7 @@
         </div>
       </div>
 
-      <input type="file" id="file-input" multiple style="display:none" accept="image/*,text/*,.pdf,.md,.txt,.py,.js,.ts,.json,.yaml,.yml,.toml,.sh,.csv">
+      <input type="file" id="file-input" multiple style="display:none" accept="image/*,audio/*,text/*,.pdf,.docx,.xlsx,.md,.txt,.py,.js,.ts,.json,.yaml,.yml,.toml,.sh,.csv,.mp3,.wav,.m4a,.ogg,.flac">
       <div class="input-area">
         <div class="attachments-preview" id="attachments-preview"></div>
         <div class="input-row">
@@ -266,6 +266,7 @@
           <div class="forge-section-label">Mode</div>
           <div class="forge-mode-group">
             <button class="forge-mode-btn active" data-mode="add" title="Append new sources to the existing pack. Concepts the model recognizes as duplicates of existing pages will update those pages.">Add sources</button>
+            <button class="forge-mode-btn" data-mode="resume" title="Continue an interrupted run. Keeps wiki pages already written; skips sources recorded as complete in wiki/log.md; processes only the remaining ones; then cross-links and finalizes. Use after a crash or timeout to avoid redoing work.">Resume interrupted</button>
             <button class="forge-mode-btn" data-mode="recompile" title="Regenerate all wiki pages from the existing raw sources without re-fetching anything. Use after improving prompts to apply the new prompt logic to every page. Zero network, only LLM cost.">Recompile from raw</button>
             <button class="forge-mode-btn" data-mode="rebuild" title="Delete all wiki pages and re-fetch every URL/file from scratch. Most expensive option.">Rebuild from scratch</button>
           </div>
@@ -772,9 +773,16 @@
   </div>
 </div>
 
+<div id="drop-overlay">
+  <div class="drop-overlay-inner">
+    <div class="drop-icon">＋</div>
+    <div class="drop-label">Drop files to attach</div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.3/purify.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="/static/app.js?v=43"></script>
+<script src="/static/app.js?v=44"></script>
 </body>
 </html>

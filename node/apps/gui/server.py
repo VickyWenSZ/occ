@@ -29,7 +29,7 @@ from node.apps.cli.config import Config, save_openrouter_config
 from node.apps.gui import log_bus
 from node.deliberation.classifier import classify
 from node.deliberation.engine import DeliberationEngine
-from node.deliberation.tools import set_workspace
+from node.deliberation.tools import set_workspace, set_upload
 from node.expert_runtime.pack import load_all_packs, load_pack, MultiPackRetriever
 
 app = FastAPI()
@@ -155,6 +155,9 @@ def _init():
     workspace = ROOT / "workspace"
     workspace.mkdir(exist_ok=True)
     set_workspace(workspace)
+    upload = ROOT / "upload"
+    upload.mkdir(exist_ok=True)
+    set_upload(upload)
 
     if _cfg.pack_name:
         pack_path = _cfg.packs_root / _cfg.pack_name
@@ -182,6 +185,7 @@ def _init():
         workspace=workspace,
         openrouter_key=_cfg.openrouter_api_key,
         openrouter_model=_cfg.openrouter_model,
+        skills_dir=ROOT / "skills",
     )
 
     _ready = True
@@ -360,22 +364,45 @@ async def update_app(background_tasks: BackgroundTasks):
     if "Already up to date" in git_out or "Already up-to-date" in git_out:
         return {"updated": False, "message": "Already up to date."}
 
-    pip = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "pip", "install", "-r",
-        str(ROOT / "node" / "requirements.txt"), "-q",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await pip.communicate()
+    # Pick the right Python for pip install + restart:
+    #   - If a venv exists (.venv/), always use it (the canonical OCC interpreter).
+    #   - Otherwise fall back to the current process Python and warn the user
+    #     that next launch will trigger the venv migration (handled by launch.bat).
+    if os.name == "nt":
+        venv_python = ROOT / ".venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = ROOT / ".venv" / "bin" / "python"
 
-    background_tasks.add_task(_restart_server)
-    return {"updated": True, "message": git_out}
+    target_python = str(venv_python) if venv_python.exists() else sys.executable
+    venv_missing_warning = ""
+
+    if venv_python.exists():
+        pip = await asyncio.create_subprocess_exec(
+            target_python, "-m", "pip", "install", "-r",
+            str(ROOT / "node" / "requirements.txt"), "-q",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await pip.communicate()
+    else:
+        # Skip pip install — system Python likely lacks write perms (the very
+        # reason we moved to a venv). The new launch.bat / launch.sh detect
+        # the missing venv and run start.bat to migrate on next launch.
+        venv_missing_warning = (
+            "\n\nNote: this OCC was installed before the venv migration. "
+            "Close OCC and reopen it from the Desktop shortcut — the next "
+            "launch will set up the new environment and install dependencies."
+        )
+
+    background_tasks.add_task(_restart_server, target_python)
+    return {"updated": True, "message": git_out + venv_missing_warning}
 
 
-def _restart_server():
+def _restart_server(target_python: str = ""):
     import time
     time.sleep(1.5)
-    os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+    py = target_python or sys.executable
+    os.execv(py, [py, str(Path(__file__).resolve())])
 
 
 # ── Forge run registry ────────────────────────────────────────────────────────
@@ -604,9 +631,15 @@ async def forge_list_packs():
                         sources = mf.get("sources", [])
                     except Exception:
                         pass
+                raw_articles_dir = pack_dir / "raw" / "articles"
+                raw_count = sum(
+                    1 for f in raw_articles_dir.glob("*.md")
+                    if f.name != "_index.md"
+                ) if raw_articles_dir.exists() else 0
                 result.append({
                     "name": pack_dir.name,
                     "source_count": len(sources),
+                    "raw_count": raw_count,
                     "sources": [
                         {"url": s.get("url", "?"), "fetched": s.get("fetched", "?")}
                         for s in sources
@@ -696,6 +729,7 @@ def _forge_run_core(body: "ForgeRunBody"):
 
     rebuild   = body.mode == "rebuild"
     recompile = body.mode == "recompile"
+    resume    = body.mode == "resume"
 
     if rebuild:
         concepts_dir = wiki_dir / "concepts"
@@ -721,6 +755,13 @@ def _forge_run_core(body: "ForgeRunBody"):
             shutil.rmtree(concepts_dir)
             yield "🗑️ Wiki pages cleared — recompiling from existing raw/ (no re-fetch)."
         mf = manifest.load_or_create(pack_dir, pack_name)
+    elif resume:
+        # Pick up where a previous interrupted run left off:
+        # - Keep existing wiki/concepts (89 pages from a 3-hour run mustn't be lost)
+        # - Load all raws from disk (same as recompile)
+        # - Skip sources already recorded in wiki/log.md (the per-source completion marker)
+        # - Let the existing post-process pass cross-link straggler pages with placeholders
+        mf = manifest.load_or_create(pack_dir, pack_name)
     else:
         mf = manifest.load_or_create(pack_dir, pack_name)
 
@@ -744,17 +785,30 @@ def _forge_run_core(body: "ForgeRunBody"):
 
     pdf_vision_model = extract_model if body.fetch_images else None
 
-    # ── Recompile mode: load existing raw sources, ignore any new input ───────
-    if recompile:
+    # ── Recompile / Resume modes: load existing raw sources, ignore any new input ───
+    if recompile or resume:
         raw_articles = pack_dir / "raw" / "articles"
         if not raw_articles.exists():
-            yield "❌ Recompile requires existing raw/articles/ — none found. Use 'Add sources' first."
+            mode_label = "Recompile" if recompile else "Resume"
+            yield f"❌ {mode_label} requires existing raw/articles/ — none found. Use 'Add sources' first."
             return
         loaded = _load_existing_raws_as_sources(raw_articles)
         if not loaded:
             yield "❌ No usable raw sources found in raw/articles/."
             return
-        yield f"📚 Loaded {len(loaded)} existing raw source(s) for recompilation."
+        if resume:
+            completed = _completed_source_names_from_log(wiki_dir)
+            before = len(loaded)
+            loaded = [item for item in loaded if item[1] not in completed]
+            skipped = before - len(loaded)
+            if skipped:
+                yield f"🔁 Resume: {skipped} source(s) already complete (from log.md), {len(loaded)} remaining to process."
+            else:
+                yield f"🔁 Resume: no completed sources found in log.md — processing all {len(loaded)}."
+            if not loaded:
+                yield "✅ All sources already complete. Running post-process only (cross-link stragglers + index + summary)."
+        else:
+            yield f"📚 Loaded {len(loaded)} existing raw source(s) for recompilation."
         raw_sources.extend(loaded)
         # Skip body.files / body.urls / body.text — we are re-using raw only
     else:
@@ -924,39 +978,45 @@ def _forge_run_core(body: "ForgeRunBody"):
                         page_content = None
                         for attempt in range(3):
                             try:
-                                page_content = llm.synthesize_wiki_page(
+                                raw_out = llm.synthesize_wiki_page(
                                     concept, all_payload,
                                     available_images=available_images,
                                     model=write_model,
                                 )
+                                page_content = wiki._normalize_llm_page_output(raw_out)
                                 break
                             except Exception as e:
+                                page_content = None
                                 yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
                     else:
                         yield f"✍️  Enriching: {title}..."
                         page_content = None
                         for attempt in range(3):
                             try:
-                                page_content = llm.update_wiki_page(
+                                raw_out = llm.update_wiki_page(
                                     concept, existing_content, text_content, source_name,
                                     raw_path=raw_path, available_images=available_images,
                                     model=write_model,
                                 )
+                                page_content = wiki._normalize_llm_page_output(raw_out)
                                 break
                             except Exception as e:
+                                page_content = None
                                 yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
                 else:
                     yield f"✍️  Writing: {title}..."
                     page_content = None
                     for attempt in range(3):
                         try:
-                            page_content = llm.write_wiki_page(
+                            raw_out = llm.write_wiki_page(
                                 concept, text_content, source_name,
                                 raw_path=raw_path, available_images=available_images,
                                 model=write_model,
                             )
+                            page_content = wiki._normalize_llm_page_output(raw_out)
                             break
                         except Exception as e:
+                            page_content = None
                             yield f"  ⏳ Attempt {attempt+1}/3 failed: {e} — retrying..."
 
                 if not page_content:
@@ -964,7 +1024,11 @@ def _forge_run_core(body: "ForgeRunBody"):
                     continue
 
                 if page_content.strip():
-                    wiki.write_page(wiki_dir, slug, page_content)
+                    try:
+                        wiki.write_page(wiki_dir, slug, page_content)
+                    except ValueError as e:
+                        yield f"  ❌ {title}: malformed LLM output ({e}) — skipping page"
+                        continue
                     entry = {"slug": slug, "title": title, "summary": concept.get("summary", "")}
                     if slug not in existing_slugs:
                         all_pages.append(entry)
@@ -983,16 +1047,41 @@ def _forge_run_core(body: "ForgeRunBody"):
 
             manifest.add_source(mf, source_url, sources.sha256(text_content))
             wiki.append_log(wiki_dir, source_name, written, source_url)
+            # Persist manifest immediately so a mid-run crash leaves an
+            # accurate "what's done" record on disk. Was previously saved
+            # only at the very end of the run — meaning a 3-hour run that
+            # hung on the 13th source left an empty manifest.
+            manifest.save(pack_dir, mf)
 
         # Cross-link pass — connect newly-written pages to the rest of the wiki.
         # Re-scan from disk first: `all_pages` holds the concept-extractor's
         # title/summary, but write_wiki_page rewrites both in the final
         # frontmatter. Using the in-memory list would feed the cross-link LLM
         # stale labels (and produce malformed wikilinks).
-        if touched_slugs and len(all_pages) > 1:
-            yield f"\n🔗 Cross-linking {len(touched_slugs)} touched pages ({extract_model})..."
-            disk_pages = wiki.scan_existing_pages(wiki_dir)
-            for slug in sorted(touched_slugs):
+        # Straggler recovery: also pick up any page still bearing the
+        # placeholder `_To be linked after compilation._` — those are leftover
+        # from a previous session that was interrupted before its cross-link
+        # pass could run. This makes the pipeline self-healing across restarts.
+        disk_pages = wiki.scan_existing_pages(wiki_dir)
+        slugs_needing_link: set[str] = set(touched_slugs)
+        placeholder = "_To be linked after compilation._"
+        for p in disk_pages:
+            page_path = wiki_dir / "concepts" / wiki._slug_to_filename(p["slug"])
+            if not page_path.exists():
+                continue
+            try:
+                if placeholder in page_path.read_text(encoding="utf-8"):
+                    slugs_needing_link.add(p["slug"])
+            except Exception:
+                pass
+
+        if slugs_needing_link and len(disk_pages) > 1:
+            stragglers = slugs_needing_link - touched_slugs
+            label = f"{len(slugs_needing_link)} pages"
+            if stragglers:
+                label += f" ({len(touched_slugs)} new + {len(stragglers)} straggler{'s' if len(stragglers) != 1 else ''})"
+            yield f"\n🔗 Cross-linking {label} ({extract_model})..."
+            for slug in sorted(slugs_needing_link):
                 page = next((p for p in disk_pages if p["slug"] == slug), None)
                 if not page:
                     continue
@@ -1012,6 +1101,31 @@ def _forge_run_core(body: "ForgeRunBody"):
 
         fresh_pages = wiki.scan_existing_pages(wiki_dir)
         wiki.update_index(wiki_dir, fresh_pages)
+
+        # Auto-finalize: run mechanical lint with fix=True until it converges.
+        # The cross-link pass adds A→B but not B→A — the lint's autofix layer
+        # writes reciprocal back-links and normalizes near-duplicate tags.
+        # Looping handles cascading fixes (a new back-link may itself need
+        # back-linking). Caps at 4 iterations so a pathological cycle can't
+        # loop forever.
+        try:
+            from forge._lint import run_structural_checks as _lint_run
+            yield "\n🔧 Auto-finalize: normalizing cross-references and tags..."
+            for pass_num in range(1, 5):
+                _issues, _summ = _lint_run(wiki_dir, pack_dir, fix=True)
+                fixed = _summ.get("fixed", 0)
+                if fixed == 0:
+                    break
+                yield f"  ↻ pass {pass_num}: auto-fixed {fixed} issue(s)"
+            _, final_summ = _lint_run(wiki_dir, pack_dir, fix=False)
+            yield (
+                f"  ✅ Lint converged: "
+                f"{final_summ.get('critical', 0)} critical, "
+                f"{final_summ.get('warning', 0)} warning, "
+                f"{final_summ.get('suggestion', 0)} suggestion."
+            )
+        except Exception as e:
+            yield f"  ⚠️ Auto-finalize lint skipped: {e}"
 
         if fresh_pages:
             try:
@@ -1081,6 +1195,31 @@ def _build_sources_payload(
         payload.append({"name": name, "text": body, "raw_path": s_path})
     payload.append({"name": new_source_name, "text": new_text, "raw_path": new_raw_path})
     return payload
+
+
+def _completed_source_names_from_log(wiki_dir: Path) -> set[str]:
+    """
+    Parse `wiki/log.md` to recover the set of source names that have already
+    been processed end-to-end by a previous Forge run. The log is appended by
+    `wiki.append_log` only AFTER all concepts from a source are written, so
+    presence here is a reliable "this source is done" marker even when the
+    run crashed before saving the manifest.
+
+    Entry format produced by append_log:
+        ## [YYYY-MM-DD] ingest | <source-name>
+
+    Returns an empty set if log.md does not exist or contains no entries.
+    """
+    import re as _re
+    log_path = wiki_dir / "log.md"
+    if not log_path.exists():
+        return set()
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return set()
+    pattern = _re.compile(r"^##\s+\[[^\]]+\]\s+ingest\s+\|\s+(.+?)\s*$", _re.MULTILINE)
+    return {m.group(1) for m in pattern.finditer(text)}
 
 
 def _load_existing_raws_as_sources(raw_articles_dir: Path) -> list[tuple]:
@@ -1348,6 +1487,7 @@ async def forge_reload_packs():
         openrouter_key=_cfg.openrouter_api_key,
         openrouter_model=_cfg.openrouter_model,
         local_mode=_cfg.local_mode,
+        skills_dir=ROOT / "skills",
     )
     n = len(_retriever.packs)
     log_bus.write(f"[GUI] Packs reloaded: {n} pack(s)")
@@ -1851,6 +1991,25 @@ async def get_chat(chat_id: str):
 async def delete_chat(chat_id: str):
     chats = [c for c in _load_chats() if c["id"] != chat_id]
     _save_chats(chats)
+
+    # Disk cleanup: delete the chat's uploaded files from upload/, but ONLY if
+    # no other chat still references them (same filename uploaded in two chats
+    # = single file on disk; don't break the other chat).
+    files_to_check = _CHAT_UPLOADS.pop(chat_id, set())
+    still_referenced: set[str] = set()
+    for other_files in _CHAT_UPLOADS.values():
+        still_referenced.update(other_files)
+
+    upload_root = (ROOT / "upload").resolve()
+    for filename in files_to_check - still_referenced:
+        try:
+            target = (upload_root / filename).resolve()
+            if str(target).startswith(str(upload_root)) and target.is_file():
+                target.unlink()
+        except Exception:
+            pass
+
+    _CHAT_STOPS.pop(chat_id, None)
     return {"ok": True}
 
 
@@ -1899,6 +2058,13 @@ class QueryBody(BaseModel):
 # and breaks the loop cleanly so the partial answer still gets saved.
 _CHAT_STOPS: dict[str, threading.Event] = {}
 
+# Per-chat-id set of binary files uploaded into the upload/ folder during the
+# session. Once a chat has any binary upload (PDF/DOCX/XLSX/audio), follow-up
+# messages in that chat must stay in "chat" mode (tools available) so the
+# model can re-read the files when the user references them. Cleared on chat
+# delete.
+_CHAT_UPLOADS: dict[str, set[str]] = {}
+
 
 @app.post("/api/chats/{chat_id}/stop")
 async def stop_chat_stream(chat_id: str):
@@ -1916,21 +2082,58 @@ async def chat_query(chat_id: str, body: QueryBody):
     if not _get_chat(chat_id):
         raise HTTPException(404, "Chat not found")
 
-    # Resolve attachments: images → base64 list, text files → appended to query
+    # Resolve attachments:
+    #   images        → base64 list (passed to model as multimodal input)
+    #   binary docs   → saved to workspace/, hint injected so the model calls the right tool
+    #   text files    → inlined into the query as [File: ...]
     images_b64: list[str] = []
     text_suffix = ""
+    uploaded_files: list[str] = []
+    upload_dir = ROOT / "upload"
+    BINARY_EXTS = {".pdf", ".docx", ".xlsx", ".mp3", ".wav", ".m4a", ".ogg", ".flac"}
     for att in body.attachments:
         mime = att.get("type", "")
+        name = att.get("name", "file")
         data = att.get("data", "")
         raw = data.split(",", 1)[-1] if "," in data else data
+        ext = Path(name).suffix.lower()
         if mime.startswith("image/"):
             images_b64.append(raw)
+        elif mime.startswith("audio/") or ext in BINARY_EXTS:
+            try:
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                target = upload_dir / name
+                target.write_bytes(base64.b64decode(raw))
+                uploaded_files.append(name)
+            except Exception:
+                pass
         else:
             try:
                 content = base64.b64decode(raw).decode("utf-8", errors="replace")
-                text_suffix += f"\n\n[File: {att.get('name', 'file')}]\n{content}"
+                text_suffix += f"\n\n[File: {name}]\n{content}"
             except Exception:
                 pass
+
+    # Track uploads at chat level so follow-up messages (without new attachments)
+    # still know which files exist in upload/ and can re-read them on demand.
+    if uploaded_files:
+        _CHAT_UPLOADS.setdefault(chat_id, set()).update(uploaded_files)
+
+    known_files = _CHAT_UPLOADS.get(chat_id, set())
+    if known_files:
+        text_suffix += (
+            "\n\n[Files available in upload folder for this chat: "
+            + ", ".join(sorted(known_files))
+            + ". Use read_pdf / read_docx / read_xlsx / transcribe_audio to "
+            "(re-)read them whenever the user refers to their content. "
+            "IMPORTANT: this chat is dedicated to analyzing the attached files. "
+            "If the user asks something clearly unrelated (general knowledge, "
+            "history, science, current events, unrelated technical topics), do "
+            "NOT answer from your own training — instead reply briefly in the "
+            "user's language with a polite suggestion to open a new chat for "
+            "that question, because the knowledge-retrieval pipeline is "
+            "available only in chats without file uploads.]"
+        )
 
     full_query = body.message + text_suffix
 
@@ -1941,10 +2144,24 @@ async def chat_query(chat_id: str, body: QueryBody):
         loop = asyncio.get_event_loop()
         q: asyncio.Queue = asyncio.Queue()
 
-        # Classify mode in thread pool
+        # Classify mode in thread pool. Override: if this chat has had any
+        # binary upload, stay in chat mode so atomic tools (read_pdf,
+        # read_xlsx, transcribe_audio, ...) remain reachable for follow-up
+        # references.
+        # Otherwise the two-stage classifier returns one of:
+        #   'chat'           — atomic tools / social / meta
+        #   'deliberate'     — knowledge retrieval pipeline
+        #   'skill:<name>'   — a specific orchestrated skill (e.g. 'skill:web_research')
+        # All three modes are passed through to the engine, which has a
+        # dedicated branch for each.
         mode = body.mode
         if mode == "auto":
-            mode = await loop.run_in_executor(None, classify, _model, full_query)
+            if known_files:
+                mode = "chat"
+            else:
+                skill_reg = _engine._skill_registry if _engine is not None else None
+                mode = await loop.run_in_executor(None, classify, _model, full_query, skill_reg)
+                log_bus.write(f"[router] classified as '{mode}'")
 
         # Register a fresh stop event for this chat — overwrites any stale one.
         stop_event = threading.Event()
@@ -2156,6 +2373,7 @@ async def run_command(body: CommandBody):
             workspace=ROOT / "workspace",
             openrouter_key=_cfg.openrouter_api_key,
             openrouter_model=_cfg.openrouter_model,
+            skills_dir=ROOT / "skills",
         )
         return {"output": f"Switched to {new_model}"}
 
@@ -2174,6 +2392,7 @@ async def run_command(body: CommandBody):
             workspace=ROOT / "workspace",
             openrouter_key=_cfg.openrouter_api_key,
             openrouter_model=_cfg.openrouter_model,
+            skills_dir=ROOT / "skills",
         )
         return {"output": f"Loaded pack: {pack_name}  ·  domains: {', '.join(_retriever.domains)}"}
 

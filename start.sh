@@ -21,6 +21,20 @@ if ! command -v python3 &>/dev/null; then
 fi
 echo " [OK] Python found."
 
+# ── 1b. Create virtual environment if missing ─────────────────────────────────
+if [ ! -f ".venv/bin/python" ] && [ ! -f ".venv/bin/python3" ]; then
+    echo " Creating virtual environment .venv/ (one-time, ~10 seconds)..."
+    python3 -m venv .venv
+    if [ $? -ne 0 ]; then
+        echo " [!] Failed to create virtual environment."
+        exit 1
+    fi
+    echo " [OK] Virtual environment created."
+    .venv/bin/python -m pip install --upgrade pip --quiet 2>/dev/null
+fi
+PY=".venv/bin/python"
+echo " [OK] Using Python from .venv/"
+
 # ── 2. Ollama ─────────────────────────────────────────────────────────────────
 if ! command -v ollama &>/dev/null; then
     echo " [!] Ollama not found."
@@ -40,9 +54,18 @@ if ! command -v ollama &>/dev/null; then
 fi
 echo " [OK] Ollama found."
 
+# ── 2b. Kill any running OCC server (would lock pip-managed files) ───────────
+if [[ "$OS" == "Darwin" ]]; then
+    lsof -ti TCP:7891 -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || true
+else
+    lsof -ti TCP:7891 -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || \
+    fuser -k 7891/tcp 2>/dev/null || true
+fi
+sleep 1
+
 # ── 3. Python dependencies ────────────────────────────────────────────────────
 echo " Installing dependencies (skipped if already up to date)..."
-python3 -m pip install -r node/requirements.txt -q
+$PY -m pip install -r node/requirements.txt -q
 if [ $? -ne 0 ]; then
     echo " [!] Failed to install dependencies. Check your internet connection."
     exit 1
@@ -51,7 +74,7 @@ echo " [OK] Dependencies ready."
 
 # ── 4. Detect model ───────────────────────────────────────────────────────────
 echo " Detecting hardware..."
-OCC_MODEL=$(python3 -c "from node.hardware import get_profile; print(get_profile()['model'])" 2>/dev/null)
+OCC_MODEL=$($PY -c "from node.hardware import get_profile; print(get_profile()['model'])" 2>/dev/null)
 if [ -z "$OCC_MODEL" ]; then
     echo " [!] Could not detect hardware profile."
     exit 1
@@ -89,13 +112,22 @@ else
     echo " [OK] Model already installed."
 fi
 
+# ── 7b. Pre-download Whisper model (audio transcription) ─────────────────────
+echo " Pre-loading audio transcription model (Whisper base, ~140MB on first run)..."
+$PY -c "from faster_whisper import WhisperModel; WhisperModel('base')" &>/dev/null
+if [ $? -ne 0 ]; then
+    echo " [!] Whisper preload failed (non-critical, will retry on first audio use)."
+else
+    echo " [OK] Whisper model ready."
+fi
+
 # ── 8. Generate icons ─────────────────────────────────────────────────────────
 echo " Generating icons..."
-python3 make_icons.py || echo " [!] Icon generation failed (non-critical, continuing)."
+$PY make_icons.py || echo " [!] Icon generation failed (non-critical, continuing)."
 
 # ── 9. Create desktop shortcut ────────────────────────────────────────────────
 echo " Creating desktop shortcut..."
-python3 setup_shortcut.py || echo " [!] Shortcut creation failed (non-critical, continuing)."
+$PY setup_shortcut.py || echo " [!] Shortcut creation failed (non-critical, continuing)."
 chmod +x launch.sh 2>/dev/null || true
 
 # ── 10. Start GUI ─────────────────────────────────────────────────────────────
@@ -103,4 +135,4 @@ echo ""
 echo " Starting OCC Node..."
 echo " Opening browser at http://localhost:7891"
 echo ""
-python3 node/apps/gui/server.py
+$PY node/apps/gui/server.py

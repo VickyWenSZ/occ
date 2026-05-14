@@ -8,11 +8,17 @@ import re
 from pathlib import Path
 
 _WORKSPACE: Path | None = None
+_UPLOAD: Path | None = None
 
 
 def set_workspace(path: Path):
     global _WORKSPACE
     _WORKSPACE = path
+
+
+def set_upload(path: Path):
+    global _UPLOAD
+    _UPLOAD = path
 
 
 def _safe_path(filename: str) -> Path:
@@ -22,6 +28,26 @@ def _safe_path(filename: str) -> Path:
     if not str(resolved).startswith(str(_WORKSPACE.resolve())):
         raise ValueError(f"Path '{filename}' escapes the workspace.")
     return resolved
+
+
+def _safe_upload_path(filename: str) -> Path:
+    if _UPLOAD is None:
+        raise RuntimeError("Upload folder not initialized.")
+    resolved = (_UPLOAD / filename).resolve()
+    if not str(resolved).startswith(str(_UPLOAD.resolve())):
+        raise ValueError(f"Path '{filename}' escapes the upload folder.")
+    return resolved
+
+
+def list_upload_files() -> list[str]:
+    """Return filenames currently in the upload folder, excluding dotfiles
+    and .gitkeep. Used by skills that need to enumerate user-uploaded files."""
+    if _UPLOAD is None or not _UPLOAD.exists():
+        return []
+    return sorted(
+        f.name for f in _UPLOAD.iterdir()
+        if f.is_file() and not f.name.startswith(".")
+    )
 
 _URL_RE = re.compile(r'https?://\S+')
 
@@ -110,26 +136,58 @@ def web_search(query: str, max_results: int = 5) -> str:
 
 
 def fetch_url(url: str) -> str:
-    import requests
-    from bs4 import BeautifulSoup
+    """Fetch a URL and return its main text content.
+
+    Two-stage extraction:
+      1. trafilatura (best-quality main-content extraction).
+      2. If trafilatura returns nothing (JS-heavy SPA, paywall stub, etc.),
+         fall back to a crude HTML strip so we at least return *some* text
+         instead of an empty result.
+    """
+    import re
+    import httpx
+    import trafilatura
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        # Trim to avoid flooding context
-        return text[:8000] if len(text) > 8000 else text
+        with httpx.Client(
+            timeout=15.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; OCC/1.0)",
+                "Accept-Language": "it,en;q=0.9",
+            },
+        ) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return f"HTTP {e.response.status_code} on {url}"
+    except httpx.TimeoutException:
+        return f"Timeout fetching {url} (15s)"
     except Exception as e:
-        return f"Could not fetch URL: {e}"
+        return f"Could not fetch URL ({type(e).__name__}): {e}"
+
+    html = resp.text
+    text = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
+    if text.strip():
+        return text[:8000] if len(text) > 8000 else text
+
+    # Fallback: trafilatura returned empty (paywall, SPA, anti-bot stub).
+    # Strip script/style blocks then strip remaining tags.
+    cleaned = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return f"Could not extract readable text from {url} (page returned empty after both extractors)."
+    # Tag the fallback so Qwen knows this is rough
+    return ("[fallback extraction — main-content extractor returned empty]\n"
+            + (cleaned[:8000] if len(cleaned) > 8000 else cleaned))
 
 
 def read_file(filename: str) -> str:
     try:
-        path = _safe_path(filename)
+        path = _safe_upload_path(filename)
         if not path.exists():
-            return f"File '{filename}' not found in workspace."
+            return f"File '{filename}' not found in upload folder."
         return path.read_text(encoding="utf-8")
     except ValueError as e:
         return str(e)
@@ -191,6 +249,145 @@ def run_code(code: str) -> str:
         return "Error: code execution timed out (30s limit)."
     except Exception as e:
         return f"Error running code: {e}"
+
+
+# ── Document readers (PDF / DOCX / XLSX) ───────────────────────────────────────
+
+_DOC_READ_LIMIT = 6000  # max chars returned to keep tool result inside chat ctx
+
+
+def read_pdf(filename: str) -> str:
+    try:
+        path = _safe_upload_path(filename)
+        if not path.exists():
+            return f"File '{filename}' not found in upload folder."
+        import fitz  # PyMuPDF
+        doc = fitz.open(str(path))
+        try:
+            parts = []
+            total = 0
+            for page in doc:
+                t = page.get_text()
+                if not t:
+                    continue
+                parts.append(t)
+                total += len(t)
+                if total >= _DOC_READ_LIMIT:
+                    break
+            text = "\n\n".join(parts)
+        finally:
+            doc.close()
+        if not text.strip():
+            return f"PDF '{filename}' has no extractable text (possibly scanned)."
+        if len(text) > _DOC_READ_LIMIT:
+            text = text[:_DOC_READ_LIMIT] + "\n\n[...truncated]"
+        return text
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error reading PDF: {e}"
+
+
+def read_docx(filename: str) -> str:
+    try:
+        path = _safe_upload_path(filename)
+        if not path.exists():
+            return f"File '{filename}' not found in upload folder."
+        from docx import Document
+        doc = Document(str(path))
+        parts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                parts.append(" | ".join(cells))
+        text = "\n".join(parts)
+        if not text.strip():
+            return f"Document '{filename}' is empty."
+        if len(text) > _DOC_READ_LIMIT:
+            text = text[:_DOC_READ_LIMIT] + "\n\n[...truncated]"
+        return text
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error reading docx: {e}"
+
+
+def read_xlsx(filename: str) -> str:
+    try:
+        path = _safe_upload_path(filename)
+        if not path.exists():
+            return f"File '{filename}' not found in upload folder."
+        from openpyxl import load_workbook
+        wb = load_workbook(str(path), data_only=True, read_only=True)
+        try:
+            parts = []
+            running = 0
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                header = f"--- Sheet: {sheet_name} ---"
+                parts.append(header)
+                running += len(header)
+                for row in sheet.iter_rows(values_only=True):
+                    row_str = "\t".join("" if v is None else str(v) for v in row)
+                    if not row_str.strip():
+                        continue
+                    parts.append(row_str)
+                    running += len(row_str)
+                    if running >= _DOC_READ_LIMIT:
+                        break
+                if running >= _DOC_READ_LIMIT:
+                    break
+        finally:
+            wb.close()
+        text = "\n".join(parts)
+        if not text.strip():
+            return f"Workbook '{filename}' is empty."
+        if len(text) > _DOC_READ_LIMIT:
+            text = text[:_DOC_READ_LIMIT] + "\n\n[...truncated]"
+        return text
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error reading xlsx: {e}"
+
+
+# ── Audio transcription (Whisper) ──────────────────────────────────────────────
+
+_WHISPER_MODEL = None
+
+
+def _get_whisper_model():
+    """Lazy-load the Whisper model; downloaded once on first use."""
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        import os
+        from faster_whisper import WhisperModel
+        model_size = os.environ.get("OCC_WHISPER_MODEL", "base")
+        device = os.environ.get("OCC_WHISPER_DEVICE", "cpu")
+        compute_type = "int8" if device == "cpu" else "float16"
+        _WHISPER_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
+    return _WHISPER_MODEL
+
+
+def transcribe_audio(filename: str) -> str:
+    try:
+        path = _safe_upload_path(filename)
+        if not path.exists():
+            return f"Audio file '{filename}' not found in upload folder."
+        model = _get_whisper_model()
+        segments, info = model.transcribe(str(path), beam_size=5)
+        parts = [seg.text.strip() for seg in segments if seg.text and seg.text.strip()]
+        if not parts:
+            return f"No speech detected in '{filename}'."
+        text = " ".join(parts)
+        return f"[language: {info.language}, duration: {info.duration:.1f}s]\n\n{text}"
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error transcribing audio: {e}"
 
 
 TOOL_SCHEMA = [
@@ -287,6 +484,65 @@ TOOL_SCHEMA += [
     },
 ]
 
+TOOL_SCHEMA += [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_pdf",
+            "description": "Read text content from a PDF file in the upload folder. Use when the user asks to read, summarize, or answer questions about a PDF document they attached.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Filename of the uploaded PDF (e.g. 'report.pdf')"},
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_docx",
+            "description": "Read text content from a Microsoft Word .docx file in the upload folder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Filename of the uploaded .docx (e.g. 'document.docx')"},
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_xlsx",
+            "description": "Read cell contents from a Microsoft Excel .xlsx file in the upload folder. Returns all sheets with rows as tab-separated values.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Filename of the uploaded .xlsx (e.g. 'data.xlsx')"},
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transcribe_audio",
+            "description": "Transcribe an audio file in the upload folder to text using Whisper. Supports common formats (mp3, wav, m4a, ogg, flac).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Filename of the uploaded audio (e.g. 'recording.mp3')"},
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+]
+
 TOOL_FUNCTIONS = {
     "web_search": web_search,
     "fetch_url": fetch_url,
@@ -294,4 +550,8 @@ TOOL_FUNCTIONS = {
     "write_file": write_file,
     "list_files": list_files,
     "run_code": run_code,
+    "read_pdf": read_pdf,
+    "read_docx": read_docx,
+    "read_xlsx": read_xlsx,
+    "transcribe_audio": transcribe_audio,
 }

@@ -14,6 +14,8 @@ Thumbs.db
 _refs/
 workspace/*
 !workspace/.gitkeep
+upload/*
+!upload/.gitkeep
 .claude/
 deliberation_log.md
 **/embeddings.json

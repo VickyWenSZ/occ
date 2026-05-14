@@ -29,6 +29,14 @@ def _tool_status(fn_name: str, fn_args: dict) -> str:
         return "Listing workspace files..."
     if fn_name == "run_code":
         return "Running code..."
+    if fn_name == "read_pdf":
+        return f"Reading PDF: {fn_args.get('filename', '')}..."
+    if fn_name == "read_docx":
+        return f"Reading Word document: {fn_args.get('filename', '')}..."
+    if fn_name == "read_xlsx":
+        return f"Reading Excel workbook: {fn_args.get('filename', '')}..."
+    if fn_name == "transcribe_audio":
+        return f"Transcribing audio: {fn_args.get('filename', '')}..."
     if fn_name == "fetch_full_page":
         return f"Critic verifying source: {fn_args.get('file', '')}..."
     return f"Running {fn_name}..."
@@ -42,6 +50,10 @@ def _tool_label(fn_name: str) -> str:
         "write_file": "FILE",
         "list_files": "FILE",
         "run_code":   "CODE",
+        "read_pdf":   "PDF",
+        "read_docx":  "DOCX",
+        "read_xlsx":  "XLSX",
+        "transcribe_audio": "AUDIO",
         "fetch_full_page": "VERIFY",
     }.get(fn_name, fn_name.upper())
 
@@ -134,6 +146,7 @@ class DeliberationEngine:
         openrouter_model: str = "",
         local_mode: bool = False,
         vram_used_mb: int = 0,
+        skills_dir=None,
     ):
         self.model = model
         self.or_key = openrouter_key
@@ -144,6 +157,15 @@ class DeliberationEngine:
         self.num_ctx_answer = num_ctx_answer
         self.num_ctx_synth = num_ctx_synth
         self._retrieval_chars_local = retrieval_chars
+
+        # Load skills from skills/ if the directory was passed. Adding/removing
+        # a skill is just adding/removing a *.py file in that directory.
+        self._skill_registry = None
+        if skills_dir is not None:
+            from node.deliberation.skills import REGISTRY, load_skills_from_dir
+            n_loaded = load_skills_from_dir(skills_dir)
+            _log(f"[skills] loaded {n_loaded} skill(s): {REGISTRY.names()}")
+            self._skill_registry = REGISTRY
 
         today = datetime.now().strftime("%B %d, %Y")
         parts = [_OCC_IDENTITY, f"Today's date is {today}."]
@@ -161,6 +183,11 @@ class DeliberationEngine:
             "Use them ONLY when the user explicitly asks to search the web, look "
             "something up online, or fetch a URL."
         )
+        # Note: skills are NOT exposed to Qwen in chat mode. They live in their
+        # own routing path (mode='skill:<name>') chosen by the two-stage
+        # classifier. Keeping them out of chat mode means Qwen only sees
+        # atomic tools (web_search, read_pdf, run_code, ...) and never has to
+        # disambiguate between "use web_search" vs "use skill_web_research".
         self._chat_system = " ".join(parts)
         self._history: list[dict] = []
         self._last_ctx_used: int = 0
@@ -188,9 +215,30 @@ class DeliberationEngine:
     # ─── Public entry point ───────────────────────────────────────────────────
 
     def route_stream(self, query: str, mode: str = "deliberate", images: list | None = None):
-        if mode == "chat":
+        # Chitchat: pure social/meta. No tools exposed, no retrieval — just a
+        # streaming LLM call so 'ciao' / 'thanks' / 'who are you' don't pay
+        # for tool schema overhead and Qwen can't spuriously call anything.
+        if mode == "chitchat":
+            yield ("routing", "chat")
+            yield from self._stream_chat_only(query, images=images)
+            return
+
+        # Tools mode (also accepts legacy 'chat' alias): atomic tools exposed
+        # to Qwen (web_search, fetch_url, read_pdf, run_code, ...). Qwen
+        # picks which tool to call.
+        if mode in ("tools", "chat"):
             yield ("routing", "chat")
             yield from self._stream_with_tools(self._chat_system, query, temperature=0.7, images=images)
+            return
+
+        # Skill mode: classifier picked a specific orchestrated skill via the
+        # Stage-2 router. Execute it directly (no Qwen tool-selection in the
+        # loop), forward the skill's intermediate status events to the UI,
+        # then stream a final answer grounded on the skill's result.
+        if mode.startswith("skill:"):
+            skill_name = mode[len("skill:"):]
+            yield ("routing", "chat")
+            yield from self._run_skill(skill_name, query, images=images)
             return
 
         # Local mode: uses private packs, no server, no peers
@@ -1316,6 +1364,11 @@ class DeliberationEngine:
         # tools are always available. The gate is the user's CURRENT message,
         # not history — explicit consent is per-turn.
         allowed_schema, allowed_fn_names = get_allowed_tools(prompt)
+        # Chat mode exposes ONLY atomic tools to Qwen. Skills are reachable
+        # via a separate route (mode='skill:<name>') chosen by the two-stage
+        # classifier; they never appear in the chat tool list to avoid
+        # forcing Qwen to disambiguate atomic-vs-orchestrated.
+        skill_names: set[str] = set()
 
         user_msg: dict = {"role": "user", "content": prompt}
         if images:
@@ -1355,11 +1408,57 @@ class DeliberationEngine:
                     )
                     messages.append(resp.tool_result(tc, result))
                     continue
+                # Skill dispatch (when fn_name is a registered skill).
+                # Skill.run() may return either a str (trivial skills) or an
+                # iterator of (kind, value) events (multi-step skills that
+                # want to stream progress to the UI). The final result MUST
+                # be either the returned str or a yielded ('result', text).
+                if fn_name in skill_names:
+                    skill = self._skill_registry.get(fn_name)
+                    yield ("status", f"Running skill: {skill.name}...")
+                    yield ("tool_used", f"SKILL:{skill.name.upper()}")
+                    _log(f"[skills] {fn_name} START args={list(fn_args.keys())}")
+                    result = ""
+                    try:
+                        out = skill.run(fn_args)
+                        if isinstance(out, str):
+                            result = out
+                        else:
+                            # Iterator: forward all non-result events to UI,
+                            # capture the final 'result' as the model-facing text.
+                            for ev in out:
+                                if not (isinstance(ev, tuple) and len(ev) == 2):
+                                    continue
+                                kind, value = ev
+                                if kind == "result":
+                                    result = value
+                                else:
+                                    yield ev
+                        _log(f"[skills] {fn_name} OK ({len(result)} chars)")
+                    except Exception as e:
+                        result = f"Error running skill {fn_name}: {e}"
+                        _log(f"[skills] {fn_name} FAIL: {e}")
+                    # Harvest any web sources the skill embedded in its output
+                    # (lines like "**Title**" + "Source: http..." — same
+                    # format web_search emits). Populates the UI Sources panel
+                    # automatically without a special return type per skill.
+                    web_sources.extend(self._parse_web_sources(result))
+                    yield ("status", "Generating response...")
+                    messages.append(resp.tool_result(tc, result))
+                    continue
+
                 fn = TOOL_FUNCTIONS.get(fn_name)
                 if fn:
                     yield ("status", _tool_status(fn_name, fn_args))
                     yield ("tool_used", _tool_label(fn_name))
-                    result = fn(**fn_args)
+                    _log(f"[tools] {fn_name} START args={list(fn_args.keys())}")
+                    try:
+                        result = fn(**fn_args)
+                        _log(f"[tools] {fn_name} OK ({len(result)} chars)")
+                    except Exception as e:
+                        result = f"Error running {fn_name}: {e}"
+                        _log(f"[tools] {fn_name} FAIL: {e}")
+                    yield ("status", "Generating response...")
                     if fn_name == "web_search":
                         web_sources.extend(self._parse_web_sources(result))
                     elif fn_name == "fetch_url":
@@ -1369,3 +1468,121 @@ class DeliberationEngine:
                 else:
                     result = f"Unknown tool: {fn_name}"
                 messages.append(resp.tool_result(tc, result))
+            _log(f"[tools] LLM call after tool result (ctx~{self._measure_ctx(messages)} tok)")
+
+    # ─── Chitchat mode (no tools, no retrieval) ───────────────────────────────
+
+    def _stream_chat_only(self, query: str, images: list | None = None):
+        """Pure streaming LLM call for social / meta messages. No tool schemas
+        in the prompt, no retrieval, no skill — just the assistant responding.
+        Saves ~hundreds of tokens of tool overhead and avoids Qwen spuriously
+        calling a tool on 'ciao'."""
+        from node.provider import stream as _provider_stream
+        user_msg: dict = {"role": "user", "content": query}
+        if images:
+            user_msg["images"] = images
+        messages = [
+            {"role": "system", "content": self._chat_system},
+            *self._history,
+            user_msg,
+        ]
+        self._peak_ctx_used = self._measure_ctx(messages)
+        chars = 0
+        for token in _provider_stream(
+            messages, self.model, self.or_key, self.or_model, 0.7, self.num_ctx_answer,
+        ):
+            chars += len(token)
+            yield ("token", token)
+        self._update_ctx(self._peak_ctx_used, chars // 3)
+
+
+    # ─── Skill mode (chosen by Stage-2 classifier) ────────────────────────────
+
+    def _run_skill(self, skill_name: str, query: str, images: list | None = None):
+        """Execute a specific skill end-to-end and stream events.
+
+        Flow:
+          1. Look up the skill in the registry.
+          2. Build args from query (each required string param gets the user
+             query verbatim — works for the current skills which take a
+             single 'query' / 'claim' / 'question' field).
+          3. Run the skill, forwarding intermediate ('status', ...) events to
+             the UI and capturing the final ('result', text).
+          4. Harvest any web sources embedded in the result for the Sources
+             panel.
+          5. Make a final streaming LLM call with the skill result as
+             grounded context, yielding tokens to the UI.
+        """
+        skill = self._skill_registry.get(skill_name) if self._skill_registry else None
+        if skill is None:
+            # Skill went away — degrade to chat mode (atomic tools only).
+            _log(f"[skills] {skill_name} not in registry, falling back to chat")
+            yield from self._stream_with_tools(self._chat_system, query, temperature=0.7, images=images)
+            return
+
+        yield ("status", f"Running skill: {skill.name}...")
+        yield ("tool_used", f"SKILL:{skill.name.upper()}")
+        _log(f"[skills] {skill_name} START (skill mode)")
+
+        # Args: required string params all get the user query verbatim.
+        args: dict = {}
+        props = skill.parameters.get("properties", {})
+        for pname in skill.parameters.get("required", []):
+            if props.get(pname, {}).get("type") == "string":
+                args[pname] = query
+
+        # Build a runtime context the skill can use for internal LLM calls
+        # (e.g. translating a query into the pack's language for retrieval).
+        from types import SimpleNamespace
+        ctx = SimpleNamespace(
+            model=self.model,
+            or_key=self.or_key,
+            or_model=self.or_model,
+        )
+        result = ""
+        try:
+            out = skill.run(args, ctx)
+            if isinstance(out, str):
+                result = out
+            else:
+                for ev in out:
+                    if not (isinstance(ev, tuple) and len(ev) == 2):
+                        continue
+                    kind, value = ev
+                    if kind == "result":
+                        result = value
+                    else:
+                        yield ev
+            _log(f"[skills] {skill_name} OK ({len(result)} chars)")
+        except Exception as e:
+            result = f"Error running skill {skill_name}: {e}"
+            _log(f"[skills] {skill_name} FAIL: {e}")
+
+        # Harvest web sources for the UI Sources panel (web_research /
+        # fact_check embed search results in their output text).
+        web_sources = self._parse_web_sources(result)
+        if web_sources:
+            yield ("peer_answers", {"mode": "web", "web_sources": web_sources})
+
+        # Final streaming LLM call: generate the user-facing answer with the
+        # skill result as grounded context.
+        yield ("status", "Generating response...")
+        from node.provider import stream as _provider_stream
+        user_msg: dict = {"role": "user", "content": query}
+        if images:
+            user_msg["images"] = images
+        messages = [
+            {"role": "system", "content": self._chat_system},
+            *self._history,
+            user_msg,
+            {"role": "user", "content": f"[Result of skill `{skill.name}`:]\n\n{result}"},
+        ]
+        self._peak_ctx_used = self._measure_ctx(messages)
+        full_text_chars = 0
+        for token in _provider_stream(
+            messages, self.model, self.or_key, self.or_model, 0.7, self.num_ctx_answer,
+        ):
+            full_text_chars += len(token)
+            yield ("token", token)
+        # Approximate completion-tokens from chars; prompt-tokens already in peak.
+        self._update_ctx(self._peak_ctx_used, full_text_chars // 3)
