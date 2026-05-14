@@ -209,10 +209,19 @@ class CodeInspectSkill(Skill):
         key_symbols = [s for s in context.get("key_symbols", []) if isinstance(s, str)][:5]
         _log(f"[code_inspect] language={language!r} framework={framework!r} symbols={key_symbols}")
 
-        # ── Step 3: pack retrieval (only if the language maps to a pack) ────
+        # ── Step 3: pack retrieval (only when it can actually help) ─────────
+        # Skip retrieval for intents that don't benefit from external docs:
+        #   - 'search' looks INSIDE the user's pasted code, not in a pack —
+        #     the pack has no idea what's in the user's codebase.
+        # Skip when no pack maps to the detected language.
         pack_scope = _LANG_TO_PACK.get(language)
         retrieval_text = ""
-        if pack_scope:
+        if intent == "search":
+            yield ("status",
+                "Skipping pack lookup for search — answering directly from "
+                "the code you provided."
+            )
+        elif pack_scope:
             yield ("status", f"Looking up '{pack_scope}' pack documentation...")
             keywords = _build_keywords(intent, context, query)
             _log(f"[code_inspect] retrieval keywords: {keywords!r} scope={pack_scope}")
@@ -351,12 +360,14 @@ def _detect_context(query: str, model: str) -> dict:
 
 
 def _build_keywords(intent: str, context: dict, original_query: str) -> str:
-    """Compose a keyword query for pack_retrieve. Combines: detected key
-    symbols + framework name + intent-bias terms. The translation step inside
-    pack_retrieve will then convert these into the pack's language if
-    necessary."""
+    """Compose a keyword query for pack_retrieve. Pack pages are titled in
+    GENERAL terms ('Exception Handling', 'Virtual Environments') — the user's
+    SPECIFIC symbols ('KeyError', 'my_handler', 'lxml') are usually noise
+    against BM25 because they appear inside pages but not in their titles.
+    So we deliberately leave key_symbols OUT here and rely on framework +
+    intent-bias terms for the search. The user's original symbols still
+    appear in the model's final-answer context (verbatim from the query)."""
     parts: list[str] = []
-    parts.extend(context.get("key_symbols", [])[:5])
     framework = context.get("framework") or ""
     if framework:
         parts.append(framework)

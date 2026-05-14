@@ -275,18 +275,21 @@ def _extract_requirement(query: str, model: str) -> dict:
 
 
 def _build_pattern_keywords(req: dict, query: str) -> str:
-    """Build a short BM25 keyword query for finding RELEVANT PATTERNS in a
-    code pack (e.g. 'csv reading dictionary count' → finds the page on
-    csv.DictReader). Used only when a pack exists for the language."""
+    """Build a BM25 keyword query for finding RELEVANT PATTERNS in a code
+    pack (e.g. 'FastAPI endpoint Pydantic example' → finds the FastAPI page
+    on request models). Frameworks are the strongest specificity signal —
+    a generic 'example pattern' query against a pack returns anything, but
+    'FastAPI endpoint Pydantic example' lands on the right page. So we
+    take all named frameworks (cap 5) and include the artifact type, then
+    only ONE generic disambiguator."""
     parts: list[str] = []
     artifact = (req.get("artifact") or "").lower()
     if artifact and artifact != "snippet":
         parts.append(artifact)
-    for fw in req.get("frameworks", [])[:3]:
+    for fw in req.get("frameworks", [])[:5]:
         if isinstance(fw, str) and fw.strip():
             parts.append(fw.strip())
     parts.append("example")
-    parts.append("pattern")
     if not parts:
         return query[:80]
     return " ".join(parts)
