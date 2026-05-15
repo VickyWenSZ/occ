@@ -743,8 +743,12 @@ def download_pack(path: str) -> str:
 
             pages_ok = 0
             pages_failed: list[str] = []
+            # Allow nested page paths (e.g. "concepts/julius-caesar.md") but
+            # block traversal and absolute paths. Each segment is restricted
+            # to safe characters.
+            page_re = re.compile(r"^[A-Za-z0-9._\-]+(/[A-Za-z0-9._\-]+)*\.md$")
             for page_file in pages_to_fetch:
-                if not re.match(r"^[A-Za-z0-9._\-]+\.md$", page_file):
+                if not page_re.match(page_file) or ".." in page_file:
                     pages_failed.append(page_file)
                     continue
                 try:
@@ -754,7 +758,9 @@ def download_pack(path: str) -> str:
                     if pr.status_code != 200:
                         pages_failed.append(page_file)
                         continue
-                    (wiki_dir / page_file).write_text(pr.text, encoding="utf-8")
+                    out_path = wiki_dir / page_file
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_text(pr.text, encoding="utf-8")
                     pages_ok += 1
                 except Exception:
                     pages_failed.append(page_file)
