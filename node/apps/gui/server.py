@@ -185,6 +185,7 @@ def _init():
         workspace=workspace,
         openrouter_key=_cfg.openrouter_api_key,
         openrouter_model=_cfg.openrouter_model,
+        local_mode=_cfg.local_mode,
         skills_dir=ROOT / "skills",
         packs_root=_cfg.packs_root,
     )
@@ -2457,6 +2458,7 @@ async def run_command(body: CommandBody):
             workspace=ROOT / "workspace",
             openrouter_key=_cfg.openrouter_api_key,
             openrouter_model=_cfg.openrouter_model,
+            local_mode=_cfg.local_mode,
             skills_dir=ROOT / "skills",
             packs_root=_cfg.packs_root,
         )
@@ -2477,6 +2479,7 @@ async def run_command(body: CommandBody):
             workspace=ROOT / "workspace",
             openrouter_key=_cfg.openrouter_api_key,
             openrouter_model=_cfg.openrouter_model,
+            local_mode=_cfg.local_mode,
             skills_dir=ROOT / "skills",
             packs_root=_cfg.packs_root,
         )
