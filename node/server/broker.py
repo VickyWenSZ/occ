@@ -221,6 +221,19 @@ async def get_page(path: str, file: str):
     return Response(f.read_text(encoding="utf-8"), media_type="text/markdown")
 
 
+@app.get("/packs/{path:path}/manifest.yaml")
+async def get_manifest(path: str):
+    """Serve a pack's manifest.yaml. Required by the node-side download_pack
+    tool to mirror a pack to the local expert-packs/ directory (manifest is
+    the marker that local_index uses to discover packs on disk)."""
+    f = (PACKS_DIR / path / "manifest.yaml").resolve()
+    if not str(f).startswith(str(PACKS_DIR.resolve())):
+        raise HTTPException(403)
+    if not f.exists():
+        raise HTTPException(404)
+    return Response(f.read_text(encoding="utf-8"), media_type="text/yaml")
+
+
 # ─── HTTP: Node registry ───────────────────────────────────────────────────
 
 @app.get("/nodes")

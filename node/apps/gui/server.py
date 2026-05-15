@@ -29,7 +29,7 @@ from node.apps.cli.config import Config, save_openrouter_config
 from node.apps.gui import log_bus
 from node.deliberation.classifier import classify
 from node.deliberation.engine import DeliberationEngine
-from node.deliberation.tools import set_workspace, set_upload
+from node.deliberation.tools import set_workspace, set_upload, set_packs_root
 from node.expert_runtime.pack import load_all_packs, load_pack, MultiPackRetriever
 
 app = FastAPI()
@@ -158,6 +158,7 @@ def _init():
     upload = ROOT / "upload"
     upload.mkdir(exist_ok=True)
     set_upload(upload)
+    set_packs_root(_cfg.packs_root)
 
     if _cfg.pack_name:
         pack_path = _cfg.packs_root / _cfg.pack_name
@@ -365,13 +366,38 @@ async def get_pack_state():
 @app.post("/api/local/pack-state")
 async def set_pack_state(body: DisabledPacksBody):
     """Persist a new disabled-pack set. The engine reads this list fresh on
-    every local-mode query, so toggles take effect immediately — no reindex,
-    no engine rebuild."""
+    every local-mode query, so toggle-off takes effect immediately — no
+    rebuild required. Newly-enabled packs (present in the old disabled list
+    but not in the new) trigger an incremental `reindex_pack` so packs pulled
+    via `download_pack` become searchable on first activation."""
     if not _cfg:
         raise HTTPException(503, "Not ready")
-    from node.apps.cli.config import save_disabled_packs
-    save_disabled_packs(body.disabled)
-    return {"ok": True, "disabled": sorted(set(body.disabled))}
+    from node.apps.cli.config import load_disabled_packs, save_disabled_packs
+    from node.retrieval import local_index
+
+    old_disabled = set(load_disabled_packs())
+    new_disabled = set(body.disabled)
+    newly_enabled = old_disabled - new_disabled
+
+    save_disabled_packs(list(new_disabled))
+
+    indexed: list[dict] = []
+    for pack_path in sorted(newly_enabled):
+        try:
+            result = local_index.reindex_pack(_cfg.packs_root, pack_path)
+            indexed.append({"pack": pack_path, **result})
+            log_bus.write(
+                f"[pack-state] reindexed '{pack_path}' "
+                f"({result.get('pages_indexed', 0)} pages)"
+            )
+        except Exception as e:
+            log_bus.write(f"[pack-state] reindex_pack({pack_path}) failed: {e}")
+
+    return {
+        "ok": True,
+        "disabled": sorted(new_disabled),
+        "indexed": indexed,
+    }
 
 
 class OpenRouterActiveBody(BaseModel):

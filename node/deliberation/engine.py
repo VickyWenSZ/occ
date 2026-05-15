@@ -39,6 +39,11 @@ def _tool_status(fn_name: str, fn_args: dict) -> str:
         return f"Transcribing audio: {fn_args.get('filename', '')}..."
     if fn_name == "fetch_full_page":
         return f"Critic verifying source: {fn_args.get('file', '')}..."
+    if fn_name == "list_packs":
+        prefix = fn_args.get("prefix", "") or "root"
+        return f"Browsing broker catalog at '{prefix}'..."
+    if fn_name == "download_pack":
+        return f"Downloading pack: {fn_args.get('path', '')}..."
     return f"Running {fn_name}..."
 
 
@@ -55,6 +60,8 @@ def _tool_label(fn_name: str) -> str:
         "read_xlsx":  "XLSX",
         "transcribe_audio": "AUDIO",
         "fetch_full_page": "VERIFY",
+        "list_packs": "CATALOG",
+        "download_pack": "DOWNLOAD",
     }.get(fn_name, fn_name.upper())
 
 

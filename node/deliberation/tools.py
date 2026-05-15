@@ -9,6 +9,7 @@ from pathlib import Path
 
 _WORKSPACE: Path | None = None
 _UPLOAD: Path | None = None
+_PACKS_ROOT: Path | None = None
 
 
 def set_workspace(path: Path):
@@ -19,6 +20,12 @@ def set_workspace(path: Path):
 def set_upload(path: Path):
     global _UPLOAD
     _UPLOAD = path
+
+
+def set_packs_root(path: Path):
+    """Wire the expert-packs/ root so `download_pack` knows where to save."""
+    global _PACKS_ROOT
+    _PACKS_ROOT = path
 
 
 def _safe_path(filename: str) -> Path:
@@ -543,6 +550,306 @@ TOOL_SCHEMA += [
     },
 ]
 
+# ── Broker pack catalog: list + download ─────────────────────────────────────
+# Lets the user browse the OCC broker's pack tree from chat and pull packs
+# locally. Packs are saved DISABLED — the Settings toggle controls activation,
+# and the existing /api/local/pack-state endpoint triggers `reindex_pack` on
+# enable so the FTS5 index is built lazily.
+
+_PACK_PATH_RE = re.compile(r"^[a-z0-9][a-z0-9/_\-]*$")
+
+# Per-call cache for the broker's bulk summaries dict. list_packs probes many
+# children in a single invocation; one fetch per call is enough.
+_PACK_SUMMARIES_CACHE: dict | None = None
+
+
+def _broker_tree(prefix: str):
+    """GET /tree[/prefix]. Returns the parsed JSON or None on any failure."""
+    import httpx
+    from node.retrieval.pack_cache import SERVER_URL
+    url = f"{SERVER_URL}/tree" if not prefix else f"{SERVER_URL}/tree/{prefix}"
+    try:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _fetch_summaries_bulk() -> dict:
+    """GET /packs/summaries — one bulk call returns {pack_path: summary} for
+    every indexed pack on the broker. Cheaper than N per-pack manifest calls."""
+    import httpx
+    from node.retrieval.pack_cache import SERVER_URL
+    try:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            resp = client.get(f"{SERVER_URL}/packs/summaries")
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        summaries = data.get("summaries", {}) if isinstance(data, dict) else {}
+        return summaries if isinstance(summaries, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fetch_pack_summary_remote(pack_path: str) -> str:
+    """Return a single pack's summary from the cached bulk dict."""
+    global _PACK_SUMMARIES_CACHE
+    if _PACK_SUMMARIES_CACHE is None:
+        _PACK_SUMMARIES_CACHE = _fetch_summaries_bulk()
+    return str(_PACK_SUMMARIES_CACHE.get(pack_path, "") or "").strip()
+
+
+def _pack_installed_locally(pack_path: str) -> bool:
+    """True when expert-packs/<pack_path>/ has both manifest.yaml and wiki/index.md."""
+    if _PACKS_ROOT is None:
+        return False
+    p = _PACKS_ROOT / pack_path
+    return (p / "manifest.yaml").exists() and (p / "wiki" / "index.md").exists()
+
+
+def list_packs(prefix: str = "") -> str:
+    """Browse the OCC broker's pack catalog at the given prefix.
+
+    Returns a human-readable listing of immediate children at that path so the
+    user can navigate the tree conversationally. Pack leaves are annotated
+    with their manifest summary and a marker when already installed locally.
+    """
+    global _PACK_SUMMARIES_CACHE
+    _PACK_SUMMARIES_CACHE = None  # refresh once per call so re-browses see updates
+    prefix_clean = (prefix or "").strip().strip("/").replace("\\", "/")
+    if prefix_clean and not _PACK_PATH_RE.match(prefix_clean):
+        return f"Invalid catalog path: '{prefix}'."
+
+    data = _broker_tree(prefix_clean)
+    if data is None:
+        return "Could not reach the OCC broker."
+
+    if not prefix_clean:
+        children = data if isinstance(data, list) else []
+        is_pack_here = False
+    else:
+        if not isinstance(data, dict):
+            return f"Nothing at '{prefix_clean}' on the broker."
+        children = data.get("children", []) or []
+        is_pack_here = bool(data.get("has_pack"))
+
+    lines: list[str] = []
+    location = prefix_clean or "(root)"
+
+    if is_pack_here:
+        summary = _fetch_pack_summary_remote(prefix_clean)
+        marker = " — installed locally" if _pack_installed_locally(prefix_clean) else ""
+        lines.append(f"Pack: {prefix_clean}{marker}")
+        if summary:
+            lines.append(f"  {summary}")
+        else:
+            lines.append("  (no description available — pack manifest has empty summary)")
+        lines.append("")
+
+    if children:
+        lines.append(f"Under {location}:")
+        all_summaries = _PACK_SUMMARIES_CACHE or {}
+        for name in children:
+            if not isinstance(name, str) or not name:
+                continue
+            child_path = f"{prefix_clean}/{name}" if prefix_clean else name
+            child_data = _broker_tree(child_path)
+            child_has_pack = bool(
+                isinstance(child_data, dict) and child_data.get("has_pack")
+            )
+            if child_has_pack:
+                summary = _fetch_pack_summary_remote(child_path)
+                marker = " ✓" if _pack_installed_locally(child_path) else ""
+                line = f"  - {name}{marker} (pack)"
+                if summary:
+                    snippet = summary[:140].rstrip()
+                    if len(summary) > 140:
+                        snippet += "..."
+                    line += f" — {snippet}"
+                else:
+                    line += " — (no description available yet)"
+                lines.append(line)
+            else:
+                # Count packs reachable under this category so the user knows
+                # whether it's worth drilling down further.
+                prefix_for_count = f"{child_path}/"
+                pack_count = sum(
+                    1 for pp in all_summaries if pp.startswith(prefix_for_count)
+                )
+                if pack_count == 1:
+                    lines.append(f"  - {name}/ (category, 1 pack inside)")
+                elif pack_count > 1:
+                    lines.append(f"  - {name}/ (category, {pack_count} packs inside)")
+                else:
+                    lines.append(f"  - {name}/ (category)")
+    elif not is_pack_here:
+        return f"Nothing at '{prefix_clean}' on the broker."
+
+    return "\n".join(lines).strip()
+
+
+def download_pack(path: str) -> str:
+    """Download a pack from the OCC broker to the local expert-packs/ folder.
+
+    Saves the pack as DISABLED so it doesn't interfere with current retrieval.
+    The user activates it from Settings — that toggle calls reindex_pack so
+    the pack becomes searchable on first activation. Overwrites any existing
+    local copy silently (with a note in the return value).
+    """
+    import httpx
+    from node.retrieval.pack_cache import SERVER_URL
+
+    pack_path = (path or "").strip().strip("/").replace("\\", "/")
+    if not pack_path:
+        return "download_pack: missing pack path."
+    if not _PACK_PATH_RE.match(pack_path):
+        return f"download_pack: invalid pack path '{path}'."
+    if _PACKS_ROOT is None:
+        return "download_pack: local packs root not configured."
+
+    pack_dir = _PACKS_ROOT / pack_path
+    wiki_dir = pack_dir / "wiki"
+    pre_existed = pack_dir.exists()
+
+    pages_to_fetch: list[str] = []
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            # index.md — the source of truth for which pages belong to the pack
+            r = client.get(f"{SERVER_URL}/packs/{pack_path}/wiki/index.md")
+            if r.status_code != 200:
+                return (
+                    f"download_pack: pack '{pack_path}' not found on broker "
+                    f"(HTTP {r.status_code})."
+                )
+            index_md = r.text
+            for line in index_md.splitlines():
+                if not line.startswith("|"):
+                    continue
+                m = re.match(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|", line)
+                if not m:
+                    continue
+                page_file = m.group(1).strip()
+                if page_file.lower() == "file" or page_file.startswith("-"):
+                    continue
+                if page_file:
+                    pages_to_fetch.append(page_file)
+
+            wiki_dir.mkdir(parents=True, exist_ok=True)
+            (wiki_dir / "index.md").write_text(index_md, encoding="utf-8")
+
+            pages_ok = 0
+            pages_failed: list[str] = []
+            for page_file in pages_to_fetch:
+                if not re.match(r"^[A-Za-z0-9._\-]+\.md$", page_file):
+                    pages_failed.append(page_file)
+                    continue
+                try:
+                    pr = client.get(
+                        f"{SERVER_URL}/packs/{pack_path}/wiki/{page_file}"
+                    )
+                    if pr.status_code != 200:
+                        pages_failed.append(page_file)
+                        continue
+                    (wiki_dir / page_file).write_text(pr.text, encoding="utf-8")
+                    pages_ok += 1
+                except Exception:
+                    pages_failed.append(page_file)
+
+            mr = client.get(f"{SERVER_URL}/packs/{pack_path}/manifest.yaml")
+            if mr.status_code != 200:
+                return (
+                    f"download_pack: pack '{pack_path}' missing manifest.yaml "
+                    f"on broker (HTTP {mr.status_code})."
+                )
+            (pack_dir / "manifest.yaml").write_text(mr.text, encoding="utf-8")
+    except Exception as e:
+        return f"download_pack: fetch failed: {type(e).__name__}: {e}"
+
+    # Stamp the new pack as disabled. Existing entries are preserved.
+    try:
+        from node.apps.cli.config import load_disabled_packs, save_disabled_packs
+        disabled = set(load_disabled_packs())
+        disabled.add(pack_path)
+        save_disabled_packs(list(disabled))
+    except Exception:
+        pass
+
+    notes = []
+    if pre_existed:
+        notes.append("overwrote existing local copy")
+    if pages_failed:
+        notes.append(f"{len(pages_failed)} pages failed: {', '.join(pages_failed[:3])}")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+
+    return (
+        f"Pack '{pack_path}' downloaded: {pages_ok} pages + manifest{suffix}.\n"
+        f"Saved as DISABLED. Activate it from Settings to use it in local mode — "
+        f"activation triggers the FTS5 index build automatically."
+    )
+
+
+TOOL_SCHEMA += [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_packs",
+            "description": (
+                "Browse the OCC broker's catalog of knowledge packs available "
+                "for remote use or local download. Returns one level of the "
+                "catalog tree at the given prefix (empty prefix = top level). "
+                "Use when the user asks what packs are available on the broker, "
+                "wants to browse the catalog, or wants to check if a topic is "
+                "covered."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prefix": {
+                        "type": "string",
+                        "description": (
+                            "Catalog path to browse. Empty string ('') for the "
+                            "top-level categories. Use a path like 'marketing' "
+                            "or 'history/ancient-rome' to drill down."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_pack",
+            "description": (
+                "Download a pack from the OCC broker to the local expert-packs/ "
+                "folder so the user can use it later in local mode or modify it "
+                "with Forge. The pack is saved DISABLED — activation from "
+                "Settings makes it searchable (and triggers indexing). Use when "
+                "the user explicitly asks to download or save a pack."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Full pack path on the broker (e.g. 'marketing/"
+                            "storybrand' or 'history/ancient-rome/caesar')."
+                        ),
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+]
+
+
 TOOL_FUNCTIONS = {
     "web_search": web_search,
     "fetch_url": fetch_url,
@@ -554,4 +861,6 @@ TOOL_FUNCTIONS = {
     "read_docx": read_docx,
     "read_xlsx": read_xlsx,
     "transcribe_audio": transcribe_audio,
+    "list_packs": list_packs,
+    "download_pack": download_pack,
 }
