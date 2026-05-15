@@ -2255,6 +2255,22 @@ async def chat_query(chat_id: str, body: QueryBody):
         # All three modes are passed through to the engine, which has a
         # dedicated branch for each.
         mode = body.mode
+        # Conversation-aware rewrite — resolve pronouns and back-references in
+        # the user query BEFORE the classifier sees it. A bare follow-up like
+        # "and what did Dennett think? did he agree?" reads as chitchat in
+        # isolation but is clearly a knowledge question once "he" is bound to
+        # the previous topic. Computed once here, reused by both the classifier
+        # AND the engine's deliberate/skill paths (via route_stream's new
+        # rewritten_query param) so we never pay for two rewrites.
+        rewritten_query = full_query
+        if _engine is not None and _engine._history and full_query.strip():
+            rewritten_query = await loop.run_in_executor(
+                None, _engine._rewrite_query_with_history, full_query
+            )
+            if rewritten_query != full_query:
+                log_bus.write(
+                    f"[rewriter] '{full_query[:80]}' -> '{rewritten_query[:80]}'"
+                )
         # Hard override: if /ollama bypass is ON, route every message to the
         # raw-Ollama path. Skips classifier, skills, retrieval, tools, system
         # prompt. Toggle off with /ollama.
@@ -2266,7 +2282,7 @@ async def chat_query(chat_id: str, body: QueryBody):
                 mode = "chat"
             else:
                 skill_reg = _engine._skill_registry if _engine is not None else None
-                mode = await loop.run_in_executor(None, classify, _model, full_query, skill_reg)
+                mode = await loop.run_in_executor(None, classify, _model, rewritten_query, skill_reg)
                 log_bus.write(f"[router] classified as '{mode}'")
 
         # Register a fresh stop event for this chat — overwrites any stale one.
@@ -2276,7 +2292,8 @@ async def chat_query(chat_id: str, body: QueryBody):
         def stream_thread():
             try:
                 for kind, value in _engine.route_stream(
-                    full_query, mode, images=images_b64 or None
+                    full_query, mode, images=images_b64 or None,
+                    rewritten_query=rewritten_query,
                 ):
                     if stop_event.is_set():
                         asyncio.run_coroutine_threadsafe(

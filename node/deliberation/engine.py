@@ -429,7 +429,8 @@ class DeliberationEngine:
 
     # ─── Public entry point ───────────────────────────────────────────────────
 
-    def route_stream(self, query: str, mode: str = "deliberate", images: list | None = None):
+    def route_stream(self, query: str, mode: str = "deliberate", images: list | None = None,
+                     rewritten_query: str | None = None):
         # Ollama bypass: completely raw — no OCC system prompt, no tools, no
         # retrieval, no skills. Activated by the /ollama toggle. Useful to
         # compare the raw model behavior against OCC's framework output.
@@ -461,7 +462,13 @@ class DeliberationEngine:
         if mode.startswith("skill:"):
             skill_name = mode[len("skill:"):]
             yield ("routing", "chat")
-            yield from self._run_skill(skill_name, query, images=images)
+            # Pass the rewritten query to the skill so entity detectors and
+            # similar internal LLM calls see references resolved ("write a
+            # poem in his style" → "...in Pascoli's style"). The engine's
+            # final user-facing LLM call still sees the user's ORIGINAL query
+            # so the answer matches their voice.
+            skill_query = rewritten_query if rewritten_query is not None else self._rewrite_query_with_history(query)
+            yield from self._run_skill(skill_name, query, skill_query=skill_query, images=images)
             return
 
         # Local mode: uses private packs, no server, no peers.
@@ -476,9 +483,14 @@ class DeliberationEngine:
             # question (small models otherwise bind 'this/lui' to the most
             # local context block). Synth keeps the user's original phrasing
             # so the final answer's voice matches the user's prompt.
-            retrieval_query = self._rewrite_query_with_history(query)
-            if retrieval_query != query:
-                _log(f"[rewriter] '{query[:80]}' -> '{retrieval_query[:80]}'")
+            # Skip the rewriter call when the caller (server.py) already
+            # computed it for the classifier — single rewrite per turn.
+            if rewritten_query is not None:
+                retrieval_query = rewritten_query
+            else:
+                retrieval_query = self._rewrite_query_with_history(query)
+                if retrieval_query != query:
+                    _log(f"[rewriter] '{query[:80]}' -> '{retrieval_query[:80]}'")
             if self._local_packs_root is not None:
                 context, retrieved_pages = self._retrieve_from_local(retrieval_query)
             else:
@@ -496,9 +508,14 @@ class DeliberationEngine:
             return
 
         yield ("status", "Retrieving knowledge...")
-        retrieval_query = self._rewrite_query_with_history(query)
-        if retrieval_query != query:
-            _log(f"[rewriter] '{query[:80]}' -> '{retrieval_query[:80]}'")
+        # Skip the rewriter call when the caller (server.py) already computed
+        # it for the classifier — single rewrite per turn.
+        if rewritten_query is not None:
+            retrieval_query = rewritten_query
+        else:
+            retrieval_query = self._rewrite_query_with_history(query)
+            if retrieval_query != query:
+                _log(f"[rewriter] '{query[:80]}' -> '{retrieval_query[:80]}'")
         context, retrieved_pages = self._retrieve_from_server(retrieval_query)
 
         if context is None:
@@ -2298,20 +2315,32 @@ class DeliberationEngine:
 
     # ─── Skill mode (chosen by Stage-2 classifier) ────────────────────────────
 
-    def _run_skill(self, skill_name: str, query: str, images: list | None = None):
+    def _run_skill(self, skill_name: str, query: str, skill_query: str | None = None,
+                   images: list | None = None):
         """Execute a specific skill end-to-end and stream events.
+
+        Args:
+          skill_name: qualified registry name (e.g. 'skill_creative_writer').
+          query: the user's ORIGINAL message — used for the final user-facing
+            LLM call so the answer matches the user's phrasing.
+          skill_query: the conversation-rewritten version of the query — used
+            to build the skill's args. Lets skills' internal LLM calls (entity
+            detection, requirement extraction, etc.) see pronouns and back-
+            references resolved against the chat history. When None, falls
+            back to `query`.
 
         Flow:
           1. Look up the skill in the registry.
-          2. Build args from query (each required string param gets the user
-             query verbatim — works for the current skills which take a
-             single 'query' / 'claim' / 'question' field).
+          2. Build args from skill_query (each required string param gets the
+             rewritten query verbatim — works for the current skills which
+             take a single 'query' / 'claim' / 'question' field).
           3. Run the skill, forwarding intermediate ('status', ...) events to
              the UI and capturing the final ('result', text).
           4. Harvest any web sources embedded in the result for the Sources
              panel.
-          5. Make a final streaming LLM call with the skill result as
-             grounded context, yielding tokens to the UI.
+          5. Make a final streaming LLM call with the user's ORIGINAL query
+             plus the skill result as grounded context, yielding tokens to
+             the UI.
         """
         skill = self._skill_registry.get(skill_name) if self._skill_registry else None
         if skill is None:
@@ -2324,12 +2353,14 @@ class DeliberationEngine:
         yield ("tool_used", f"SKILL:{skill.name.upper()}")
         _log(f"[skills] {skill_name} START (skill mode)")
 
-        # Args: required string params all get the user query verbatim.
+        # Args: required string params all get the rewritten query verbatim
+        # (entity detection / requirement extraction see references resolved).
+        skill_input = skill_query if skill_query is not None else query
         args: dict = {}
         props = skill.parameters.get("properties", {})
         for pname in skill.parameters.get("required", []):
             if props.get(pname, {}).get("type") == "string":
-                args[pname] = query
+                args[pname] = skill_input
 
         # Build a runtime context the skill can use for internal LLM calls
         # (e.g. translating a query into the pack's language for retrieval).
@@ -2375,8 +2406,15 @@ class DeliberationEngine:
             {"role": "system", "content": self._chat_system},
             *self._history,
             user_msg,
-            {"role": "user", "content": f"[Result of skill `{skill.name}`:]\n\n{result}"},
         ]
+        # Only append the skill-result wrapper when the skill actually produced
+        # something. Skills like creative_writer return an empty result when no
+        # grounding is needed; in that case the LLM should see only the user's
+        # query, with no extra framing.
+        if result and result.strip():
+            messages.append(
+                {"role": "user", "content": f"[Result of skill `{skill.name}`:]\n\n{result}"}
+            )
         self._peak_ctx_used = self._measure_ctx(messages)
         full_text_chars = 0
         for token in _provider_stream(
