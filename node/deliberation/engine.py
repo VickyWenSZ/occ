@@ -233,6 +233,152 @@ class DeliberationEngine:
         if len(self._history) > 1000:
             self._history = self._history[-1000:]
 
+    # ─── History budgeting & query rewriting ─────────────────────────────────
+    #
+    # Both pieces are NEW. They sit upstream of the retrieval pipelines and
+    # before the Expert/Synth deliberation calls. Goal: make deliberate-mode
+    # turns feel like a chat — pronouns and back-references resolve, and the
+    # Expert can recall what was just said when synthesizing the new answer.
+    # Strict fallback: any failure path leaves behavior identical to today
+    # (original query into retrieval, no extra messages in Expert/Synth).
+
+    def _budgeted_history(self, char_budget: int) -> list[dict]:
+        """Pick recent user+assistant pairs from self._history that fit within
+        char_budget. Pairs are kept intact (no orphan user without its reply
+        or vice versa). Newest-first selection, dropped oldest. If the pair
+        on the boundary fits the user message but not the full assistant
+        reply, the assistant content is truncated provided ≥200 chars of
+        room remain — below that the pair is dropped."""
+        if not self._history or char_budget <= 0:
+            return []
+
+        # Pair up turns. add_to_history always appends user then assistant,
+        # so the list is canonically alternating, but defensive iteration
+        # tolerates a stray entry without crashing.
+        pairs: list[tuple[dict, dict]] = []
+        i = 0
+        while i < len(self._history) - 1:
+            a = self._history[i]
+            b = self._history[i + 1]
+            if a.get("role") == "user" and b.get("role") == "assistant":
+                pairs.append((a, b))
+                i += 2
+            else:
+                i += 1
+        if not pairs:
+            return []
+
+        kept: list[tuple[dict, dict]] = []
+        used = 0
+        for user_msg, assist_msg in reversed(pairs):
+            u_text = user_msg.get("content", "") or ""
+            a_text = assist_msg.get("content", "") or ""
+            pair_size = len(u_text) + len(a_text)
+            if used + pair_size <= char_budget:
+                kept.append((user_msg, assist_msg))
+                used += pair_size
+                continue
+            # Try truncating the assistant of this boundary pair.
+            remaining = char_budget - used - len(u_text)
+            if remaining < 200:
+                break
+            truncated = {
+                "role": "assistant",
+                "content": a_text[:remaining].rstrip() + "..." if len(a_text) > remaining else a_text,
+            }
+            kept.append((user_msg, truncated))
+            break
+
+        # Restore chronological order (oldest pair first).
+        out: list[dict] = []
+        for u, a in reversed(kept):
+            out.append({"role": "user", "content": u.get("content", "") or ""})
+            out.append({"role": "assistant", "content": a.get("content", "") or ""})
+        return out
+
+    def _rewrite_query_with_history(self, query: str) -> str:
+        """Rewrite a follow-up query into a standalone search query, resolving
+        pronouns and back-references using the last 3 turns of chat history.
+
+        - Empty history: no LLM call, return query unchanged.
+        - LLM error or pathological output: return original query.
+        - Already-standalone queries: rewriter is instructed to return them
+          unchanged, so this is a near-no-op in those cases (still costs one
+          small LLM call, ~1k tokens of context).
+
+        The rewritten string is used ONLY for the retrieval pipeline. The
+        Expert/Synth see the user's original query, so the user's voice is
+        preserved in the final answer.
+        """
+        if not self._history or not query.strip():
+            return query
+
+        # Pull last 3 turns; assistant responses truncated to first 600 chars
+        # — enough for entity/reference resolution, not enough to bloat the
+        # rewriter context.
+        TURNS = 3
+        ASSIST_CAP = 600
+        recent = self._history[-TURNS * 2:]
+        history_lines: list[str] = []
+        for msg in recent:
+            role = msg.get("role", "")
+            content = (msg.get("content", "") or "").strip()
+            if not content:
+                continue
+            if role == "assistant" and len(content) > ASSIST_CAP:
+                content = content[:ASSIST_CAP].rstrip() + "..."
+            label = "User" if role == "user" else "Assistant"
+            history_lines.append(f"{label}: {content}")
+
+        if not history_lines:
+            return query
+
+        system = (
+            "You rewrite a follow-up user question into a standalone search query. "
+            "Resolve pronouns (he/she/it/they/lui/lei/loro) and back-references "
+            "('that one', 'the previous topic', 'quella cosa', 'di prima') using "
+            "the conversation history. If the question is already standalone, "
+            "return it unchanged. Output ONLY the rewritten query — no preamble, "
+            "no quotes, no explanation."
+        )
+        user = (
+            "Conversation history:\n"
+            + "\n".join(history_lines)
+            + f"\n\nFollow-up question:\n{query.strip()}\n\nStandalone query:"
+        )
+
+        try:
+            from node.provider import call as _provider_call
+            resp = _provider_call(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                model_local=self.model,
+                or_key=self.or_key,
+                or_model=self.or_model,
+                tools=None,
+                temperature=0.0,
+                num_ctx=4096,
+            )
+            out = (resp.content or "").strip()
+        except Exception as e:
+            _log(f"[rewriter] call failed: {e} — using original query")
+            return query
+
+        # Strip surrounding quotes/backticks the model sometimes adds.
+        out = out.strip('"').strip("'").strip("`").strip()
+        if not out:
+            return query
+        # Reject pathological output: way too long, or an obvious refusal.
+        if len(out) > len(query) * 12 + 400:
+            _log(f"[rewriter] suspiciously long output ({len(out)} chars) — using original")
+            return query
+        lower = out.lower()
+        if lower.startswith(("i cannot", "i can't", "sorry", "non posso", "mi dispiace")):
+            return query
+        return out
+
     # ─── Public entry point ───────────────────────────────────────────────────
 
     def route_stream(self, query: str, mode: str = "deliberate", images: list | None = None):
@@ -277,11 +423,17 @@ class DeliberationEngine:
         # Otherwise fall back to the legacy expert_pack.retrieve keyword search.
         if self._local_mode:
             yield ("status", "Retrieving knowledge...")
+            # Resolve pronouns/back-references using chat history so retrieval
+            # sees a standalone query. Original `query` still flows into the
+            # Expert/Synth so the user's voice is preserved.
+            retrieval_query = self._rewrite_query_with_history(query)
+            if retrieval_query != query:
+                _log(f"[rewriter] '{query[:80]}' -> '{retrieval_query[:80]}'")
             if self._local_packs_root is not None:
-                context, retrieved_pages = self._retrieve_from_local(query)
+                context, retrieved_pages = self._retrieve_from_local(retrieval_query)
             else:
                 context = (
-                    self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
+                    self.expert_pack.retrieve(retrieval_query, max_chars=self.retrieval_chars)
                     if self.expert_pack else ""
                 )
                 retrieved_pages = None
@@ -290,7 +442,10 @@ class DeliberationEngine:
             return
 
         yield ("status", "Retrieving knowledge...")
-        context, retrieved_pages = self._retrieve_from_server(query)
+        retrieval_query = self._rewrite_query_with_history(query)
+        if retrieval_query != query:
+            _log(f"[rewriter] '{query[:80]}' -> '{retrieval_query[:80]}'")
+        context, retrieved_pages = self._retrieve_from_server(retrieval_query)
 
         if context is None:
             yield ("routing", "local_fallback")
@@ -1454,6 +1609,12 @@ class DeliberationEngine:
 
         _priv, _pub = load_or_generate_keypair()
 
+        # Shared history budget for the local Expert and the local Synth.
+        # The remote Critic stays history-less — the peer protocol doesn't
+        # carry chat history, and verification doesn't need it.
+        _history_budget = min(self.retrieval_chars // 6, 15000)
+        history_msgs = self._budgeted_history(_history_budget) if _history_budget > 0 else []
+
         # Call 1 — Expert (local)
         yield ("status", "Expert analyzing...")
         if context:
@@ -1467,6 +1628,7 @@ class DeliberationEngine:
         expert_resp = _provider_call(
             messages=[
                 {"role": "system", "content": ROLES["expert"]["system"]},
+                *history_msgs,
                 {"role": "user", "content": expert_prompt},
             ],
             model_local=self.model,
@@ -1532,6 +1694,7 @@ class DeliberationEngine:
         for token in _provider_stream(
             messages=[
                 {"role": "system", "content": ROLES["synthesizer"]["system"]},
+                *history_msgs,
                 {"role": "user", "content": synth_prompt},
             ],
             model_local=self.model,
@@ -1555,6 +1718,14 @@ class DeliberationEngine:
         """
         from node.provider import call as _provider_call, stream as _provider_stream
 
+        # History budget — shared by Expert and Synth. Scales with the tier's
+        # retrieval window: small tiers get ~1k chars of recall, big tiers up
+        # to 15k. Capped to avoid eating the answer's response space.
+        _history_budget = min(self.retrieval_chars // 6, 15000)
+        history_msgs = self._budgeted_history(_history_budget) if _history_budget > 0 else []
+        if history_msgs:
+            _log(f"[history] injecting {len(history_msgs)//2} turn(s), {_history_budget} char budget")
+
         # Call 1 — Expert
         yield ("status", "Expert analyzing...")
         backend = "OR" if self.or_key else "ollama"
@@ -1571,6 +1742,7 @@ class DeliberationEngine:
             expert_resp = _provider_call(
                 messages=[
                     {"role": "system", "content": ROLES["expert"]["system"]},
+                    *history_msgs,
                     {"role": "user", "content": expert_prompt},
                 ],
                 model_local=self.model,
@@ -1653,6 +1825,7 @@ class DeliberationEngine:
             for token in _provider_stream(
                 messages=[
                     {"role": "system", "content": ROLES["synthesizer"]["system"]},
+                    *history_msgs,
                     {"role": "user", "content": synth_prompt},
                 ],
                 model_local=self.model,
