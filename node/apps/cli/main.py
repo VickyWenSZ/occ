@@ -290,6 +290,7 @@ def build_engine(cfg: Config, retriever, model: str, workspace=None) -> Delibera
         openrouter_model=cfg.openrouter_model,
         local_mode=cfg.local_mode,
         vram_used_mb=get_vram_used_mb(),
+        packs_root=cfg.packs_root,
     )
 
 

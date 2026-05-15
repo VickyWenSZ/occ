@@ -313,6 +313,26 @@ async def set_local_mode(body: LocalModeBody):
     return {"ok": True, "local_mode": body.enabled}
 
 
+@app.post("/api/local/reindex")
+async def local_reindex():
+    """Full rebuild of the local FTS5 index over the current packs_root.
+
+    Forge and Lint already trigger an incremental reindex of the pack they
+    touched. This endpoint exists for the rarer case where the user added or
+    moved pack folders by hand and wants the local search to pick them up
+    without a node restart. Returns the count of packs and pages indexed.
+    """
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    from node.retrieval import local_index
+    try:
+        result = local_index.reindex_all(_cfg.packs_root)
+    except Exception as e:
+        raise HTTPException(500, f"Reindex failed: {e}")
+    log_bus.write(f"[local-index] reindex complete: {result}")
+    return {"ok": True, **result}
+
+
 class OpenRouterActiveBody(BaseModel):
     active: bool
 
@@ -673,6 +693,13 @@ async def forge_run(body: ForgeRunBody):
     def gen_factory():
         for line in _forge_run_core(body):
             yield line
+        # Refresh the local FTS5 index for this pack so retrieval picks up
+        # newly written pages without waiting for a node restart.
+        try:
+            from node.retrieval import local_index
+            local_index.reindex_pack(_cfg.packs_root, pack_name_clean)
+        except Exception:
+            pass
         yield {"type": "forge_complete", "pack_name": pack_name_clean}
 
     run_id = _start_managed_run("forge", pack_name_clean, gen_factory)
@@ -1290,6 +1317,13 @@ async def forge_lint(body: ForgeLintBody):
             model=body.model, fix=body.fix, skip_semantic=body.skip_semantic,
         ):
             yield line
+        # Lint may rewrite pages, frontmatter, or the index — refresh the
+        # local FTS5 entries for this pack so search reflects the new state.
+        try:
+            from node.retrieval import local_index
+            local_index.reindex_pack(_cfg.packs_root, pack_name)
+        except Exception:
+            pass
         yield {"type": "lint_complete", "pack_name": pack_name}
 
     run_id = _start_managed_run("lint", pack_name, gen_factory)
@@ -1894,6 +1928,11 @@ async def scout_forge_batch(body: ScoutForgeBatchBody):
         )
         for line in _forge_run_core(recompile_body):
             yield line
+        try:
+            from node.retrieval import local_index
+            local_index.reindex_pack(_cfg.packs_root, pack_name_clean)
+        except Exception:
+            pass
         yield {"type": "forge_complete", "pack_name": pack_name_clean}
 
     run_id = _start_managed_run("scout_forge", pack_name_clean, gen_factory)

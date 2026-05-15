@@ -1902,6 +1902,36 @@ async function setLocalMode(enabled) {
   }
 }
 
+async function localReindex() {
+  const btn = document.getElementById('local-reindex-btn');
+  const status = document.getElementById('local-reindex-status');
+  if (!btn || !status) return;
+  btn.disabled = true;
+  status.className = 'settings-reindex-status';
+  status.textContent = 'Reindexing…';
+  try {
+    const r = await apiFetch('/api/local/reindex', { method: 'POST' });
+    if (r?.ok) {
+      status.className = 'settings-reindex-status ok';
+      status.textContent = `Done — ${r.packs_indexed} pack(s), ${r.pages_indexed} page(s)`;
+    } else {
+      status.className = 'settings-reindex-status err';
+      status.textContent = 'Reindex failed';
+    }
+  } catch (e) {
+    status.className = 'settings-reindex-status err';
+    status.textContent = 'Reindex failed: ' + (e?.message || e);
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => {
+      if (status.textContent.startsWith('Done')) {
+        status.textContent = '';
+        status.className = 'settings-reindex-status';
+      }
+    }, 4000);
+  }
+}
+
 async function setOrActive(enabled) {
   const r = await apiFetch('/api/config/openrouter/active', {
     method: 'POST', body: JSON.stringify({ active: enabled }),

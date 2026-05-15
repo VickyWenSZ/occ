@@ -1421,6 +1421,38 @@ body {
   font-style: italic;
 }
 
+.settings-reindex-row {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  margin-top: 0.625rem;
+}
+.settings-reindex-btn {
+  padding: 0.25rem 0.625rem;
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 0.6875rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+.settings-reindex-btn:hover:not(:disabled) {
+  border-color: var(--border-strong, var(--border));
+  background: var(--surface);
+}
+.settings-reindex-btn:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+.settings-reindex-status {
+  font-size: 0.6875rem;
+  color: var(--text-ghost);
+}
+.settings-reindex-status.ok { color: #4ade80; }
+.settings-reindex-status.err { color: #f87171; }
+
 /* ── OpenRouter section ──────────────────────────────────────────────────── */
 
 .settings-or-node-row {
