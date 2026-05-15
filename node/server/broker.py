@@ -172,6 +172,37 @@ async def list_packs():
     return sorted(d.name for d in PACKS_DIR.iterdir() if d.is_dir())
 
 
+@app.get("/packs/summaries")
+async def get_pack_summaries():
+    """Return {pack_path: summary} for every indexed pack.
+
+    Consumed by node-side _decompose_query to disambiguate domain selection:
+    without summaries the LLM picks by literal name overlap (e.g. a software
+    pack named 'open-cognitive-commons' bleeds into psychology queries).
+    Data already lives in the FTS5 index — read via SELECT DISTINCT, no
+    extra crawl, no rate limit (low cost, infrequent).
+
+    Backward compatibility: nodes that don't know this endpoint hit a 404
+    and fall back to the legacy names-only prompt.
+    """
+    conn = _open_db()
+    try:
+        cursor = conn.execute(
+            "SELECT DISTINCT pack_path, pack_summary FROM pack_pages ORDER BY pack_path"
+        )
+        return {
+            "summaries": {
+                row[0]: (row[1] or "")
+                for row in cursor.fetchall()
+                if row[0]
+            }
+        }
+    except sqlite3.OperationalError:
+        return {"summaries": {}}
+    finally:
+        conn.close()
+
+
 @app.get("/packs/{pack}/index.md")
 async def get_index(pack: str):
     f = PACKS_DIR / pack / "wiki" / "index.md"

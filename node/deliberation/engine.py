@@ -119,6 +119,54 @@ def _parse_frontmatter_brief(text: str) -> tuple[str, str]:
     return (title, summary)
 
 
+_DOMAIN_SUMMARY_CAP = 140
+
+
+def _format_domains_for_decompose(root_list: list[str], summaries: dict[str, str]) -> str:
+    """Render a domain list for the decompose prompt.
+
+    With summaries: bullet list 'domain: summary (capped 140 chars)'. For
+    domains that are categories (not packs themselves), uses the summary of
+    the first sub-pack found under that category, so the LLM gets a
+    representative description.
+
+    Without summaries (empty dict or all-misses): falls back to a
+    comma-joined name list — the legacy decompose behavior. This keeps
+    older brokers or fresh installs without pack summaries fully working.
+    """
+    if not root_list:
+        return ""
+    if not summaries:
+        return ", ".join(root_list)
+
+    def _domain_summary(domain: str) -> str:
+        s = summaries.get(domain, "")
+        if s:
+            return s
+        prefix = domain + "/"
+        for path, sub_summary in summaries.items():
+            if path.startswith(prefix) and sub_summary:
+                return sub_summary
+        return ""
+
+    lines: list[str] = []
+    any_enriched = False
+    for d in root_list:
+        s = _domain_summary(d)
+        if s:
+            s_trim = s.strip()
+            if len(s_trim) > _DOMAIN_SUMMARY_CAP:
+                s_trim = s_trim[:_DOMAIN_SUMMARY_CAP].rstrip() + "..."
+            lines.append(f"- {d}: {s_trim}")
+            any_enriched = True
+        else:
+            lines.append(f"- {d}")
+    if not any_enriched:
+        # No summary matched any root — degrade to legacy comma list.
+        return ", ".join(root_list)
+    return "\n".join(lines)
+
+
 _OCC_IDENTITY = (
     "You are OCC (Open Cognitive Commons), a general-purpose AI assistant. "
     "You can help with questions on any topic, code, writing, reasoning, and analysis. "
@@ -424,8 +472,10 @@ class DeliberationEngine:
         if self._local_mode:
             yield ("status", "Retrieving knowledge...")
             # Resolve pronouns/back-references using chat history so retrieval
-            # sees a standalone query. Original `query` still flows into the
-            # Expert/Synth so the user's voice is preserved.
+            # sees a standalone query AND the Expert receives an unambiguous
+            # question (small models otherwise bind 'this/lui' to the most
+            # local context block). Synth keeps the user's original phrasing
+            # so the final answer's voice matches the user's prompt.
             retrieval_query = self._rewrite_query_with_history(query)
             if retrieval_query != query:
                 _log(f"[rewriter] '{query[:80]}' -> '{retrieval_query[:80]}'")
@@ -438,7 +488,11 @@ class DeliberationEngine:
                 )
                 retrieved_pages = None
             yield ("routing", "local_private")
-            yield from self._deliberate_multiagent(query, context or "", retrieved_pages=retrieved_pages)
+            yield from self._deliberate_multiagent(
+                query, context or "",
+                retrieved_pages=retrieved_pages,
+                expert_query=retrieval_query,
+            )
             return
 
         yield ("status", "Retrieving knowledge...")
@@ -450,18 +504,29 @@ class DeliberationEngine:
         if context is None:
             yield ("routing", "local_fallback")
             yield ("status", "Server unavailable — answering from base model only...")
-            yield from self._deliberate_multiagent(query, "", retrieved_pages=None)
+            yield from self._deliberate_multiagent(
+                query, "",
+                retrieved_pages=None,
+                expert_query=retrieval_query,
+            )
             return
 
         best_peer = self._select_best_peer(mode)
         if best_peer:
             yield ("routing", "distributed")
-            yield from self._deliberate_with_peer(query, context or "", best_peer)
+            yield from self._deliberate_with_peer(
+                query, context or "", best_peer,
+                expert_query=retrieval_query,
+            )
         else:
             if mode == "network":
                 yield ("status", "No peers available — running locally...")
             yield ("routing", "local")
-            yield from self._deliberate_multiagent(query, context or "", retrieved_pages=retrieved_pages)
+            yield from self._deliberate_multiagent(
+                query, context or "",
+                retrieved_pages=retrieved_pages,
+                expert_query=retrieval_query,
+            )
 
     # ─── Retrieval ────────────────────────────────────────────────────────────
 
@@ -877,6 +942,25 @@ class DeliberationEngine:
         if not lower_to_orig:
             return None
 
+        # 1b. Best-effort fetch of per-pack summaries to disambiguate domain
+        # selection. Older brokers don't expose this endpoint → 404 → silent
+        # fallback to the legacy names-only prompt. Short timeout to keep
+        # query latency low even when the endpoint hangs.
+        summaries_map: dict[str, str] = {}
+        try:
+            sresp = httpx.get(f"{SERVER_URL}/packs/summaries", timeout=3.0)
+            if sresp.status_code == 200:
+                data = sresp.json()
+                if isinstance(data, dict):
+                    raw_sum = data.get("summaries", {})
+                    if isinstance(raw_sum, dict):
+                        summaries_map = {
+                            str(k): str(v) for k, v in raw_sum.items() if v
+                        }
+        except Exception:
+            summaries_map = {}
+        domains_block = _format_domains_for_decompose(root_list, summaries_map)
+
         # 2. Constrained LLM choice
         system = (
             "You identify which knowledge domains are needed to answer a question. "
@@ -885,7 +969,7 @@ class DeliberationEngine:
         )
         user = (
             f"Question: {query}\n"
-            f"Available domains: {', '.join(root_list)}\n"
+            f"Available domains:\n{domains_block}\n"
             "Which domains are needed?"
         )
         try:
@@ -1220,6 +1304,17 @@ class DeliberationEngine:
         if not lower_to_orig:
             return None
 
+        # Fetch per-pack summaries from manifest.yaml. Used to disambiguate
+        # domain selection — without summaries Qwen picks by literal name
+        # overlap (e.g. "open-cognitive-commons" bleeds into psychology
+        # queries because the name contains "cognitive"). With summaries the
+        # LLM has actual semantic info per domain.
+        try:
+            summaries_map = local_index.list_pack_summaries(packs_root)
+        except Exception:
+            summaries_map = {}
+        domains_block = _format_domains_for_decompose(root_list, summaries_map)
+
         system = (
             "You identify which knowledge domains are needed to answer a question. "
             "Reply only with names from the provided list, one per line. "
@@ -1227,7 +1322,7 @@ class DeliberationEngine:
         )
         user = (
             f"Question: {query}\n"
-            f"Available domains: {', '.join(root_list)}\n"
+            f"Available domains:\n{domains_block}\n"
             "Which domains are needed?"
         )
         try:
@@ -1601,13 +1696,25 @@ class DeliberationEngine:
         candidates = [p for p in peers if p.vram_used_mb > self.vram_used_mb]
         return max(candidates, key=lambda p: p.vram_used_mb) if candidates else None
 
-    def _deliberate_with_peer(self, query: str, context: str, peer):
-        """Expert (local) → Critic (remote peer, E2E encrypted) → Synthesis (local, streaming)."""
+    def _deliberate_with_peer(
+        self,
+        query: str,
+        context: str,
+        peer,
+        expert_query: str | None = None,
+    ):
+        """Expert (local) → Critic (remote peer, E2E encrypted) → Synthesis (local, streaming).
+
+        `expert_query` (optional): rewritten/standalone version of `query` used
+        only in the Expert prompt. See _deliberate_multiagent for rationale.
+        """
         from node.server.client import call_peer_critic
         from node.crypto import load_or_generate_keypair
         from node.provider import call as _provider_call, stream as _provider_stream
 
         _priv, _pub = load_or_generate_keypair()
+
+        effective_expert_query = expert_query if expert_query else query
 
         # Shared history budget for the local Expert and the local Synth.
         # The remote Critic stays history-less — the peer protocol doesn't
@@ -1620,11 +1727,11 @@ class DeliberationEngine:
         if context:
             expert_prompt = (
                 f"[Knowledge context]\n{context}\n\n"
-                f"Question: {query}\n\n"
+                f"Question: {effective_expert_query}\n\n"
                 "Answer using the knowledge above."
             )
         else:
-            expert_prompt = f"Question: {query}\n\nAnswer helpfully."
+            expert_prompt = f"Question: {effective_expert_query}\n\nAnswer helpfully."
         expert_resp = _provider_call(
             messages=[
                 {"role": "system", "content": ROLES["expert"]["system"]},
@@ -1707,7 +1814,13 @@ class DeliberationEngine:
 
     # ─── Local multiagent ─────────────────────────────────────────────────────
 
-    def _deliberate_multiagent(self, query: str, context: str, retrieved_pages: dict | None = None):
+    def _deliberate_multiagent(
+        self,
+        query: str,
+        context: str,
+        retrieved_pages: dict | None = None,
+        expert_query: str | None = None,
+    ):
         """3-call sequential deliberation: Expert → Critic → Synthesis (streaming).
 
         `retrieved_pages` (optional): { (pack, file): {title, summary, content} }.
@@ -1715,7 +1828,16 @@ class DeliberationEngine:
         `fetch_full_page` tool to verify specific claims against the full source
         text. Without it (local-only mode), the Critic falls back to the
         excerpt-only behavior.
+
+        `expert_query` (optional): rewritten/standalone version of `query` used
+        only in the Expert prompt. Small models tend to bind ambiguous pronouns
+        ("this", "lui") to the most-local context (the [Knowledge context]
+        block) rather than to chat history, so we feed the already-resolved
+        query to remove the ambiguity. Synth keeps the user's original
+        phrasing so the final answer's voice matches the user's prompt.
+        Defaults to `query` for backward compatibility.
         """
+        effective_expert_query = expert_query if expert_query else query
         from node.provider import call as _provider_call, stream as _provider_stream
 
         # History budget — shared by Expert and Synth. Scales with the tier's
@@ -1733,11 +1855,11 @@ class DeliberationEngine:
         if context:
             expert_prompt = (
                 f"[Knowledge context]\n{context}\n\n"
-                f"Question: {query}\n\n"
+                f"Question: {effective_expert_query}\n\n"
                 "Answer using the knowledge above."
             )
         else:
-            expert_prompt = f"Question: {query}\n\nAnswer helpfully."
+            expert_prompt = f"Question: {effective_expert_query}\n\nAnswer helpfully."
         try:
             expert_resp = _provider_call(
                 messages=[

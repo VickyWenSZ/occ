@@ -281,6 +281,21 @@ def list_pack_paths(packs_root: Path) -> list[str]:
     return sorted(p for (p, _d) in _walk_packs(packs_root))
 
 
+def list_pack_summaries(packs_root: Path) -> dict[str, str]:
+    """Return {pack_path: summary} for every pack on disk. Summary comes from
+    each pack's manifest.yaml `summary` field (empty string if missing or
+    unreadable). Used by the engine's decompose step to disambiguate domain
+    selection — without summaries Qwen picks packs by literal name overlap
+    (e.g. 'open-cognitive-commons' bleeds into psychology queries because the
+    name contains 'cognitive')."""
+    out: dict[str, str] = {}
+    for pack_path, pack_dir in _walk_packs(packs_root):
+        summary = _read_pack_summary(pack_dir)
+        if summary:
+            out[pack_path] = summary
+    return out
+
+
 # ── Tree (mirrors broker /tree and /tree/{path}) ──────────────────────────────
 
 _TREE_SKIP_NAMES = {"wiki", "raw", "_refs"}
