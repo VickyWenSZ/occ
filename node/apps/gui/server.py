@@ -319,6 +319,17 @@ async def set_local_mode(body: LocalModeBody):
     _cfg = Config()
     if _engine:
         _engine._local_mode = body.enabled
+    # Toggling local mode ON kicks a background reindex so the FTS5 index
+    # reconciles with the filesystem — anything the user removed by hand
+    # from expert-packs/ since the last reindex stops appearing in search.
+    # Background: doesn't block the toggle response, doesn't crash if it fails.
+    if body.enabled and _cfg is not None:
+        try:
+            from node.retrieval import local_index
+            local_index.start_background_reindex(_cfg.packs_root)
+            log_bus.write("[local-mode] toggled ON — background reindex started")
+        except Exception as e:
+            log_bus.write(f"[local-mode] background reindex failed to start: {e}")
     return {"ok": True, "local_mode": body.enabled}
 
 
