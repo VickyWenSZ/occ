@@ -1020,9 +1020,31 @@ class DeliberationEngine:
     # and call into local_index. Two methods that are data-source-agnostic
     # (_translate_query_for_pack, _expand_via_see_also) are reused verbatim.
 
-    def _decompose_query_local(self, packs_root, query: str) -> list[str] | None:
+    @staticmethod
+    def _has_enabled_pack_under(scope: str, all_packs: list[str], disabled: set[str]) -> bool:
+        """True iff at least one pack on disk sits at `scope` (exact) or
+        below it AND is not in the disabled set. Used to hide top-level
+        domains and sub-tree nodes from Qwen when their entire sub-tree
+        contains only disabled packs."""
+        prefix = scope + "/"
+        for p in all_packs:
+            if (p == scope or p.startswith(prefix)) and p not in disabled:
+                return True
+        return False
+
+    def _decompose_query_local(
+        self,
+        packs_root,
+        query: str,
+        disabled: set[str] | None = None,
+        all_packs: list[str] | None = None,
+    ) -> list[str] | None:
         """Local twin of _decompose_query. Same 3-state contract; the root
         list comes from local_index.tree(packs_root) instead of broker /tree.
+
+        When `disabled` and `all_packs` are provided, top-level domains whose
+        whole sub-tree contains only disabled packs are pre-filtered out — so
+        Qwen sees only domains that actually have something to retrieve.
         """
         import re as _re
         from node.provider import call as _provider_call
@@ -1031,6 +1053,13 @@ class DeliberationEngine:
         root_list = local_index.tree(packs_root, "")
         if not isinstance(root_list, list) or not root_list:
             return None
+        if disabled and all_packs is not None:
+            root_list = [
+                d for d in root_list
+                if self._has_enabled_pack_under(d, all_packs, disabled)
+            ]
+            if not root_list:
+                return []
 
         lower_to_orig = {str(r).lower(): str(r) for r in root_list if isinstance(r, str)}
         if not lower_to_orig:
@@ -1106,9 +1135,20 @@ class DeliberationEngine:
 
         return " ".join(children) if children else ""
 
-    def _navigate_within_scope_local(self, packs_root, domain: str, query: str) -> str:
+    def _navigate_within_scope_local(
+        self,
+        packs_root,
+        domain: str,
+        query: str,
+        disabled: set[str] | None = None,
+        all_packs: list[str] | None = None,
+    ) -> str:
         """Local twin of _navigate_within_scope. LLM-driven tree-walk over the
-        local directory hierarchy. Returns `domain` at worst, never None."""
+        local directory hierarchy. Returns `domain` at worst, never None.
+
+        When `disabled` and `all_packs` are provided, sub-topics whose whole
+        sub-tree is disabled are filtered from the children list before
+        prompting Qwen."""
         from node.provider import call as _provider_call
         from node.retrieval import local_index
 
@@ -1120,6 +1160,13 @@ class DeliberationEngine:
             if not isinstance(node, dict):
                 return current_path
             children = node.get("children", []) or []
+            if disabled and all_packs is not None:
+                children = [
+                    c for c in children
+                    if self._has_enabled_pack_under(
+                        f"{current_path}/{c}", all_packs, disabled
+                    )
+                ]
             has_pack = node.get("has_pack", False)
 
             if not children:
@@ -1170,10 +1217,18 @@ class DeliberationEngine:
 
         return current_path
 
-    def _local_search(self, q: str, k: int = 8, scope: str = "") -> list[dict]:
-        """Local twin of _server_search. Hits the local FTS5 instead of /search."""
+    def _local_search(
+        self,
+        q: str,
+        k: int = 8,
+        scope: str = "",
+        disabled: list[str] | None = None,
+    ) -> list[dict]:
+        """Local twin of _server_search. Hits the local FTS5 instead of /search.
+        Defense-in-depth: even if a disabled pack slips into a scope, the SQL
+        filter `pack_path NOT IN (disabled)` drops its results."""
         from node.retrieval import local_index
-        return local_index.search(q, k=k, scope=scope)
+        return local_index.search(q, k=k, scope=scope, disabled_packs=disabled)
 
     def _retrieve_from_local(self, query: str) -> tuple:
         """
@@ -1205,8 +1260,25 @@ class DeliberationEngine:
         except Exception:
             return ("", {})
 
+        # Read the disabled-pack list fresh per query so UI toggles take
+        # effect without rebuilding the engine. all_packs is the on-disk
+        # truth (independent of which packs Forge has touched recently).
+        try:
+            from node.apps.cli.config import load_disabled_packs
+            disabled_set = set(load_disabled_packs())
+        except Exception:
+            disabled_set = set()
+        all_packs = local_index.list_pack_paths(packs_root)
+        disabled_list = sorted(disabled_set)
+        if all_packs and not any(p not in disabled_set for p in all_packs):
+            # Every pack on disk is disabled → user explicitly opted out.
+            _log("[retrieve-local] all packs disabled — skipping retrieval")
+            return ("", {})
+
         _log(f"[retrieve-local] decompose: query={query[:80]!r}")
-        decision = self._decompose_query_local(packs_root, query)
+        decision = self._decompose_query_local(
+            packs_root, query, disabled=disabled_set, all_packs=all_packs,
+        )
         _log(f"[retrieve-local] decompose result: {decision!r}")
 
         if decision == []:
@@ -1214,13 +1286,16 @@ class DeliberationEngine:
 
         results_per_group: list[list[dict]] = []
         if decision is None:
-            legacy = self._local_search(query, k=12)
+            legacy = self._local_search(query, k=12, disabled=disabled_list)
             legacy.sort(key=lambda r: r.get("score", 0))
             if legacy:
                 results_per_group.append(legacy)
         else:
             for domain in decision:
-                scope_path = self._navigate_within_scope_local(packs_root, domain, query)
+                scope_path = self._navigate_within_scope_local(
+                    packs_root, domain, query,
+                    disabled=disabled_set, all_packs=all_packs,
+                )
                 _log(f"[retrieve-local] domain={domain} scope={scope_path}")
                 sample = self._fetch_index_sample_local(packs_root, scope_path)
                 if not sample:
@@ -1228,10 +1303,10 @@ class DeliberationEngine:
                     continue
                 translated_q = self._translate_query_for_pack(query, sample)
                 _log(f"[retrieve-local] keywords for {scope_path}: {translated_q!r}")
-                d_results = self._local_search(translated_q, k=8, scope=scope_path)
+                d_results = self._local_search(translated_q, k=8, scope=scope_path, disabled=disabled_list)
                 if not d_results and scope_path != domain:
                     _log(f"[retrieve-local] empty at {scope_path}, retry at {domain}")
-                    d_results = self._local_search(translated_q, k=8, scope=domain)
+                    d_results = self._local_search(translated_q, k=8, scope=domain, disabled=disabled_list)
                 d_results.sort(key=lambda r: r.get("score", 0))
                 _log(f"[retrieve-local] {len(d_results)} hits for {domain}; top: "
                      f"{(d_results[0].get('page_file', '') if d_results else '-')}")

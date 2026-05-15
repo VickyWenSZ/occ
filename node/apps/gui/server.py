@@ -263,6 +263,8 @@ async def get_gpu_stats():
 async def get_config():
     if not _cfg:
         raise HTTPException(503, "Not ready")
+    from node.retrieval import local_index
+    from node.apps.cli.config import load_disabled_packs
     return {
         "model": _model,
         "hardware_profile": _cfg.hardware_profile,
@@ -272,6 +274,11 @@ async def get_config():
         "openrouter_key_saved": bool(_cfg.openrouter_api_key),
         "openrouter_model": _cfg.openrouter_model,
         "packs": [{"name": p.name, "domains": p.domains} for p in (_retriever.packs if _retriever else [])],
+        # Full pack_paths on disk (recursive, includes nested layouts) and the
+        # subset currently disabled by the user. Used by the Knowledge Source
+        # panel to render enable/disable chip toggles.
+        "pack_paths": local_index.list_pack_paths(_cfg.packs_root),
+        "disabled_packs": load_disabled_packs(),
         "local_mode": _cfg.local_mode,
     }
 
@@ -332,6 +339,39 @@ async def local_reindex():
         raise HTTPException(500, f"Reindex failed: {e}")
     log_bus.write(f"[local-index] reindex complete: {result}")
     return {"ok": True, **result}
+
+
+class DisabledPacksBody(BaseModel):
+    disabled: list[str]
+
+
+@app.get("/api/local/pack-state")
+async def get_pack_state():
+    """Return the full list of pack_paths on disk plus the disabled subset.
+    The UI uses this to render which chips are 'loaded' vs 'unloaded'.
+    Independent of the engine; reflects only what's persisted in config and
+    what exists on disk right now."""
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    from node.retrieval import local_index
+    from node.apps.cli.config import load_disabled_packs
+    all_packs = local_index.list_pack_paths(_cfg.packs_root)
+    return {
+        "packs": all_packs,
+        "disabled": load_disabled_packs(),
+    }
+
+
+@app.post("/api/local/pack-state")
+async def set_pack_state(body: DisabledPacksBody):
+    """Persist a new disabled-pack set. The engine reads this list fresh on
+    every local-mode query, so toggles take effect immediately — no reindex,
+    no engine rebuild."""
+    if not _cfg:
+        raise HTTPException(503, "Not ready")
+    from node.apps.cli.config import save_disabled_packs
+    save_disabled_packs(body.disabled)
+    return {"ok": True, "disabled": sorted(set(body.disabled))}
 
 
 class OpenRouterActiveBody(BaseModel):

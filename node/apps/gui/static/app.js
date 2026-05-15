@@ -1870,10 +1870,17 @@ function _updateSourceSides(localOn) {
 function _renderPacksList(cfg) {
   const list = document.getElementById('settings-packs-list');
   if (!list) return;
-  const packs = cfg.packs || [];
+  // pack_paths is the recursive on-disk truth; cfg.packs is the legacy flat
+  // list (kept for the domain count chip).
+  const packPaths = cfg.pack_paths || [];
+  const disabled = new Set(cfg.disabled_packs || []);
+  const domainsByName = {};
+  for (const p of (cfg.packs || [])) {
+    domainsByName[p.name] = p.domains || [];
+  }
   const localOn = !!cfg.local_mode;
 
-  if (!packs.length) {
+  if (!packPaths.length) {
     list.innerHTML = `<span class="settings-packs-note">No local packs — create one with Forge.</span>`;
     return;
   }
@@ -1882,12 +1889,52 @@ function _renderPacksList(cfg) {
     ? ''
     : `<span class="settings-packs-note" style="width:100%;margin-bottom:0.25rem;">Available locally (active when Local only is ON):</span>`;
 
-  const chips = packs.map(p => {
-    const dc = p.domains?.length || 0;
-    return `<span class="settings-pack-chip">${escapeHtml(p.name)}${dc ? `<span class="settings-pack-chip-count">${dc}d</span>` : ''}</span>`;
+  const chips = packPaths.map(path => {
+    const leaf = path.includes('/') ? path.slice(path.lastIndexOf('/') + 1) : path;
+    const dc = domainsByName[leaf]?.length || 0;
+    const isDisabled = disabled.has(path);
+    const cls = isDisabled ? 'settings-pack-chip disabled' : 'settings-pack-chip';
+    const tip = isDisabled ? 'Click to enable for retrieval' : 'Click to disable for retrieval';
+    const safePath = escapeHtml(path);
+    return `<span class="${cls}" data-pack-path="${safePath}" title="${tip}" onclick="togglePack('${safePath.replace(/'/g, '&#39;')}')">${escapeHtml(path)}${dc ? `<span class="settings-pack-chip-count">${dc}d</span>` : ''}</span>`;
   }).join('');
 
   list.innerHTML = prefix + chips;
+}
+
+async function togglePack(packPath) {
+  if (!config) return;
+  const current = new Set(config.disabled_packs || []);
+  if (current.has(packPath)) {
+    current.delete(packPath);
+  } else {
+    current.add(packPath);
+  }
+  const next = Array.from(current).sort();
+  const r = await apiFetch('/api/local/pack-state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ disabled: next }),
+  });
+  if (r?.ok) {
+    config.disabled_packs = r.disabled;
+    _renderPacksList(config);
+  }
+}
+
+async function setAllPacksEnabled(enable) {
+  if (!config) return;
+  const all = config.pack_paths || [];
+  const disabled = enable ? [] : Array.from(all);
+  const r = await apiFetch('/api/local/pack-state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ disabled }),
+  });
+  if (r?.ok) {
+    config.disabled_packs = r.disabled;
+    _renderPacksList(config);
+  }
 }
 
 async function setLocalMode(enabled) {

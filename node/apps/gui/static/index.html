@@ -719,6 +719,18 @@
         <div class="settings-reindex-row">
           <button
             type="button"
+            id="local-load-all-btn"
+            class="btn-ghost btn-ghost-sm"
+            title="Enables every pack on disk for local retrieval."
+            onclick="setAllPacksEnabled(true)">Load ALL</button>
+          <button
+            type="button"
+            id="local-unload-all-btn"
+            class="btn-ghost btn-ghost-sm"
+            title="Disables every pack — local retrieval will return nothing until you re-enable some packs."
+            onclick="setAllPacksEnabled(false)">Unload ALL</button>
+          <button
+            type="button"
             id="local-reindex-btn"
             class="btn-ghost btn-ghost-sm"
             title="Rebuilds the local search index over all packs in expert-packs/. Forge and Lint already do this automatically for the pack they touch — use this only after adding or moving pack folders by hand."

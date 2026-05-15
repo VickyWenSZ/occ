@@ -221,9 +221,19 @@ def _fts_escape(q: str) -> str:
     return " OR ".join(f'"{w}"' for w in words)
 
 
-def search(q: str, k: int = 10, scope: str = "") -> list[dict]:
+def search(
+    q: str,
+    k: int = 10,
+    scope: str = "",
+    disabled_packs: list[str] | None = None,
+) -> list[dict]:
     """Run an FTS5 query and return top-K results ranked by BM25 — same shape
-    as broker /search response. Empty list on any error or empty query."""
+    as broker /search response. Empty list on any error or empty query.
+
+    `disabled_packs` is an optional list of pack_paths to exclude from the
+    results (UI toggle "Unload" some packs). The index stays full; filtering
+    happens at query time via SQL, so toggling is instantaneous.
+    """
     if not q.strip():
         return []
     try:
@@ -231,29 +241,23 @@ def search(q: str, k: int = 10, scope: str = "") -> list[dict]:
     except Exception:
         return []
     try:
+        clauses = ["pack_pages MATCH ?"]
+        params: list = [_fts_escape(q)]
         if scope:
-            cursor = conn.execute(
-                """
-                SELECT pack_path, page_file, title, summary, pack_summary, rank
-                FROM pack_pages
-                WHERE pack_pages MATCH ?
-                  AND (pack_path = ? OR pack_path LIKE ?)
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (_fts_escape(q), scope, f"{scope}/%", k),
-            )
-        else:
-            cursor = conn.execute(
-                """
-                SELECT pack_path, page_file, title, summary, pack_summary, rank
-                FROM pack_pages
-                WHERE pack_pages MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (_fts_escape(q), k),
-            )
+            clauses.append("(pack_path = ? OR pack_path LIKE ?)")
+            params.extend([scope, f"{scope}/%"])
+        if disabled_packs:
+            placeholders = ",".join("?" for _ in disabled_packs)
+            clauses.append(f"pack_path NOT IN ({placeholders})")
+            params.extend(disabled_packs)
+        sql = (
+            "SELECT pack_path, page_file, title, summary, pack_summary, rank "
+            "FROM pack_pages "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY rank LIMIT ?"
+        )
+        params.append(k)
+        cursor = conn.execute(sql, params)
         return [
             {
                 "pack_path": row[0],
@@ -269,6 +273,12 @@ def search(q: str, k: int = 10, scope: str = "") -> list[dict]:
         return []
     finally:
         conn.close()
+
+
+def list_pack_paths(packs_root: Path) -> list[str]:
+    """Return every pack_path on disk (sorted). Used by the UI and the engine
+    to compute which domains contain at least one enabled pack."""
+    return sorted(p for (p, _d) in _walk_packs(packs_root))
 
 
 # ── Tree (mirrors broker /tree and /tree/{path}) ──────────────────────────────
