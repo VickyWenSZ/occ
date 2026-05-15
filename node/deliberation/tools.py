@@ -692,13 +692,17 @@ def list_packs(prefix: str = "") -> str:
     return "\n".join(lines).strip()
 
 
-def download_pack(path: str) -> str:
+def download_pack(path: str, force: bool = False) -> str:
     """Download a pack from the OCC broker to the local expert-packs/ folder.
 
     Saves the pack as DISABLED so it doesn't interfere with current retrieval.
     The user activates it from Settings — that toggle calls reindex_pack so
-    the pack becomes searchable on first activation. Overwrites any existing
-    local copy silently (with a note in the return value).
+    the pack becomes searchable on first activation.
+
+    Two-step confirmation when a pack of the same path already exists locally:
+    the first call returns a message describing the conflict and does NOT
+    touch the filesystem. The LLM is expected to relay that to the user and,
+    on confirmation, re-call this tool with force=true.
     """
     import httpx
     from node.retrieval.pack_cache import SERVER_URL
@@ -713,7 +717,32 @@ def download_pack(path: str) -> str:
 
     pack_dir = _PACKS_ROOT / pack_path
     wiki_dir = pack_dir / "wiki"
-    pre_existed = pack_dir.exists()
+    pre_existed = pack_dir.exists() and (pack_dir / "manifest.yaml").exists()
+
+    if pre_existed and not force:
+        # Surface the conflict to the user via the model. Count what's at risk
+        # so the user can make an informed call.
+        try:
+            existing_pages = sum(
+                1 for f in (wiki_dir).rglob("*.md") if f.is_file()
+            ) if wiki_dir.exists() else 0
+        except Exception:
+            existing_pages = 0
+        try:
+            from node.apps.cli.config import load_disabled_packs
+            enabled = pack_path not in set(load_disabled_packs())
+        except Exception:
+            enabled = False
+        status = "enabled" if enabled else "disabled"
+        return (
+            f"A local pack already exists at '{pack_path}' "
+            f"({existing_pages} pages, currently {status}). "
+            f"Re-downloading will OVERWRITE every file on disk, including any "
+            f"local edits made with Forge. "
+            f"If the user confirms they want to overwrite, call this tool "
+            f"again with force=true. If they want to keep the local copy, "
+            f"do nothing."
+        )
 
     pages_to_fetch: list[str] = []
     try:
@@ -836,7 +865,11 @@ TOOL_SCHEMA += [
                 "folder so the user can use it later in local mode or modify it "
                 "with Forge. The pack is saved DISABLED — activation from "
                 "Settings makes it searchable (and triggers indexing). Use when "
-                "the user explicitly asks to download or save a pack."
+                "the user explicitly asks to download or save a pack. "
+                "If a pack with the same path already exists locally, the first "
+                "call returns a conflict message asking for confirmation without "
+                "touching the filesystem; relay that to the user and only re-call "
+                "with force=true if they explicitly confirm overwriting."
             ),
             "parameters": {
                 "type": "object",
@@ -846,6 +879,14 @@ TOOL_SCHEMA += [
                         "description": (
                             "Full pack path on the broker (e.g. 'marketing/"
                             "storybrand' or 'history/ancient-rome/caesar')."
+                        ),
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": (
+                            "Set to true only after the user has confirmed they "
+                            "want to overwrite a pre-existing local copy of the "
+                            "same pack. Default false."
                         ),
                     },
                 },
