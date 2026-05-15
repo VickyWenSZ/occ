@@ -217,6 +217,7 @@ function setupEventListeners() {
   document.getElementById('btn-save-or').addEventListener('click', saveOpenRouter);
   document.getElementById('or-active-toggle')?.addEventListener('change', e => setOrActive(e.target.checked));
   document.getElementById('btn-update').addEventListener('click', runUpdate);
+  document.getElementById('btn-clear-all-chats').addEventListener('click', clearAllChats);
 
   // Close modals on overlay click
   document.querySelectorAll('.modal-overlay').forEach(overlay => {
@@ -1027,6 +1028,7 @@ const SLASH_COMMANDS = [
   { cmd: '/peers',          desc: 'Show active peer nodes on the broker' },
   { cmd: '/local on',       desc: 'Use local packs only — for private Forge packs' },
   { cmd: '/local off',      desc: 'Use server packs (default)' },
+  { cmd: '/ollama',         desc: 'Toggle raw-Ollama mode: bypass OCC (no classifier, skills, retrieval, tools)' },
   { cmd: '/load',           desc: 'Reload model into VRAM' },
   { cmd: '/unload',         desc: 'Unload model from VRAM' },
   { cmd: '/openrouter on',  desc: 'Switch to OpenRouter (if configured)' },
@@ -1841,6 +1843,23 @@ async function openSettings() {
   if (hint) hint.style.display = cfg.openrouter_key_saved ? 'block' : 'none';
 
   document.getElementById('settings-modal').classList.remove('hidden');
+}
+
+async function clearAllChats() {
+  const status = document.getElementById('clear-chats-status');
+  if (!confirm('Cancellare tutte le chat? Questa operazione non può essere annullata.')) return;
+  if (!confirm('Sei sicuro? Tutte le chat e i file caricati verranno eliminati definitivamente.')) return;
+  status.textContent = 'Cancellazione…';
+  try {
+    await apiFetch('/api/chats', { method: 'DELETE' });
+    status.textContent = 'Fatto.';
+    setTimeout(() => { status.textContent = ''; }, 3000);
+    closeModal('settings-modal');
+    await loadChats();
+    await newChat();
+  } catch (e) {
+    status.textContent = 'Errore: ' + e.message;
+  }
 }
 
 function _updateSourceSides(localOn) {

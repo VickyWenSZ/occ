@@ -186,6 +186,7 @@ def _init():
         openrouter_key=_cfg.openrouter_api_key,
         openrouter_model=_cfg.openrouter_model,
         skills_dir=ROOT / "skills",
+        packs_root=_cfg.packs_root,
     )
 
     _ready = True
@@ -1488,6 +1489,7 @@ async def forge_reload_packs():
         openrouter_model=_cfg.openrouter_model,
         local_mode=_cfg.local_mode,
         skills_dir=ROOT / "skills",
+        packs_root=_cfg.packs_root,
     )
     n = len(_retriever.packs)
     log_bus.write(f"[GUI] Packs reloaded: {n} pack(s)")
@@ -2013,6 +2015,24 @@ async def delete_chat(chat_id: str):
     return {"ok": True}
 
 
+@app.delete("/api/chats")
+async def delete_all_chats():
+    _save_chats([])
+    _CHAT_UPLOADS.clear()
+    _CHAT_STOPS.clear()
+    upload_root = (ROOT / "upload").resolve()
+    if upload_root.exists():
+        for f in upload_root.iterdir():
+            if f.is_file() and f.name != ".gitkeep":
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+    if _engine:
+        _engine._history.clear()
+    return {"ok": True}
+
+
 class RenameChatBody(BaseModel):
     title: str
 
@@ -2155,7 +2175,13 @@ async def chat_query(chat_id: str, body: QueryBody):
         # All three modes are passed through to the engine, which has a
         # dedicated branch for each.
         mode = body.mode
-        if mode == "auto":
+        # Hard override: if /ollama bypass is ON, route every message to the
+        # raw-Ollama path. Skips classifier, skills, retrieval, tools, system
+        # prompt. Toggle off with /ollama.
+        if _OLLAMA_MODE:
+            mode = "ollama"
+            log_bus.write("[router] /ollama bypass ON → raw Ollama call")
+        elif mode == "auto":
             if known_files:
                 mode = "chat"
             else:
@@ -2290,10 +2316,16 @@ _HELP_TEXT = """\
 /status            show current config
 /local on          use local packs only — for private Forge packs
 /local off         use server packs (default)
+/ollama            toggle raw-Ollama mode: bypass OCC framework (no classifier, skills, retrieval, tools)
 /unload            unload model from VRAM
 /load              reload model into VRAM
 /openrouter on     switch to OpenRouter (if configured)
 /openrouter off    switch to local model"""
+
+# When True, chat_query sets mode='ollama' for every message: the engine
+# bypasses classifier, skills, retrieval, and tools, calling Ollama with no
+# OCC system prompt. Useful to compare raw model behavior vs OCC framework.
+_OLLAMA_MODE = False
 
 
 class CommandBody(BaseModel):
@@ -2318,6 +2350,19 @@ async def run_command(body: CommandBody):
             _engine._peak_ctx_used = 0
             _engine._last_ctx_used = 0
         return {"output": "Conversation cleared."}
+
+    if cmd == "/ollama":
+        global _OLLAMA_MODE
+        _OLLAMA_MODE = not _OLLAMA_MODE
+        if _OLLAMA_MODE:
+            return {"output": (
+                "Ollama bypass: ON\n\n"
+                "OCC framework disconnected — no classifier, no skills, no "
+                "retrieval, no tools. The model now responds raw, as if you "
+                "were calling Ollama directly with no system prompt.\n\n"
+                "Use /ollama again to turn off."
+            )}
+        return {"output": "Ollama bypass: OFF\n\nOCC framework restored."}
 
     if cmd == "/status":
         or_info = f"OpenRouter: {_cfg.openrouter_model}" if _cfg.openrouter_api_key else "OpenRouter: off"
@@ -2374,6 +2419,7 @@ async def run_command(body: CommandBody):
             openrouter_key=_cfg.openrouter_api_key,
             openrouter_model=_cfg.openrouter_model,
             skills_dir=ROOT / "skills",
+            packs_root=_cfg.packs_root,
         )
         return {"output": f"Switched to {new_model}"}
 
@@ -2393,6 +2439,7 @@ async def run_command(body: CommandBody):
             openrouter_key=_cfg.openrouter_api_key,
             openrouter_model=_cfg.openrouter_model,
             skills_dir=ROOT / "skills",
+            packs_root=_cfg.packs_root,
         )
         return {"output": f"Loaded pack: {pack_name}  ·  domains: {', '.join(_retriever.domains)}"}
 

@@ -120,15 +120,23 @@ def _parse_frontmatter_brief(text: str) -> tuple[str, str]:
 
 
 _OCC_IDENTITY = (
-    "You are OCC (Open Cognitive Commons), a helpful and friendly AI assistant. "
-    "You run locally on the user's machine as part of a distributed network of AI agents. "
-    "You are a general-purpose assistant: you can answer questions on any topic, help with code, "
-    "writing, analysis, reasoning, and more. "
-    "Beyond your general knowledge, you have access to curated expert knowledge packs and can "
-    "collaborate with peer nodes on the network for deeper, specialized answers. "
-    "Sometimes responses take a little longer because you are consulting peer nodes — this is normal. "
-    "Do NOT proactively advertise your domains or capabilities. "
-    "Only mention what domains or packs you have loaded if the user explicitly asks."
+    "You are OCC (Open Cognitive Commons), a general-purpose AI assistant. "
+    "You can help with questions on any topic, code, writing, reasoning, and analysis. "
+    "When expert knowledge packs are loaded, you answer from curated, verified sources "
+    "and can consult peer nodes on the network for deeper answers. "
+    "Sometimes responses take a little longer because you are consulting peer nodes — this is normal.\n\n"
+    "YOUR CAPABILITIES — describe these if the user asks what you can do:\n"
+    "- Answer questions from expert knowledge packs (topics depend on what is loaded)\n"
+    "- Search the web and read web pages (when the user explicitly asks)\n"
+    "- Read uploaded files: PDF, Word documents, Excel spreadsheets\n"
+    "- Transcribe audio files to text\n"
+    "- Read, write, and list files in the workspace\n"
+    "- Execute Python code (working directory: the workspace)\n"
+    "- Structured tasks: multi-source web research, fact-checking, "
+    "document Q&A, code inspection, code generation, code refactoring\n\n"
+    "Do NOT proactively list or advertise these capabilities. "
+    "Only describe them if the user explicitly asks what you can do. "
+    "Do NOT call web tools on your own initiative — only when the user explicitly asks."
 )
 
 
@@ -147,6 +155,7 @@ class DeliberationEngine:
         local_mode: bool = False,
         vram_used_mb: int = 0,
         skills_dir=None,
+        packs_root=None,
     ):
         self.model = model
         self.or_key = openrouter_key
@@ -157,6 +166,16 @@ class DeliberationEngine:
         self.num_ctx_answer = num_ctx_answer
         self.num_ctx_synth = num_ctx_synth
         self._retrieval_chars_local = retrieval_chars
+        # Root of local expert-packs/ (only used by the local retrieval pipeline).
+        # When set, _retrieve_from_local walks this dir and queries the local
+        # FTS5 index. None falls back to the legacy expert_pack.retrieve path.
+        self._local_packs_root = packs_root
+        if local_mode and packs_root is not None:
+            try:
+                from node.retrieval import local_index
+                local_index.start_background_reindex(packs_root)
+            except Exception:
+                pass
 
         # Load skills from skills/ if the directory was passed. Adding/removing
         # a skill is just adding/removing a *.py file in that directory.
@@ -177,7 +196,9 @@ class DeliberationEngine:
             )
         workspace_path = str(workspace) if workspace else "the workspace folder"
         parts.append(
-            f"Workspace directory: {workspace_path}. "
+            f"Your workspace folder is at: {workspace_path}. "
+            "This is the folder where you can read and write files and run Python code on behalf of the user. "
+            "If the user asks where OCC stores files or where to put files, tell them this path. "
             "Call any tool listed in your available tools when it helps answer the user. "
             "IMPORTANT: do NOT call web_search or fetch_url on your own initiative. "
             "Use them ONLY when the user explicitly asks to search the web, look "
@@ -215,6 +236,14 @@ class DeliberationEngine:
     # ─── Public entry point ───────────────────────────────────────────────────
 
     def route_stream(self, query: str, mode: str = "deliberate", images: list | None = None):
+        # Ollama bypass: completely raw — no OCC system prompt, no tools, no
+        # retrieval, no skills. Activated by the /ollama toggle. Useful to
+        # compare the raw model behavior against OCC's framework output.
+        if mode == "ollama":
+            yield ("routing", "ollama")
+            yield from self._stream_ollama_raw(query, images=images)
+            return
+
         # Chitchat: pure social/meta. No tools exposed, no retrieval — just a
         # streaming LLM call so 'ciao' / 'thanks' / 'who are you' don't pay
         # for tool schema overhead and Qwen can't spuriously call anything.
@@ -241,14 +270,23 @@ class DeliberationEngine:
             yield from self._run_skill(skill_name, query, images=images)
             return
 
-        # Local mode: uses private packs, no server, no peers
+        # Local mode: uses private packs, no server, no peers.
+        # When packs_root is wired (gui flow), use the new local pipeline that
+        # mirrors the server one (decompose → tree-walk → translate → FTS5 →
+        # See Also → per-domain budget) over the on-disk expert-packs/ tree.
+        # Otherwise fall back to the legacy expert_pack.retrieve keyword search.
         if self._local_mode:
-            context = (
-                self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
-                if self.expert_pack else ""
-            )
+            yield ("status", "Retrieving knowledge...")
+            if self._local_packs_root is not None:
+                context, retrieved_pages = self._retrieve_from_local(query)
+            else:
+                context = (
+                    self.expert_pack.retrieve(query, max_chars=self.retrieval_chars)
+                    if self.expert_pack else ""
+                )
+                retrieved_pages = None
             yield ("routing", "local_private")
-            yield from self._deliberate_multiagent(query, context, retrieved_pages=None)
+            yield from self._deliberate_multiagent(query, context or "", retrieved_pages=retrieved_pages)
             return
 
         yield ("status", "Retrieving knowledge...")
@@ -971,6 +1009,356 @@ class DeliberationEngine:
                 break
         return [{"pack": pack_path, "file": f} for f in candidates]
 
+    # ─── Local retrieval pipeline ─────────────────────────────────────────────
+    #
+    # Parallel twin of the server pipeline above (_retrieve_from_server and its
+    # helpers). Same 7-step shape, same query semantics, same return contract —
+    # but the data source is the on-disk expert-packs/ tree + the local FTS5
+    # index (node/retrieval/local_index.py) instead of the broker over HTTP.
+    #
+    # No server method is touched: the helpers below are NEW (suffix `_local`)
+    # and call into local_index. Two methods that are data-source-agnostic
+    # (_translate_query_for_pack, _expand_via_see_also) are reused verbatim.
+
+    def _decompose_query_local(self, packs_root, query: str) -> list[str] | None:
+        """Local twin of _decompose_query. Same 3-state contract; the root
+        list comes from local_index.tree(packs_root) instead of broker /tree.
+        """
+        import re as _re
+        from node.provider import call as _provider_call
+        from node.retrieval import local_index
+
+        root_list = local_index.tree(packs_root, "")
+        if not isinstance(root_list, list) or not root_list:
+            return None
+
+        lower_to_orig = {str(r).lower(): str(r) for r in root_list if isinstance(r, str)}
+        if not lower_to_orig:
+            return None
+
+        system = (
+            "You identify which knowledge domains are needed to answer a question. "
+            "Reply only with names from the provided list, one per line. "
+            "Reply 'none' if nothing is relevant. Maximum 4 domains."
+        )
+        user = (
+            f"Question: {query}\n"
+            f"Available domains: {', '.join(root_list)}\n"
+            "Which domains are needed?"
+        )
+        try:
+            resp = _provider_call(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                model_local=self.model,
+                or_key="",
+                or_model="",
+                tools=None,
+                temperature=0.0,
+                num_ctx=2048,
+            )
+            raw = (resp.content or "").strip()
+        except Exception:
+            return None
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for token in _re.findall(r"[a-zA-Z0-9][a-zA-Z0-9\-_]*", raw):
+            t = token.lower()
+            if t == "none":
+                continue
+            if t in lower_to_orig and t not in seen:
+                seen.add(t)
+                out.append(lower_to_orig[t])
+                if len(out) >= 4:
+                    break
+        return out
+
+    def _fetch_index_sample_local(self, packs_root, domain: str) -> str:
+        """Local twin of _fetch_index_sample. Walks the local tree (up to 2
+        levels) for a reachable index.md; falls back to children names."""
+        from node.retrieval import local_index
+
+        text = local_index.read_index(packs_root, domain)
+        if text:
+            return text
+
+        node = local_index.tree(packs_root, domain)
+        if not isinstance(node, dict):
+            return ""
+        children = node.get("children", []) or []
+
+        for child in children:
+            text = local_index.read_index(packs_root, f"{domain}/{child}")
+            if text:
+                return text
+
+        for child in children:
+            sub = local_index.tree(packs_root, f"{domain}/{child}")
+            if not isinstance(sub, dict):
+                continue
+            for grandchild in sub.get("children", []) or []:
+                text = local_index.read_index(packs_root, f"{domain}/{child}/{grandchild}")
+                if text:
+                    return text
+
+        return " ".join(children) if children else ""
+
+    def _navigate_within_scope_local(self, packs_root, domain: str, query: str) -> str:
+        """Local twin of _navigate_within_scope. LLM-driven tree-walk over the
+        local directory hierarchy. Returns `domain` at worst, never None."""
+        from node.provider import call as _provider_call
+        from node.retrieval import local_index
+
+        MAX_DEPTH = 4
+        current_path = domain
+
+        for _ in range(MAX_DEPTH):
+            node = local_index.tree(packs_root, current_path)
+            if not isinstance(node, dict):
+                return current_path
+            children = node.get("children", []) or []
+            has_pack = node.get("has_pack", False)
+
+            if not children:
+                return current_path
+
+            stop_hint = (
+                " Or reply 'stop' to use this overview level."
+                if has_pack
+                else " Or reply 'none' if no sub-topic is relevant."
+            )
+            prompt = (
+                f"You are navigating a knowledge tree to find the right level "
+                f"for this question: \"{query}\"\n"
+                f"Current location: {current_path}\n"
+                + ("This location has its own overview pack.\n" if has_pack else "")
+                + f"Sub-topics available: {', '.join(children)}\n"
+                f"Which sub-topic is most relevant? Reply with exactly one name "
+                f"from the list.{stop_hint}"
+            )
+
+            try:
+                llm_resp = _provider_call(
+                    messages=[{"role": "user", "content": prompt}],
+                    model_local=self.model,
+                    or_key="",
+                    or_model="",
+                    tools=None,
+                    temperature=0.0,
+                    num_ctx=2048,
+                )
+                choice = (llm_resp.content or "").strip().rstrip(".").lower()
+            except Exception:
+                return current_path
+
+            if choice in ("none", "stop", ""):
+                return current_path
+
+            matched = next((c for c in children if c.lower() == choice), None)
+            if not matched:
+                matched = next(
+                    (c for c in children if choice in c.lower() or c.lower() in choice),
+                    None,
+                )
+            if not matched:
+                return current_path
+
+            current_path = f"{current_path}/{matched}"
+
+        return current_path
+
+    def _local_search(self, q: str, k: int = 8, scope: str = "") -> list[dict]:
+        """Local twin of _server_search. Hits the local FTS5 instead of /search."""
+        from node.retrieval import local_index
+        return local_index.search(q, k=k, scope=scope)
+
+    def _retrieve_from_local(self, query: str) -> tuple:
+        """
+        Local-disk twin of _retrieve_from_server. Same 7-step pipeline:
+          1. decompose query into root domains (local tree)
+          2. per domain, tree-walk to the right depth + translate to pack language
+          3. per-domain scoped FTS5 search
+          4. round-robin merge across domains, dedup
+          5. fetch full page content (direct disk read)
+          6. See Also expansion per pack
+          7. assemble context with per-domain budget + build retrieved_pages
+
+        Returns (context, retrieved_pages) — same shape as the server twin.
+        Status semantics (mirrored):
+          - non-empty string → success
+          - ""               → no-retrieval decision or empty results
+          - None             → reserved for unreachable backend (not used here:
+                               local disk is always reachable if packs_root exists)
+        """
+        from pathlib import Path
+        from node.retrieval import local_index
+
+        packs_root = self._local_packs_root
+        if packs_root is None or not Path(packs_root).exists():
+            return ("", {})
+
+        try:
+            local_index.ensure_index_ready(packs_root)
+        except Exception:
+            return ("", {})
+
+        _log(f"[retrieve-local] decompose: query={query[:80]!r}")
+        decision = self._decompose_query_local(packs_root, query)
+        _log(f"[retrieve-local] decompose result: {decision!r}")
+
+        if decision == []:
+            return ("", {})
+
+        results_per_group: list[list[dict]] = []
+        if decision is None:
+            legacy = self._local_search(query, k=12)
+            legacy.sort(key=lambda r: r.get("score", 0))
+            if legacy:
+                results_per_group.append(legacy)
+        else:
+            for domain in decision:
+                scope_path = self._navigate_within_scope_local(packs_root, domain, query)
+                _log(f"[retrieve-local] domain={domain} scope={scope_path}")
+                sample = self._fetch_index_sample_local(packs_root, scope_path)
+                if not sample:
+                    _log(f"[retrieve-local] no index sample for {scope_path} — skip")
+                    continue
+                translated_q = self._translate_query_for_pack(query, sample)
+                _log(f"[retrieve-local] keywords for {scope_path}: {translated_q!r}")
+                d_results = self._local_search(translated_q, k=8, scope=scope_path)
+                if not d_results and scope_path != domain:
+                    _log(f"[retrieve-local] empty at {scope_path}, retry at {domain}")
+                    d_results = self._local_search(translated_q, k=8, scope=domain)
+                d_results.sort(key=lambda r: r.get("score", 0))
+                _log(f"[retrieve-local] {len(d_results)} hits for {domain}; top: "
+                     f"{(d_results[0].get('page_file', '') if d_results else '-')}")
+                if d_results:
+                    results_per_group.append(d_results)
+
+        if not results_per_group:
+            return ("", {})
+
+        page_meta: dict[tuple[str, str], dict] = {}
+        for g_results in results_per_group:
+            for r in g_results:
+                k = (r.get("pack_path", ""), r.get("page_file", ""))
+                if k[0] and k[1] and k not in page_meta:
+                    page_meta[k] = {
+                        "title": r.get("title", ""),
+                        "summary": r.get("summary", ""),
+                    }
+
+        PER_GROUP = 4
+        MAX_PAGES_TOTAL = 12
+        seen: set[tuple[str, str]] = set()
+        refs_by_pack: dict[str, list[str]] = {}
+        ordered_refs: list[tuple[str, str]] = []
+        for round_idx in range(PER_GROUP):
+            for g_results in results_per_group:
+                if len(seen) >= MAX_PAGES_TOTAL:
+                    break
+                if round_idx >= len(g_results):
+                    continue
+                r = g_results[round_idx]
+                pack_path = r.get("pack_path", "")
+                page_file = r.get("page_file", "")
+                if not pack_path or not page_file:
+                    continue
+                key = (pack_path, page_file)
+                if key in seen:
+                    continue
+                seen.add(key)
+                refs_by_pack.setdefault(pack_path, []).append(page_file)
+                ordered_refs.append(key)
+            if len(seen) >= MAX_PAGES_TOTAL:
+                break
+
+        if not refs_by_pack:
+            return ("", {})
+
+        pages_by_pack: dict[str, dict[str, str]] = {}
+        for pack_path, files in refs_by_pack.items():
+            fetched: dict[str, str] = {}
+            for f in files:
+                content = local_index.read_page(packs_root, pack_path, f)
+                if content:
+                    fetched[f] = content
+            if fetched:
+                pages_by_pack[pack_path] = fetched
+
+        if not pages_by_pack:
+            return ("", {})
+
+        # See Also expansion per pack — reuse the server-side helper verbatim
+        # (it only parses content strings, no broker calls).
+        for pack_path in list(pages_by_pack.keys()):
+            index_content = local_index.read_index(packs_root, pack_path)
+            if not index_content:
+                continue
+            already = set(pages_by_pack[pack_path].keys())
+            extra_refs = self._expand_via_see_also(
+                pages_by_pack[pack_path], pack_path, index_content,
+                already_fetched=already, cap=3,
+            )
+            if not extra_refs:
+                continue
+            for ref in extra_refs:
+                content = local_index.read_page(packs_root, ref["pack"], ref["file"])
+                if content:
+                    pages_by_pack[pack_path][ref["file"]] = content
+
+        active_domains: set[str] = {pp.split("/", 1)[0] for pp in pages_by_pack}
+        budget_per_domain = self.retrieval_chars // max(len(active_domains), 1)
+        domain_spend: dict[str, int] = {d: 0 for d in active_domains}
+
+        parts: list[str] = []
+        emitted: set[tuple[str, str]] = set()
+        for (pack_path, filename) in ordered_refs:
+            content = pages_by_pack.get(pack_path, {}).get(filename)
+            if content is None:
+                continue
+            domain = pack_path.split("/", 1)[0]
+            remaining = budget_per_domain - domain_spend.get(domain, 0)
+            if remaining <= 0:
+                continue
+            chunk = content[:remaining]
+            parts.append(f"[{pack_path}/{filename}]\n{chunk}")
+            domain_spend[domain] = domain_spend.get(domain, 0) + len(chunk)
+            emitted.add((pack_path, filename))
+
+        for pack_path, pages in pages_by_pack.items():
+            domain = pack_path.split("/", 1)[0]
+            for filename, content in pages.items():
+                if (pack_path, filename) in emitted:
+                    continue
+                remaining = budget_per_domain - domain_spend.get(domain, 0)
+                if remaining <= 0:
+                    break
+                chunk = content[:remaining]
+                parts.append(f"[{pack_path}/{filename}]\n{chunk}")
+                domain_spend[domain] = domain_spend.get(domain, 0) + len(chunk)
+
+        retrieved_pages: dict[tuple[str, str], dict] = {}
+        for pack_path, pages in pages_by_pack.items():
+            for filename, content in pages.items():
+                meta = page_meta.get((pack_path, filename), {})
+                title = meta.get("title", "")
+                summary = meta.get("summary", "")
+                if not title or not summary:
+                    fm_title, fm_summary = _parse_frontmatter_brief(content)
+                    title = title or fm_title
+                    summary = summary or fm_summary
+                retrieved_pages[(pack_path, filename)] = {
+                    "title": title,
+                    "summary": summary,
+                    "content": content,
+                }
+
+        return ("\n\n".join(parts), retrieved_pages)
+
     # ─── Peer routing ─────────────────────────────────────────────────────────
 
     def _select_best_peer(self, mode: str):
@@ -1469,6 +1857,48 @@ class DeliberationEngine:
                     result = f"Unknown tool: {fn_name}"
                 messages.append(resp.tool_result(tc, result))
             _log(f"[tools] LLM call after tool result (ctx~{self._measure_ctx(messages)} tok)")
+
+    # ─── Raw Ollama mode (no OCC framework at all) ────────────────────────────
+
+    def _stream_ollama_raw(self, query: str, images: list | None = None):
+        """Bypass everything: no OCC system prompt, no tools, no retrieval,
+        no skills. Just `ollama.chat(messages=[*history, user])` streamed
+        back. Activated by the /ollama toggle for testing what the raw model
+        produces vs OCC's framework output. Conversation history IS included
+        (so the bypass behaves like a normal Ollama session) but tool_calls
+        and tool roles are stripped — they wouldn't exist in a raw session."""
+        import ollama
+        user_msg: dict = {"role": "user", "content": query}
+        if images:
+            user_msg["images"] = images
+        clean_history = [
+            {"role": m["role"], "content": m.get("content", "") or ""}
+            for m in self._history
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        messages = [*clean_history, user_msg]
+        self._peak_ctx_used = self._measure_ctx(messages)
+        chars = 0
+        try:
+            for chunk in ollama.chat(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                think=False,
+                keep_alive=-1,
+                options={"temperature": 0.7, "num_ctx": self.num_ctx_answer},
+            ):
+                try:
+                    token = chunk.message.content or ""
+                except AttributeError:
+                    token = chunk.get("message", {}).get("content", "") or ""
+                if token:
+                    chars += len(token)
+                    yield ("token", token)
+        except Exception as e:
+            yield ("error", f"raw ollama call failed: {e}")
+        self._update_ctx(self._peak_ctx_used, chars // 3)
+
 
     # ─── Chitchat mode (no tools, no retrieval) ───────────────────────────────
 
