@@ -17,6 +17,7 @@ Security status — alpha. See SECURITY.md at the repo root for full threat mode
     * /admin/reindex token is a single static value (no rotation).
   Do NOT run this broker in production without the hardening track.
 """
+import base64
 import json
 import os
 import re
@@ -27,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import FastAPI, HTTPException, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -35,6 +38,10 @@ app = FastAPI()
 
 PACKS_DIR = Path("/opt/occ-packs")
 SEARCH_DB = Path("/opt/occ-broker/pack_search.db")
+# Separate DB file for TOFU identity bindings: pack_search.db gets DROP+CREATEd
+# at every schema migration, which would wipe identities. node_identity.db has
+# its own lifecycle and only gets touched by this register flow.
+IDENTITY_DB = Path("/opt/occ-broker/node_identity.db")
 _NODE_TIMEOUT = 90  # seconds
 _REINDEX_TOKEN = os.environ.get("OCC_REINDEX_TOKEN", "")
 
@@ -63,6 +70,22 @@ _PENDING_QUERIES_CAP = 10_000
 # legitimate Critic payload needs and gives a hostile peer 16 MB × cap of
 # pending state to amplify into the broker's memory.
 _WS_MAX_BYTES = 1 * 1024 * 1024
+
+# TOFU bookkeeping.
+#   _IDENTITY_CAP: hard upper bound on rows in node_identity. Past this the
+#     broker rejects new identities to prevent a spam-driven disk-fill. At
+#     ~256 bytes/row this is ~256 MB of headroom, far above realistic load.
+#   _REGISTER_RATE_*: per-IP cap on register attempts. Each register entails
+#     an Ed25519 verify + a SQLite hit; without rate limiting an attacker
+#     could spam new identities and consume both CPU and the identity quota.
+_IDENTITY_CAP = 1_000_000
+_REGISTER_RATE_MAX = 60        # attempts per window
+_REGISTER_RATE_WINDOW = 60     # seconds
+_REGISTER_RATE_STATE_CAP = 10_000
+
+# Per-IP register attempt state, sibling of _rate_limit_state for /search.
+_register_rate_state: dict[str, list[float]] = {}
+_register_rate_last_cleanup: float = 0.0
 
 # node_id → {ws, tier_name, vram_used_mb, public_key, last_seen, last_seen_ts}
 nodes: dict[str, dict] = {}
@@ -598,6 +621,135 @@ async def admin_reindex(
         raise HTTPException(500, str(e))
 
 
+# ─── TOFU identity store ───────────────────────────────────────────────────
+#
+# Each node has a stable Ed25519 signing key (separate from its X25519
+# encryption key). On first register we record `(node_id → signing_pubkey)`
+# and refuse any later register for that node_id that doesn't sign the
+# challenge with the same key. This is the same model SSH uses with
+# known_hosts — practical, no CA required, blocks identity theft after the
+# first contact.
+
+
+def _identity_db() -> sqlite3.Connection:
+    """Open (or create) the identity SQLite. Separate file from pack_search
+    so a search-index reindex never wipes identities."""
+    IDENTITY_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(IDENTITY_DB))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS node_identity (
+            node_id        TEXT PRIMARY KEY,
+            signing_pubkey TEXT NOT NULL,
+            first_seen     TEXT NOT NULL,
+            last_seen      TEXT NOT NULL
+        )
+    """)
+    return conn
+
+
+def _tofu_lookup(node_id: str) -> str | None:
+    """Return the signing_pubkey stored for node_id, or None if unknown."""
+    conn = _identity_db()
+    try:
+        cur = conn.execute(
+            "SELECT signing_pubkey FROM node_identity WHERE node_id = ?",
+            (node_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _tofu_insert(node_id: str, signing_pubkey: str) -> bool:
+    """Insert a new identity. Returns False when the identity table is at
+    cap (caller should reject the registration). Caller is expected to have
+    already confirmed via _tofu_lookup that node_id is new."""
+    conn = _identity_db()
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM node_identity")
+        if cur.fetchone()[0] >= _IDENTITY_CAP:
+            return False
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO node_identity (node_id, signing_pubkey, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?)",
+            (node_id, signing_pubkey, now_iso, now_iso),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _tofu_touch(node_id: str) -> None:
+    """Update last_seen for an existing identity — light bookkeeping that
+    lets a future cleanup pass identify dormant rows for pruning."""
+    conn = _identity_db()
+    try:
+        conn.execute(
+            "UPDATE node_identity SET last_seen = ? WHERE node_id = ?",
+            (datetime.now(timezone.utc).isoformat(), node_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _check_register_rate_limit(client_ip: str) -> bool:
+    """Sibling of _check_rate_limit for the WS register flow. Each verify
+    costs CPU and each new identity costs a row, so spam needs its own cap.
+    Returns True if allowed, False if the IP has exceeded the window."""
+    global _register_rate_last_cleanup
+    now = time.time()
+    cutoff = now - _REGISTER_RATE_WINDOW
+
+    if now - _register_rate_last_cleanup > _REGISTER_RATE_WINDOW:
+        for k in list(_register_rate_state.keys()):
+            ts = _register_rate_state[k]
+            while ts and ts[0] < cutoff:
+                ts.pop(0)
+            if not ts:
+                del _register_rate_state[k]
+        _register_rate_last_cleanup = now
+
+    if (len(_register_rate_state) >= _REGISTER_RATE_STATE_CAP
+            and client_ip not in _register_rate_state):
+        return True  # fail-open under extreme load, mirrors /search policy
+
+    timestamps = _register_rate_state.setdefault(client_ip, [])
+    while timestamps and timestamps[0] < cutoff:
+        timestamps.pop(0)
+    if len(timestamps) >= _REGISTER_RATE_MAX:
+        return False
+    timestamps.append(now)
+    return True
+
+
+def _verify_register_signature(
+    signing_pubkey_b64: str,
+    signature_b64: str,
+    challenge: bytes,
+    node_id: str,
+) -> bool:
+    """Verify the Ed25519 signature over (challenge || node_id). The bind
+    to node_id stops a captured signature from being replayed under a
+    different claimed id."""
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(signing_pubkey_b64))
+        sig = base64.b64decode(signature_b64)
+    except Exception:
+        return False
+    msg = challenge + node_id.encode()
+    try:
+        pub.verify(sig, msg)
+        return True
+    except InvalidSignature:
+        return False
+    except Exception:
+        return False
+
+
 # ─── WebSocket ─────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
@@ -605,6 +757,20 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     node_id: str | None = None
     my_pending: set[str] = set()  # query_ids waiting on this connection
+    client_ip = ws.client.host if ws.client else "unknown"
+
+    # Per-connection challenge: the client must sign these exact bytes (plus
+    # its claimed node_id) in the register message, proving possession of
+    # the private key that matches its declared signing pubkey. The nonce
+    # also prevents replay of a register from an earlier session.
+    challenge = secrets.token_bytes(32)
+    try:
+        await ws.send_text(json.dumps({
+            "type": "challenge",
+            "nonce": base64.b64encode(challenge).decode(),
+        }))
+    except Exception:
+        return
 
     try:
         async for raw in ws.iter_text():
@@ -624,16 +790,55 @@ async def websocket_endpoint(ws: WebSocket):
             mtype = msg.get("type")
 
             if mtype == "register":
+                # Rate limit register attempts per client IP — each attempt
+                # costs an Ed25519 verify + a SQLite hit, and unbounded spam
+                # could otherwise consume the identity table quota.
+                if not _check_register_rate_limit(client_ip):
+                    await ws.send_text(json.dumps({
+                        "type": "error", "error": "register_rate_limit",
+                    }))
+                    continue
                 claimed_id = msg.get("node_id", "")
                 if not claimed_id:
                     await ws.send_text(json.dumps({"type": "error", "error": "missing_node_id"}))
                     continue
+                signing_pubkey = msg.get("signing_pubkey", "")
+                signature_b64 = msg.get("signature", "")
+                if not signing_pubkey or not signature_b64:
+                    await ws.send_text(json.dumps({
+                        "type": "error", "error": "signature_required",
+                    }))
+                    continue
+                if not _verify_register_signature(
+                    signing_pubkey, signature_b64, challenge, claimed_id,
+                ):
+                    await ws.send_text(json.dumps({
+                        "type": "error", "error": "invalid_signature",
+                    }))
+                    continue
+                # TOFU: bind the node_id to this signing pubkey on first
+                # contact, refuse any future register that tries to claim
+                # the same node_id with a different key.
+                known_key = _tofu_lookup(claimed_id)
+                if known_key is None:
+                    if not _tofu_insert(claimed_id, signing_pubkey):
+                        await ws.send_text(json.dumps({
+                            "type": "error", "error": "identity_table_full",
+                        }))
+                        continue
+                elif known_key != signing_pubkey:
+                    await ws.send_text(json.dumps({
+                        "type": "error", "error": "node_id_owned_by_another_key",
+                    }))
+                    continue
+                else:
+                    _tofu_touch(claimed_id)
                 # Reject claims that target a node_id already registered AND
-                # still alive (last_seen within _NODE_TIMEOUT). Without this,
-                # any peer that learns a node_id from /nodes can overwrite
-                # the registration and start receiving Critic queries meant
-                # for the real node. Stale registrations (dead) are still
-                # replaceable so reconnects work after a crash.
+                # still alive (last_seen within _NODE_TIMEOUT). With TOFU
+                # this is now a redundant defence (a thief without the key
+                # can't even pass signature verification), but it still
+                # protects against accidental double-registration from the
+                # same identity across two simultaneous connections.
                 existing = nodes.get(claimed_id)
                 if existing is not None and _is_alive(existing) and existing.get("ws") is not ws:
                     await ws.send_text(json.dumps({
@@ -650,6 +855,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "tier_name": msg.get("tier_name", "micro"),
                     "vram_used_mb": msg.get("vram_used_mb", 0),
                     "public_key": msg.get("public_key", ""),
+                    "signing_pubkey": signing_pubkey,
                     "last_seen": datetime.now(timezone.utc).isoformat(),
                     "last_seen_ts": time.time(),
                 }

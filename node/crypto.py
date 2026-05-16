@@ -145,3 +145,44 @@ def publisher_fingerprint() -> str:
     from node.pack_signing import fingerprint
     _priv_b64, pub_b64 = load_or_generate_publisher_keypair()
     return fingerprint(pub_b64)
+
+
+# ── Node identity signing key (Ed25519) ───────────────────────────────────────
+# Distinct from both the X25519 encryption pair (peer Critic E2E) and the
+# publisher key (pack signing). This one binds a node's identity to a
+# private key the broker can challenge: the Trust-On-First-Use table on the
+# broker side records the pubkey on first register and refuses any future
+# register for the same node_id under a different key.
+
+
+def load_or_generate_node_signing_keypair() -> tuple[bytes, bytes]:
+    """Return (priv_bytes, pub_bytes) — raw 32-byte Ed25519 keys.
+
+    Bytes instead of base64 because the caller usually wants to sign
+    immediately (Ed25519PrivateKey.from_private_bytes wants raw). For
+    transport (sending the pubkey to the broker) callers can b64-encode.
+    """
+    _KEY_PATH.mkdir(exist_ok=True)
+    _restrict_perms(_KEY_PATH, 0o700)
+    priv_file = _KEY_PATH / "signing.key"
+    pub_file = _KEY_PATH / "signing.pub"
+
+    if priv_file.exists() and pub_file.exists():
+        _restrict_perms(priv_file, 0o600)
+        _restrict_perms(pub_file, 0o644)
+        return priv_file.read_bytes(), pub_file.read_bytes()
+
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    priv_bytes = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    pub_bytes = pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    priv_file.write_bytes(priv_bytes)
+    _restrict_perms(priv_file, 0o600)
+    pub_file.write_bytes(pub_bytes)
+    _restrict_perms(pub_file, 0o644)
+    return priv_bytes, pub_bytes
+
+
+def sign_with_node_key(priv_bytes: bytes, message: bytes) -> bytes:
+    """Sign a single message with the node's Ed25519 identity key."""
+    return Ed25519PrivateKey.from_private_bytes(priv_bytes).sign(message)

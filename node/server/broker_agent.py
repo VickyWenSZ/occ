@@ -3,6 +3,7 @@ OCC Broker Agent — connects to broker.opencognitivecommons.org via WebSocket,
 registers this node, and handles incoming Critic query messages.
 """
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -17,7 +18,14 @@ sys.path.insert(0, str(ROOT))
 from node.server.node_id import NODE_ID as _NODE_ID
 from node.deliberation.roles import ROLES
 from node.hardware import get_vram_used_mb, select_tier, detect_vram_gb
-from node.crypto import load_or_generate_keypair, pubkey_b64, encrypt as _encrypt, decrypt as _decrypt
+from node.crypto import (
+    load_or_generate_keypair,
+    load_or_generate_node_signing_keypair,
+    pubkey_b64,
+    sign_with_node_key,
+    encrypt as _encrypt,
+    decrypt as _decrypt,
+)
 
 try:
     from node.apps.gui import log_bus as _log_bus
@@ -29,6 +37,12 @@ _MODEL = os.getenv("OCC_MODEL", "qwen3.5:9b")
 _BROKER_WS = os.getenv("OCC_BROKER_URL", "wss://broker.opencognitivecommons.org/ws")
 
 _PRIVATE_KEY, _PUBLIC_KEY = load_or_generate_keypair()
+# Ed25519 identity keypair — proves to the broker that this node is the
+# legitimate holder of NODE_ID. The broker remembers (NODE_ID → signing
+# pubkey) via TOFU and refuses any later registration under a different
+# key for the same id.
+_SIGNING_PRIV, _SIGNING_PUB = load_or_generate_node_signing_keypair()
+_SIGNING_PUB_B64 = base64.b64encode(_SIGNING_PUB).decode()
 _VRAM_MB = get_vram_used_mb()
 _TIER_NAME = select_tier(detect_vram_gb())["name"]
 
@@ -91,16 +105,36 @@ async def run():
     while True:
         try:
             async with websockets.connect(_BROKER_WS, ping_timeout=None) as ws:
+                # The broker sends a one-time challenge nonce right after
+                # ws.accept(). We sign (nonce || node_id) with our Ed25519
+                # identity key to prove ownership of NODE_ID on the broker's
+                # TOFU table. Binding node_id into the signed bytes prevents
+                # replaying a captured signature under a different id.
+                first_msg = json.loads(await ws.recv())
+                if first_msg.get("type") != "challenge":
+                    _log(f"[OCC Node] Expected challenge, got {first_msg!r}. Reconnecting...")
+                    await asyncio.sleep(5)
+                    continue
+                challenge = base64.b64decode(first_msg.get("nonce", ""))
+                signature = sign_with_node_key(
+                    _SIGNING_PRIV, challenge + _NODE_ID.encode(),
+                )
                 await ws.send(json.dumps({
                     "type": "register",
                     "node_id": _NODE_ID,
                     "tier_name": _TIER_NAME,
                     "vram_used_mb": _VRAM_MB,
                     "public_key": pubkey_b64(_PUBLIC_KEY),
+                    "signing_pubkey": _SIGNING_PUB_B64,
+                    "signature": base64.b64encode(signature).decode(),
                 }))
                 msg = json.loads(await ws.recv())
                 if msg.get("type") == "registered":
                     _log(f"[OCC Node] Registered. Tier={_TIER_NAME}, VRAM={_VRAM_MB}MB. Ready.")
+                elif msg.get("type") == "error":
+                    _log(f"[OCC Node] Broker rejected register: {msg.get('error')}. Reconnecting in 5s.")
+                    await asyncio.sleep(5)
+                    continue
 
                 async def heartbeat():
                     while True:
