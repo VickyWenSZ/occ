@@ -12,19 +12,22 @@ build/
 Thumbs.db
 *.log
 _refs/
-workspace/*
-!workspace/.gitkeep
-upload/*
-!upload/.gitkeep
 .claude/
-deliberation_log.md
 **/embeddings.json
 bash.exe.stackdump
 fix_nginx.py
-.occ_config.json
-.occ_chats.json
 OCC_DESIGN_SYSTEM.md
 admin/
+
+# Legacy service files — kept here so an unmigrated clone doesn't try to
+# track them. After the auto-migration on first launch these live under
+# ~/.occ/ instead, but leaving the entries protects users mid-upgrade.
+.occ_config.json
+.occ_chats.json
+.occ_chats.json.migrated
+deliberation_log.md
+workspace/
+upload/
 
 # Expert pack content is user/community-built. The repo ships only the
 # directory shell so Forge has somewhere to write. Real packs are deployed

@@ -8,13 +8,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat,
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hashes import SHA256
 
-_KEY_PATH = Path.home() / ".occ_keys"
-
-# Publisher signing key lives in a separate directory so it can stay outside
-# the Node GUI process's working set: the Forge/Node loop never reads it,
-# only the Hub deploy flow does. Keeping it apart limits the blast radius if
-# a bug in a Node dependency leaks heap content.
-_PUBLISHER_KEY_PATH = Path.home() / ".occ_publisher"
+from node import paths
 
 
 def _restrict_perms(path: Path, mode: int) -> None:
@@ -29,10 +23,8 @@ def _restrict_perms(path: Path, mode: int) -> None:
 
 def load_or_generate_keypair() -> tuple[bytes, bytes]:
     """Return (private_key_bytes, public_key_bytes). Generates and persists if not found."""
-    _KEY_PATH.mkdir(exist_ok=True)
-    _restrict_perms(_KEY_PATH, 0o700)
-    priv_file = _KEY_PATH / "private.key"
-    pub_file = _KEY_PATH / "public.key"
+    priv_file = paths.x25519_private_key()
+    pub_file = paths.x25519_public_key()
 
     if priv_file.exists() and pub_file.exists():
         # Re-assert tight perms on every load — covers the case where the
@@ -114,10 +106,8 @@ def load_or_generate_publisher_keypair() -> tuple[str, str]:
     Hub's deploy flow calls this once per process and threads the priv
     into pack_signing.sign_pack().
     """
-    _PUBLISHER_KEY_PATH.mkdir(exist_ok=True)
-    _restrict_perms(_PUBLISHER_KEY_PATH, 0o700)
-    priv_file = _PUBLISHER_KEY_PATH / "signing.key"
-    pub_file = _PUBLISHER_KEY_PATH / "signing.pub"
+    priv_file = paths.publisher_signing_key()
+    pub_file = paths.publisher_signing_pub()
 
     if priv_file.exists() and pub_file.exists():
         _restrict_perms(priv_file, 0o600)
@@ -162,10 +152,8 @@ def load_or_generate_node_signing_keypair() -> tuple[bytes, bytes]:
     immediately (Ed25519PrivateKey.from_private_bytes wants raw). For
     transport (sending the pubkey to the broker) callers can b64-encode.
     """
-    _KEY_PATH.mkdir(exist_ok=True)
-    _restrict_perms(_KEY_PATH, 0o700)
-    priv_file = _KEY_PATH / "signing.key"
-    pub_file = _KEY_PATH / "signing.pub"
+    priv_file = paths.ed25519_signing_key()
+    pub_file = paths.ed25519_signing_pub()
 
     if priv_file.exists() and pub_file.exists():
         _restrict_perms(priv_file, 0o600)

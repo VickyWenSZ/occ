@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent.parent
 STATIC = Path(__file__).parent / "static"
 sys.path.insert(0, str(ROOT))
 
+from node import chat_store, paths
 from node.apps.cli.config import Config, save_openrouter_config
 from node.apps.gui import log_bus
 from node.deliberation.classifier import classify, detect_multi_intent
@@ -73,30 +74,13 @@ _ready = False
 _init_status = "starting"
 
 # ── Chat storage ──────────────────────────────────────────────────────────────
-
-_CHATS_FILE = ROOT / ".occ_chats.json"
-
-
-def _load_chats() -> list:
-    if _CHATS_FILE.exists():
-        try:
-            return json.loads(_CHATS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return []
-
-
-def _save_chats(chats: list):
-    _CHATS_FILE.write_text(
-        json.dumps(chats, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+# Thin shims that delegate to node.chat_store (SQLite). Kept here so the
+# rest of server.py keeps its old call sites unchanged; refactoring those
+# would have ballooned the diff with no behaviour change.
 
 
 def _get_chat(chat_id: str) -> dict | None:
-    for c in _load_chats():
-        if c["id"] == chat_id:
-            return c
-    return None
+    return chat_store.get_chat(chat_id)
 
 
 def _add_message_to_chat(
@@ -108,28 +92,13 @@ def _add_message_to_chat(
     tools: list | None = None,
     peer_answers: dict | None = None,
 ):
-    chats = _load_chats()
-    for c in chats:
-        if c["id"] == chat_id:
-            msg: dict = {
-                "id": str(uuid.uuid4())[:8],
-                "role": role,
-                "content": content,
-                "timestamp": datetime.now().isoformat(),
-            }
-            if routing:
-                msg["routing"] = routing
-            if attachments:
-                msg["attachments"] = attachments
-            if tools:
-                msg["tools"] = tools
-            if peer_answers:
-                msg["peer_answers"] = peer_answers
-            c["messages"].append(msg)
-            if role == "user" and len(c["messages"]) == 1:
-                c["title"] = content[:60].strip() or "New Chat"
-            _save_chats(chats)
-            return
+    chat_store.add_message(
+        chat_id, role, content,
+        routing=routing,
+        attachments=attachments,
+        tools=tools,
+        peer_answers=peer_answers,
+    )
 
 
 # ── Startup init ──────────────────────────────────────────────────────────────
@@ -137,8 +106,25 @@ def _add_message_to_chat(
 def _init():
     global _cfg, _engine, _retriever, _model, _ready, _init_status
 
+    _init_status = "migrating service paths"
+    # Move legacy scattered paths (~/.occ_keys, ~/.occ_publisher, repo-side
+    # .env / chats / workspace / upload) into the unified ~/.occ/ tree.
+    # Idempotent — a stamp file makes subsequent boots a no-op.
+    try:
+        from tools.migrate_to_dotocc import migrate as _migrate
+        result = _migrate()
+        if not result.get("skipped") and result.get("log"):
+            for line in result["log"]:
+                log_bus.write(f"[migrate] {line.strip()}")
+    except Exception as e:
+        log_bus.write(f"[migrate] WARN — migration step failed: {e}")
+
     _init_status = "loading config"
     log_bus.write("[GUI] Loading config...")
+    # Surface ~/.occ/secrets/env into the process environment so anything
+    # that reads OPENAI_API_KEY / GITHUB_TOKEN / ... via os.environ picks
+    # them up. Existing env vars win — CI and tests still override freely.
+    paths.apply_env_file_to_os_environ()
     _cfg = Config()
     _model = _cfg.model
 
@@ -179,11 +165,9 @@ def _init():
 
     _init_status = "loading packs"
     log_bus.write("[GUI] Loading expert packs...")
-    workspace = ROOT / "workspace"
-    workspace.mkdir(exist_ok=True)
+    workspace = paths.workspace_dir()
     set_workspace(workspace)
-    upload = ROOT / "upload"
-    upload.mkdir(exist_ok=True)
+    upload = paths.upload_dir()
     set_upload(upload)
     set_packs_root(_cfg.packs_root)
 
@@ -2120,30 +2104,19 @@ async def scout_discard_batch(token: str):
 
 @app.get("/api/chats")
 async def list_chats():
-    chats = _load_chats()
-    return [
-        {"id": c["id"], "title": c.get("title", "New Chat"), "created_at": c.get("created_at", "")}
-        for c in reversed(chats)
-    ]
+    # chat_store.list_chats already returns most-recent first.
+    return chat_store.list_chats()
 
 
 @app.post("/api/chats")
 async def create_chat():
-    chat = {
-        "id": str(uuid.uuid4())[:12],
-        "title": "New Chat",
-        "created_at": datetime.now().isoformat(),
-        "messages": [],
-    }
-    chats = _load_chats()
-    chats.append(chat)
-    _save_chats(chats)
+    chat = chat_store.create_chat()
     return {"id": chat["id"], "title": chat["title"]}
 
 
 @app.get("/api/chats/{chat_id}")
 async def get_chat(chat_id: str):
-    chat = _get_chat(chat_id)
+    chat = chat_store.get_chat(chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
     return chat
@@ -2151,8 +2124,7 @@ async def get_chat(chat_id: str):
 
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat(chat_id: str):
-    chats = [c for c in _load_chats() if c["id"] != chat_id]
-    _save_chats(chats)
+    chat_store.delete_chat(chat_id)
 
     # Disk cleanup: delete the chat's uploaded files from upload/, but ONLY if
     # no other chat still references them (same filename uploaded in two chats
@@ -2162,7 +2134,7 @@ async def delete_chat(chat_id: str):
     for other_files in _CHAT_UPLOADS.values():
         still_referenced.update(other_files)
 
-    upload_root = (ROOT / "upload").resolve()
+    upload_root = paths.upload_dir().resolve()
     for filename in files_to_check - still_referenced:
         try:
             target = (upload_root / filename).resolve()
@@ -2177,10 +2149,10 @@ async def delete_chat(chat_id: str):
 
 @app.delete("/api/chats")
 async def delete_all_chats():
-    _save_chats([])
+    chat_store.delete_all_chats()
     _CHAT_UPLOADS.clear()
     _CHAT_STOPS.clear()
-    upload_root = (ROOT / "upload").resolve()
+    upload_root = paths.upload_dir().resolve()
     if upload_root.exists():
         for f in upload_root.iterdir():
             if f.is_file() and f.name != ".gitkeep":
@@ -2199,13 +2171,10 @@ class RenameChatBody(BaseModel):
 
 @app.patch("/api/chats/{chat_id}")
 async def rename_chat(chat_id: str, body: RenameChatBody):
-    chats = _load_chats()
-    for c in chats:
-        if c["id"] == chat_id:
-            c["title"] = body.title.strip() or "New Chat"
-            _save_chats(chats)
-            return {"ok": True, "title": c["title"]}
-    raise HTTPException(404, "Chat not found")
+    title = chat_store.rename_chat(chat_id, body.title)
+    if title is None:
+        raise HTTPException(404, "Chat not found")
+    return {"ok": True, "title": title}
 
 
 @app.post("/api/chats/{chat_id}/activate")
@@ -2269,7 +2238,7 @@ async def chat_query(chat_id: str, body: QueryBody):
     images_b64: list[str] = []
     text_suffix = ""
     uploaded_files: list[str] = []
-    upload_dir = ROOT / "upload"
+    upload_dir = paths.upload_dir()
     upload_dir_resolved = upload_dir.resolve()
     BINARY_EXTS = {".pdf", ".docx", ".xlsx", ".mp3", ".wav", ".m4a", ".ogg", ".flac"}
     # Hard cap per attachment payload (base64 chars). 50 MB raw ≈ 67 MB b64.
@@ -2706,7 +2675,7 @@ async def run_command(body: CommandBody):
 # ── Deliberation log (mirrors cli/main.py) ────────────────────────────────────
 
 def _write_deliberation_log(query: str, peer_data: dict, answer: str):
-    log_path = ROOT / "deliberation_log.md"
+    log_path = paths.deliberation_log()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     routing_mode = peer_data.get("mode", "delegate")
     parts = [f"\n---\n\n## [{timestamp}] — {routing_mode}\n\n**Query:** {query}\n\n"]

@@ -2,25 +2,27 @@ import json
 import os
 from pathlib import Path
 
+from node import paths
 from node.hardware import get_profile
 from node.provider import BUDGET_MODEL
 
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
-_CONFIG_FILE = Path.home() / ".occ" / "config.json"
 
 
 def _load_occ_config() -> dict:
-    if _CONFIG_FILE.exists():
+    f = paths.config_file()
+    if f.exists():
         try:
-            return json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+            return json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             pass
     return {}
 
 
 def _save_occ_config(cfg: dict) -> None:
-    _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    f = paths.config_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
 def save_openrouter_config(api_key: str, model: str):

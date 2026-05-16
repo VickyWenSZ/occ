@@ -116,9 +116,10 @@ def scp_sig(local_sig: Path, pack_path: str) -> bool:
 def trigger_reindex():
     """Refresh the broker FTS5 index so /search picks up any pack whose
     body changed (it shouldn't have, but cheap insurance)."""
-    token_file = Path.home() / ".occ_reindex_token"
+    from node import paths
+    token_file = paths.reindex_token_file()
     if not token_file.exists():
-        print("[reindex] no ~/.occ_reindex_token — skipping")
+        print(f"[reindex] no {token_file} — skipping")
         return
     token = token_file.read_text().strip()
     try:
