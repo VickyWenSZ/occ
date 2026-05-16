@@ -881,6 +881,13 @@ def download_pack(path: str, force: bool = False) -> str:
         )
 
     pages_to_fetch: list[str] = []
+    # In-memory buffer of fetched content. We only write to disk AFTER the
+    # signature has been verified — otherwise a tampered pack would be
+    # half-written before the failure surfaces, and a partial layout looks
+    # like a normal pack to local_index.
+    fetched_pages: dict[str, str] = {}
+    manifest_text: str = ""
+    sig_text: str = ""
     try:
         with httpx.Client(timeout=20.0, follow_redirects=True) as client:
             # index.md — the source of truth for which pages belong to the pack
@@ -891,6 +898,7 @@ def download_pack(path: str, force: bool = False) -> str:
                     f"(HTTP {r.status_code})."
                 )
             index_md = r.text
+            fetched_pages["index.md"] = index_md
             for line in index_md.splitlines():
                 if not line.startswith("|"):
                     continue
@@ -903,14 +911,7 @@ def download_pack(path: str, force: bool = False) -> str:
                 if page_file:
                     pages_to_fetch.append(page_file)
 
-            wiki_dir.mkdir(parents=True, exist_ok=True)
-            (wiki_dir / "index.md").write_text(index_md, encoding="utf-8")
-
-            pages_ok = 0
             pages_failed: list[str] = []
-            # Allow nested page paths (e.g. "concepts/julius-caesar.md") but
-            # block traversal and absolute paths. Each segment is restricted
-            # to safe characters.
             page_re = re.compile(r"^[A-Za-z0-9._\-]+(/[A-Za-z0-9._\-]+)*\.md$")
             for page_file in pages_to_fetch:
                 if not page_re.match(page_file) or ".." in page_file:
@@ -923,10 +924,7 @@ def download_pack(path: str, force: bool = False) -> str:
                     if pr.status_code != 200:
                         pages_failed.append(page_file)
                         continue
-                    out_path = wiki_dir / page_file
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    out_path.write_text(pr.text, encoding="utf-8")
-                    pages_ok += 1
+                    fetched_pages[page_file] = pr.text
                 except Exception:
                     pages_failed.append(page_file)
 
@@ -936,9 +934,82 @@ def download_pack(path: str, force: bool = False) -> str:
                     f"download_pack: pack '{pack_path}' missing manifest.yaml "
                     f"on broker (HTTP {mr.status_code})."
                 )
-            (pack_dir / "manifest.yaml").write_text(mr.text, encoding="utf-8")
+            manifest_text = mr.text
+
+            # manifest.sig — fetched separately. Missing is treated as
+            # "unsigned" below; verification handles strict mode policy.
+            sr = client.get(f"{SERVER_URL}/packs/{pack_path}/manifest.sig")
+            if sr.status_code == 200:
+                sig_text = sr.text
     except Exception as e:
         return f"download_pack: fetch failed: {type(e).__name__}: {e}"
+
+    # ── Signature verification ───────────────────────────────────────────
+    # Default: refuse unsigned/invalid packs. Setting OCC_ALLOW_UNSIGNED=1
+    # downgrades the failure to a warning — kept for cutover periods or
+    # emergencies, never the default. The Node prints the policy in use so
+    # the user sees what's happening.
+    from node import pack_signing as _ps
+    allow_unsigned = os.environ.get("OCC_ALLOW_UNSIGNED", "").lower() in ("1", "true", "yes")
+    sig_warning = ""
+    if not sig_text:
+        if not allow_unsigned:
+            return (
+                f"download_pack: pack '{pack_path}' has no manifest.sig on the "
+                f"broker. Refusing to install an unsigned pack. "
+                f"(Set OCC_ALLOW_UNSIGNED=1 to bypass — not recommended.)"
+            )
+        sig_warning = f"⚠ Unsigned pack '{pack_path}' installed (OCC_ALLOW_UNSIGNED=1).\n"
+    else:
+        try:
+            import json as _json
+            sig_obj = _json.loads(sig_text)
+        except Exception as e:
+            return f"download_pack: manifest.sig is not valid JSON: {e}"
+        trusted = _ps.load_trusted_fingerprints()
+        if not trusted:
+            return (
+                "download_pack: no trusted publishers loaded — check that "
+                "node/trusted_publishers.yaml is present and populated."
+            )
+        # Build page-bytes view for the verifier. The manifest hashes the
+        # raw UTF-8 bytes of each file, including index.md which lives at
+        # wiki/index.md — same relative layout we'll write to disk.
+        pages_bytes = {rel: text.encode("utf-8") for rel, text in fetched_pages.items()}
+        try:
+            _ps.verify_pack_bytes(
+                manifest_bytes=manifest_text.encode("utf-8"),
+                pages=pages_bytes,
+                sig=sig_obj,
+                trusted_fingerprints=trusted,
+            )
+        except _ps.VerificationError as ve:
+            if allow_unsigned:
+                sig_warning = (
+                    f"⚠ Signature verification FAILED for '{pack_path}' "
+                    f"({ve}) but OCC_ALLOW_UNSIGNED=1 — installing anyway.\n"
+                )
+            else:
+                return (
+                    f"download_pack: signature verification failed for "
+                    f"'{pack_path}': {ve}. Refusing to install."
+                )
+
+    # ── Write to disk only after verification passed ─────────────────────
+    try:
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        pages_ok = 0
+        for rel, text in fetched_pages.items():
+            out_path = wiki_dir / rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(text, encoding="utf-8")
+            if rel != "index.md":
+                pages_ok += 1
+        (pack_dir / "manifest.yaml").write_text(manifest_text, encoding="utf-8")
+        if sig_text:
+            (pack_dir / "manifest.sig").write_text(sig_text, encoding="utf-8")
+    except Exception as e:
+        return f"download_pack: write to disk failed: {type(e).__name__}: {e}"
 
     # Stamp the new pack as disabled. Existing entries are preserved.
     try:
@@ -956,7 +1027,17 @@ def download_pack(path: str, force: bool = False) -> str:
         notes.append(f"{len(pages_failed)} pages failed: {', '.join(pages_failed[:3])}")
     suffix = f" ({'; '.join(notes)})" if notes else ""
 
+    signed_note = ""
+    if sig_text and not sig_warning:
+        try:
+            import json as _json
+            fp = _json.loads(sig_text).get("signer_fingerprint", "?")
+            signed_note = f"Signed by {fp}.\n"
+        except Exception:
+            signed_note = "Signature verified.\n"
+
     return (
+        f"{sig_warning}{signed_note}"
         f"Pack '{pack_path}' downloaded: {pages_ok} pages + manifest{suffix}.\n"
         f"Saved as DISABLED. Activate it from Settings to use it in local mode — "
         f"activation triggers the FTS5 index build automatically."

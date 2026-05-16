@@ -242,6 +242,29 @@ async def get_manifest(path: str):
     return Response(f.read_text(encoding="utf-8"), media_type="text/yaml")
 
 
+@app.get("/packs/{path:path}/manifest.sig")
+async def get_manifest_sig(path: str):
+    """Serve the pack's Ed25519 signature file written by the Hub at deploy
+    time. Nodes fetch this during download_pack and refuse to install the
+    pack if it's missing or its signer isn't in trusted_publishers.yaml."""
+    f = (PACKS_DIR / path / "manifest.sig").resolve()
+    if not str(f).startswith(str(PACKS_DIR.resolve())):
+        raise HTTPException(403)
+    if not f.exists():
+        raise HTTPException(404)
+    return Response(f.read_text(encoding="utf-8"), media_type="application/json")
+
+
+@app.get("/publishers")
+async def list_publishers():
+    """Stub for a future broker-managed publisher allowlist (option B in the
+    PKI plan). At launch the trust anchor is the in-repo trusted_publishers
+    .yaml file shipped with each Node, so this endpoint just returns an
+    empty list. When (if) federation needs server-side publisher management,
+    this becomes the source of truth and Nodes can fall back to it."""
+    return {"publishers": []}
+
+
 # ─── HTTP: Node registry ───────────────────────────────────────────────────
 
 @app.get("/nodes")

@@ -1,0 +1,22 @@
+# OCC trusted publishers
+#
+# Each entry is a publisher whose Ed25519 signing key the Node accepts when
+# verifying packs at download time. The fingerprint is the short identifier
+# from `node.pack_signing.fingerprint(pubkey_b64)` — 16 base32 chars derived
+# from SHA-256 of the raw Ed25519 public key.
+#
+# Adding a publisher = contributing them to this file via a signed commit on
+# the OCC repo. There is no broker-side mutable allowlist (yet) — the trust
+# anchor is git history. To revoke a publisher, remove their entry and cut
+# a release; downloads of their packs will then fail with VerificationError.
+#
+# To add yourself as a publisher:
+#   1. Run any Hub deploy once — it auto-generates ~/.occ_publisher/signing.{key,pub}
+#      and prints your fingerprint.
+#   2. Open a PR adding your entry below.
+#   3. Once merged, your packs become installable on Nodes that ship this list.
+publishers:
+  - fingerprint: "fuao4jleholdet6v"
+    name: "Vicky Wen"
+    since: "2026-05-16"
+    note: "OCC founder — sole publisher at launch."

@@ -2,12 +2,19 @@ from pathlib import Path
 import base64, os
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hashes import SHA256
 
 _KEY_PATH = Path.home() / ".occ_keys"
+
+# Publisher signing key lives in a separate directory so it can stay outside
+# the Node GUI process's working set: the Forge/Node loop never reads it,
+# only the Hub deploy flow does. Keeping it apart limits the blast radius if
+# a bug in a Node dependency leaks heap content.
+_PUBLISHER_KEY_PATH = Path.home() / ".occ_publisher"
 
 
 def _restrict_perms(path: Path, mode: int) -> None:
@@ -90,3 +97,51 @@ def pubkey_from_private_b64(private_key_bytes: bytes) -> str:
     """Derive base64 public key from private key bytes."""
     priv = X25519PrivateKey.from_private_bytes(private_key_bytes)
     return pubkey_b64(priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+
+
+# ── Publisher signing keys (Ed25519) ──────────────────────────────────────────
+# Used by the Hub to sign manifest.sig at deploy time, and by anything that
+# needs to expose the local publisher fingerprint to the user. Kept distinct
+# from the X25519 encryption keypair above: signing keys live in a separate
+# directory and a separate algorithm so the two roles never get conflated.
+
+
+def load_or_generate_publisher_keypair() -> tuple[str, str]:
+    """Return (signing_priv_b64, signing_pub_b64). Generates on first call.
+
+    Returned as base64 strings rather than raw bytes so callers can pass
+    them around (config, JSON, env) without thinking about encoding. The
+    Hub's deploy flow calls this once per process and threads the priv
+    into pack_signing.sign_pack().
+    """
+    _PUBLISHER_KEY_PATH.mkdir(exist_ok=True)
+    _restrict_perms(_PUBLISHER_KEY_PATH, 0o700)
+    priv_file = _PUBLISHER_KEY_PATH / "signing.key"
+    pub_file = _PUBLISHER_KEY_PATH / "signing.pub"
+
+    if priv_file.exists() and pub_file.exists():
+        _restrict_perms(priv_file, 0o600)
+        _restrict_perms(pub_file, 0o644)
+        return (
+            base64.b64encode(priv_file.read_bytes()).decode(),
+            base64.b64encode(pub_file.read_bytes()).decode(),
+        )
+
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    priv_bytes = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    pub_bytes = pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    priv_file.write_bytes(priv_bytes)
+    _restrict_perms(priv_file, 0o600)
+    pub_file.write_bytes(pub_bytes)
+    _restrict_perms(pub_file, 0o644)
+    return base64.b64encode(priv_bytes).decode(), base64.b64encode(pub_bytes).decode()
+
+
+def publisher_fingerprint() -> str:
+    """Return the local publisher key's short fingerprint, generating the
+    keypair if it doesn't exist yet. Useful for the GUI to display 'your
+    publisher key: vicky-abc...' without exposing the pubkey itself."""
+    from node.pack_signing import fingerprint
+    _priv_b64, pub_b64 = load_or_generate_publisher_keypair()
+    return fingerprint(pub_b64)
