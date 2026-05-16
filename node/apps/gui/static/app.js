@@ -1570,12 +1570,12 @@ function addToolBadge(msgId, label) {
 function renderFileWrittenToast(msgId, filename, folder) {
   // Inserts a small inline card under the streaming message header,
   // telling the user a file landed and offering a one-click open.
-  // De-duped per (msgId, filename) — the engine sometimes re-fires
-  // tool_used on retry; a second call to renderFileWrittenToast for
-  // the same filename is a no-op.
-  const msgEl = document.getElementById('msg-' + msgId);
-  if (!msgEl) return;
-  const existing = msgEl.querySelector(`.file-toast[data-fname="${CSS.escape(filename)}"]`);
+  // The assistant message DOM tree is rooted at id `row-${msgId}`
+  // (see createAssistantRow), with the body at `body-${msgId}`. The
+  // toast goes between header and body so it reads as a status line.
+  const row = document.getElementById('row-' + msgId);
+  if (!row) return;
+  const existing = row.querySelector(`.file-toast[data-fname="${CSS.escape(filename)}"]`);
   if (existing) return;
   const body = document.getElementById('body-' + msgId);
   const toast = document.createElement('div');
@@ -1594,12 +1594,10 @@ function renderFileWrittenToast(msgId, filename, folder) {
     e.preventDefault();
     openServiceFolder(safeFolder);
   });
-  // Place the toast just before the message body so it reads as a
-  // status line, not after the answer.
   if (body && body.parentNode) {
     body.parentNode.insertBefore(toast, body);
   } else {
-    msgEl.appendChild(toast);
+    row.appendChild(toast);
   }
   scrollToBottom();
 }
