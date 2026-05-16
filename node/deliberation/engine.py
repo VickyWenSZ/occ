@@ -2297,6 +2297,14 @@ class DeliberationEngine:
                         url = fn_args.get("url", "")
                         if url:
                             web_sources.append({"title": url, "url": url})
+                    elif fn_name == "write_file" and isinstance(result, str) and "written successfully" in result:
+                        # Surface a clickable toast in the GUI so the user
+                        # knows WHERE the file landed — the workspace lives
+                        # under ~/.occ/state/ now, which is invisible from
+                        # the repo folder a user usually browses.
+                        fname = (fn_args.get("filename") or "").strip()
+                        if fname:
+                            yield ("file_written", {"filename": fname, "folder": "workspace"})
                 else:
                     result = f"Unknown tool: {fn_name}"
                 messages.append(resp.tool_result(tc, result))

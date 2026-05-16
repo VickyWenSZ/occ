@@ -642,6 +642,53 @@ body {
   background: #1c0a00;
 }
 
+/* Inline toast emitted by the engine when a tool writes a file. Lives
+   above the streaming answer body, gives the user one-click access to
+   the workspace/upload folder (which moved to ~/.occ/state/ and is no
+   longer visible from the repo tree). */
+.file-toast {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.375rem 0 0.5rem;
+  padding: 0.375rem 0.625rem;
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.35);
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  color: var(--text-body);
+}
+.file-toast-icon {
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.file-toast-text code {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.0625rem 0.3125rem;
+  border-radius: 3px;
+}
+.file-toast-text strong {
+  color: #4ade80;
+  font-weight: 600;
+}
+.file-toast-btn {
+  margin-left: 0.25rem;
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  background: transparent;
+  border: 1px solid rgba(34, 197, 94, 0.5);
+  color: #4ade80;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.file-toast-btn:hover {
+  background: rgba(34, 197, 94, 0.15);
+  border-color: #4ade80;
+}
+
 .assistant-body {
   color: var(--text-body);
   font-size: 0.875rem;

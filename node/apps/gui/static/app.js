@@ -1567,6 +1567,43 @@ function addToolBadge(msgId, label) {
   header.appendChild(badge);
 }
 
+function renderFileWrittenToast(msgId, filename, folder) {
+  // Inserts a small inline card under the streaming message header,
+  // telling the user a file landed and offering a one-click open.
+  // De-duped per (msgId, filename) — the engine sometimes re-fires
+  // tool_used on retry; a second call to renderFileWrittenToast for
+  // the same filename is a no-op.
+  const msgEl = document.getElementById('msg-' + msgId);
+  if (!msgEl) return;
+  const existing = msgEl.querySelector(`.file-toast[data-fname="${CSS.escape(filename)}"]`);
+  if (existing) return;
+  const body = document.getElementById('body-' + msgId);
+  const toast = document.createElement('div');
+  toast.className = 'file-toast';
+  toast.dataset.fname = filename;
+  const safeFolder = folder === 'upload' ? 'upload' : 'workspace';
+  toast.innerHTML = `
+    <span class="file-toast-icon">📁</span>
+    <span class="file-toast-text">
+      <code>${escapeHtml(filename)}</code>
+      saved to <strong>${safeFolder}</strong>
+    </span>
+    <button class="file-toast-btn" type="button">Open folder</button>
+  `;
+  toast.querySelector('.file-toast-btn').addEventListener('click', (e) => {
+    e.preventDefault();
+    openServiceFolder(safeFolder);
+  });
+  // Place the toast just before the message body so it reads as a
+  // status line, not after the answer.
+  if (body && body.parentNode) {
+    body.parentNode.insertBefore(toast, body);
+  } else {
+    msgEl.appendChild(toast);
+  }
+  scrollToBottom();
+}
+
 function updateStreamingBody(msgId, tokens) {
   const body = document.getElementById('body-' + msgId);
   if (!body) return;
@@ -1699,6 +1736,15 @@ async function sendMessage() {
           updateRoutingBadgeUI(msgId, routingMode);
         } else if (data.type === 'tool_used') {
           addToolBadge(msgId, data.value);
+        } else if (data.type === 'file_written') {
+          // Inline toast inside the chat thread: a small clickable card
+          // telling the user a file landed in ~/.occ/state/<folder>/ and
+          // offering a one-click Open button. Renders right under the
+          // streaming message so it's seen in context, not buried in a
+          // notification corner.
+          const fname = data.value?.filename || '';
+          const folder = data.value?.folder || 'workspace';
+          if (fname) renderFileWrittenToast(msgId, fname, folder);
         } else if (data.type === 'peer_answers') {
           addSourcesButton(msgId, data.value);
         } else if (data.type === 'status') {
