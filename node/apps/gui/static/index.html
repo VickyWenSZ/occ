@@ -781,6 +781,22 @@
         </div>
       </div>
 
+      <!-- Files -->
+      <div class="settings-section">
+        <div class="settings-section-label">Files</div>
+        <div style="font-size:0.75rem;color:var(--text-faint);margin-bottom:0.5rem;">
+          OCC stores user files under <code style="font-size:0.7rem;">~/.occ/state/</code>. Open the folders directly here.
+        </div>
+        <div style="display:flex;align-items:center;gap:0.5rem;padding:0.25rem 0;">
+          <button class="btn-ghost btn-ghost-sm" onclick="openServiceFolder('workspace')">Open Workspace</button>
+          <span style="font-size:0.75rem;color:var(--text-faint);">Files the model writes via <code style="font-size:0.7rem;">write_file</code> / <code style="font-size:0.7rem;">run_code</code></span>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.5rem;padding:0.25rem 0;">
+          <button class="btn-ghost btn-ghost-sm" onclick="openServiceFolder('upload')">Open Upload</button>
+          <span style="font-size:0.75rem;color:var(--text-faint);">Files you attach to chats (PDFs, audio, docs)</span>
+        </div>
+      </div>
+
       <!-- Software -->
       <div class="settings-section">
         <div class="settings-section-label">Software</div>
@@ -812,6 +828,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.3/purify.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="/static/app.js?v=44"></script>
+<script src="/static/app.js?v=45"></script>
 </body>
 </html>

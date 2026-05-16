@@ -1979,6 +1979,22 @@ async function localReindex() {
   }
 }
 
+async function openServiceFolder(which) {
+  // Opens ~/.occ/state/{workspace,upload} in the OS file manager. Backend
+  // enforces an allowlist on `which`, so a hostile caller can't redirect
+  // this to ~/.occ/keys etc.
+  try {
+    const r = await apiFetch(`/api/open-folder/${encodeURIComponent(which)}`, {
+      method: 'POST',
+    });
+    if (!r?.ok) {
+      alert(`Could not open ${which} folder.`);
+    }
+  } catch (e) {
+    alert(`Could not open ${which} folder: ${e?.message || e}`);
+  }
+}
+
 async function setOrActive(enabled) {
   const r = await apiFetch('/api/config/openrouter/active', {
     method: 'POST', body: JSON.stringify({ active: enabled }),

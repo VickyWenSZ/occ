@@ -1627,6 +1627,32 @@ async def forge_reload_packs():
     return {"ok": True, "packs": n}
 
 
+@app.post("/api/open-folder/{which}")
+async def open_service_folder(which: str):
+    """Open one of the user-facing service folders in the OS file manager.
+    Allowlist enforced: only `workspace` and `upload` are exposed. The other
+    `~/.occ/*` subtrees (keys, secrets, config) hold credentials and aren't
+    meant for the user to poke around in — leaving them out of the UI keeps
+    accidents and prompt-injected requests from reaching them."""
+    import platform, subprocess
+    targets = {
+        "workspace": paths.workspace_dir(),
+        "upload":    paths.upload_dir(),
+    }
+    folder = targets.get(which)
+    if folder is None:
+        raise HTTPException(400, f"unknown folder '{which}'")
+    folder.mkdir(parents=True, exist_ok=True)
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(str(folder))
+    elif system == "Darwin":
+        subprocess.Popen(["open", str(folder)])
+    else:
+        subprocess.Popen(["xdg-open", str(folder)])
+    return {"ok": True, "folder": str(folder)}
+
+
 @app.post("/api/forge/open-folder/{pack_name}")
 async def forge_open_folder(pack_name: str):
     import platform, subprocess
