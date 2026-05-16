@@ -4,6 +4,7 @@ Tools are never called autonomously; they require explicit user intent.
 File operations are sandboxed to the workspace/ directory inside the OCC repo.
 """
 
+import os
 import re
 from pathlib import Path
 
@@ -142,6 +143,44 @@ def web_search(query: str, max_results: int = 5) -> str:
     return "\n".join(lines)
 
 
+def _url_is_safe(url: str) -> tuple[bool, str]:
+    """Resolve the URL's host and reject internal targets.
+
+    Defence against SSRF: a prompt-injected pack page or attacker-supplied
+    URL could otherwise reach back into the user's own machine (Node GUI on
+    127.0.0.1:7891, admin Hub on :7892), router admin pages (192.168.x),
+    cloud metadata services (169.254.169.254), or VPN-internal services.
+    Only http/https schemes are accepted. Returns (True, "") when safe.
+    """
+    from urllib.parse import urlparse
+    import socket
+    import ipaddress
+
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        return False, f"invalid URL: {e}"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"scheme '{parsed.scheme}' not allowed (use http/https)"
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return False, "missing host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        return False, f"cannot resolve host: {e}"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return False, f"host resolves to non-public address {addr}"
+    return True, ""
+
+
 def fetch_url(url: str) -> str:
     """Fetch a URL and return its main text content.
 
@@ -154,16 +193,33 @@ def fetch_url(url: str) -> str:
     import re
     import httpx
     import trafilatura
+    ok, why = _url_is_safe(url)
+    if not ok:
+        return f"Refused to fetch {url}: {why}."
     try:
         with httpx.Client(
             timeout=15.0,
-            follow_redirects=True,
+            follow_redirects=False,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; OCC/1.0)",
+                "User-Agent": "OCC-Node/1.0 (+https://github.com/VickyWenSZ/occ)",
                 "Accept-Language": "it,en;q=0.9",
             },
         ) as client:
             resp = client.get(url)
+            # Manual redirect handling: re-validate the target each hop so a
+            # public host can't redirect us to an internal one.
+            hops = 0
+            while resp.is_redirect and hops < 5:
+                next_url = resp.headers.get("location", "")
+                if not next_url:
+                    break
+                from urllib.parse import urljoin
+                next_url = urljoin(str(resp.url), next_url)
+                ok, why = _url_is_safe(next_url)
+                if not ok:
+                    return f"Refused to follow redirect to {next_url}: {why}."
+                resp = client.get(next_url)
+                hops += 1
             resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         return f"HTTP {e.response.status_code} on {url}"
@@ -235,22 +291,102 @@ def list_files(subdir: str = "") -> str:
         return f"Error listing files: {e}"
 
 
+# Prelude injected before user code in run_code. Installs a Python audit hook
+# that blocks the highest-impact escape vectors:
+#   - subprocess / os.system / os.exec*  → no local privilege escalation
+#   - socket networking + DNS            → no data exfiltration outbound
+#   - ctypes                             → can't FFI around the audit hook
+# Audit hooks (PEP 578) fire before the action and cannot be uninstalled from
+# Python code. We pair this with a stripped env and POSIX rlimits in the
+# caller. This is defence-in-depth against prompt-injected pack content that
+# tries to coerce the model into calling run_code with malicious payloads —
+# not a hard isolation boundary (use a container or VM for that).
+_RUN_CODE_SANDBOX_PRELUDE = r'''
+import sys as _occ_sys
+_OCC_FORBIDDEN_EVENTS = frozenset({
+    "subprocess.Popen",
+    "os.system",
+    "os.exec",
+    "os.spawn",
+    "socket.connect",
+    "socket.bind",
+    "socket.getaddrinfo",
+    "socket.gethostbyname",
+    "winreg.OpenKey",
+    "winreg.CreateKey",
+    "winreg.DeleteKey",
+    "ctypes.dlopen",
+    "ctypes.dlsym",
+    "ctypes.cdata/buffer",
+})
+_OCC_FORBIDDEN_MODULES = frozenset({
+    "ctypes", "_ctypes", "ctypes.util",
+})
+def _occ_audit(event, args):
+    if event in _OCC_FORBIDDEN_EVENTS:
+        raise PermissionError("sandbox: '" + event + "' is not allowed in run_code")
+    if event == "import":
+        mod = args[0] if args else ""
+        if mod in _OCC_FORBIDDEN_MODULES:
+            raise PermissionError("sandbox: importing '" + mod + "' is not allowed in run_code")
+_occ_sys.addaudithook(_occ_audit)
+del _occ_sys, _OCC_FORBIDDEN_EVENTS, _OCC_FORBIDDEN_MODULES, _occ_audit
+'''
+
+# Cap stdout/stderr returned to the model. Without this, an infinite-print
+# loop in 30s can produce hundreds of MB and explode the next LLM call's ctx.
+_RUN_CODE_OUTPUT_CAP = 8000
+
+
 def run_code(code: str) -> str:
     import subprocess
     import sys
+
+    # Minimal environment. Inherit only what the child Python actually needs
+    # to import its stdlib (SystemRoot on Windows, PATH stripped). No HOME →
+    # the user's dotfiles aren't directly addressable via ~. No PYTHONPATH so
+    # the user can't load arbitrary modules from outside.
+    env = {}
+    if os.name == "nt":
+        for k in ("SYSTEMROOT", "SystemRoot", "WINDIR", "PATHEXT", "TEMP", "TMP"):
+            if k in os.environ:
+                env[k] = os.environ[k]
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONUTF8"] = "1"
+
+    # POSIX-only: cap CPU time, address space, and core size. Set via
+    # preexec_fn in the child before exec, so the limits apply to user code.
+    preexec = None
+    if os.name == "posix":
+        def _set_limits():
+            import resource
+            # Memory cap: 512 MB virtual address space. Generous for legit
+            # computation, blocks fork-bomb-style ballooning.
+            resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+            resource.setrlimit(resource.RLIMIT_CPU, (35, 35))   # ~30s wall + headroom
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+        preexec = _set_limits
+
+    full_code = _RUN_CODE_SANDBOX_PRELUDE + "\n" + code
     try:
         result = subprocess.run(
-            [sys.executable, "-c", code],
+            [sys.executable, "-I", "-c", full_code],
             capture_output=True,
             text=True,
             timeout=30,
             cwd=str(_WORKSPACE),
+            env=env,
+            preexec_fn=preexec,
         )
-        output = ""
-        if result.stdout:
-            output += result.stdout
-        if result.stderr:
-            output += f"\n[stderr]\n{result.stderr}"
+        out = (result.stdout or "")[:_RUN_CODE_OUTPUT_CAP]
+        err = (result.stderr or "")[:_RUN_CODE_OUTPUT_CAP]
+        output = out
+        if err:
+            output += f"\n[stderr]\n{err}"
+        if (len(result.stdout or "") > _RUN_CODE_OUTPUT_CAP
+                or len(result.stderr or "") > _RUN_CODE_OUTPUT_CAP):
+            output += "\n[...output truncated]"
         return output.strip() or "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: code execution timed out (30s limit)."

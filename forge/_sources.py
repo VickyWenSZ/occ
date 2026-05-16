@@ -8,6 +8,42 @@ import hashlib
 from pathlib import Path
 
 
+def _is_public_url(url: str) -> tuple[bool, str]:
+    """SSRF guard: only allow http(s) hosts that resolve to public IPs.
+
+    Forge fetches URLs supplied by the user (or by prompt-injected content
+    on a page Forge is already crawling), so without this check a request
+    like `http://127.0.0.1:7891/api/local/pack-state` would reach the local
+    Node and bake its response into a pack.
+    """
+    from urllib.parse import urlparse
+    import socket
+    import ipaddress
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        return False, f"invalid URL: {e}"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"scheme '{parsed.scheme}' not allowed"
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return False, "missing host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        return False, f"cannot resolve host: {e}"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return False, f"host resolves to non-public address {addr}"
+    return True, ""
+
+
 def read_file(path: Path, vision_model: str | None = None) -> tuple[str, str, str]:
     """
     Read a .txt / .md / .pdf file. Returns (text, name, url).
@@ -112,6 +148,9 @@ def fetch_url(url: str, include_math: bool = False) -> tuple[str, str, str]:
         in the HTML, replacing them with `$LaTeX$` / `$$LaTeX$$` text before
         running trafilatura. Result: formulas appear inline in the raw text.
     """
+    ok, why = _is_public_url(url)
+    if not ok:
+        raise ValueError(f"refusing to fetch {url}: {why}")
     if _is_wikipedia(url):
         if include_math:
             text = _fetch_wikipedia_html_with_math(url)
@@ -340,8 +379,7 @@ _IMG_MIN_BYTES = 5 * 1024            # 5 KB — filter icons/spacers/tracking pi
 _IMG_MAX_PER_SOURCE = 20             # cap LLM calls per source
 _IMG_ACCEPTED_EXT = {".jpg", ".jpeg", ".png", ".webp"}  # raster, vision-friendly
 _USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "OCC-Forge/0.1 (+https://github.com/VickyWenSZ/occ; vickywensz@gmail.com)"
 )
 
 # Wikipedia / WMF endpoints reject generic UAs (403). Identify the tool per
@@ -362,6 +400,9 @@ def fetch_images_from_url(url: str, dest_dir: Path) -> list[dict]:
 
     Caller is responsible for invoking this only for URL sources.
     """
+    ok, _why = _is_public_url(url)
+    if not ok:
+        return []
     if _is_wikipedia(url):
         return []
 
@@ -425,6 +466,9 @@ def _download_image(url: str, alt: str, dest_dir: Path, idx: int) -> dict | None
     """Download a single image. Skip if <5KB or wrong content type. Return entry or None."""
     import httpx
     from urllib.parse import urlparse
+    ok, _why = _is_public_url(url)
+    if not ok:
+        return None
 
     # Determine extension from URL path
     parsed = urlparse(url)

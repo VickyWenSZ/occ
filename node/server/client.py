@@ -72,9 +72,12 @@ async def _call_peer_critic_async(
     query_id = str(uuid.uuid4())
     raw_payload = json.dumps({"context": context, "expert_answer": expert_answer})
     use_crypto = bool(peer.public_key)
+    # Bind the AEAD tag to query_id — prevents cross-query replay if a peer
+    # tries to feed an old captured ciphertext into a fresh exchange.
+    aad = query_id.encode()
 
     if use_crypto:
-        payload = _encrypt(raw_payload.encode(), peer.public_key)
+        payload = _encrypt(raw_payload.encode(), peer.public_key, aad=aad)
         my_pubkey_b64 = pubkey_from_private_b64(my_private_key)
     else:
         payload = raw_payload
@@ -99,7 +102,7 @@ async def _call_peer_critic_async(
                     if msg.get("type") == "response":
                         resp_payload = msg.get("payload", "")
                         if use_crypto:
-                            data = json.loads(_decrypt(resp_payload, my_private_key).decode())
+                            data = json.loads(_decrypt(resp_payload, my_private_key, aad=aad).decode())
                         else:
                             data = json.loads(resp_payload)
                         return data.get("critique")

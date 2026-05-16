@@ -10,13 +10,28 @@ from cryptography.hazmat.primitives.hashes import SHA256
 _KEY_PATH = Path.home() / ".occ_keys"
 
 
+def _restrict_perms(path: Path, mode: int) -> None:
+    """Best-effort chmod. POSIX honours it; Windows ignores most bits but the
+    call itself is harmless. Swallow failures so a read-only mount or odd FS
+    doesn't break key load."""
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+
+
 def load_or_generate_keypair() -> tuple[bytes, bytes]:
     """Return (private_key_bytes, public_key_bytes). Generates and persists if not found."""
     _KEY_PATH.mkdir(exist_ok=True)
+    _restrict_perms(_KEY_PATH, 0o700)
     priv_file = _KEY_PATH / "private.key"
     pub_file = _KEY_PATH / "public.key"
 
     if priv_file.exists() and pub_file.exists():
+        # Re-assert tight perms on every load — covers the case where the
+        # files were created by an older version that left them world-readable.
+        _restrict_perms(priv_file, 0o600)
+        _restrict_perms(pub_file, 0o644)
         return priv_file.read_bytes(), pub_file.read_bytes()
 
     private_key = X25519PrivateKey.generate()
@@ -24,7 +39,9 @@ def load_or_generate_keypair() -> tuple[bytes, bytes]:
     priv_bytes = private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
     pub_bytes = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
     priv_file.write_bytes(priv_bytes)
+    _restrict_perms(priv_file, 0o600)
     pub_file.write_bytes(pub_bytes)
+    _restrict_perms(pub_file, 0o644)
     return priv_bytes, pub_bytes
 
 
@@ -32,20 +49,28 @@ def _derive_aes_key(shared_secret: bytes) -> bytes:
     return HKDF(algorithm=SHA256(), length=32, salt=None, info=b"occ-v2").derive(shared_secret)
 
 
-def encrypt(payload: bytes, recipient_pubkey_b64: str) -> str:
-    """Encrypt payload for recipient. Returns base64-encoded ciphertext."""
+def encrypt(payload: bytes, recipient_pubkey_b64: str, aad: bytes = b"") -> str:
+    """Encrypt payload for recipient. Returns base64-encoded ciphertext.
+
+    `aad` is bound into the AES-GCM tag without being included in the
+    ciphertext. The Critic side must pass the identical bytes to decrypt(),
+    so we use the query_id (already in plaintext on the wire) to prevent
+    cross-query replay: a ciphertext captured for query A cannot be presented
+    as the legitimate payload for query B.
+    """
     recipient_pub = X25519PublicKey.from_public_bytes(base64.b64decode(recipient_pubkey_b64))
     ephemeral_priv = X25519PrivateKey.generate()
     shared_secret = ephemeral_priv.exchange(recipient_pub)
     aes_key = _derive_aes_key(shared_secret)
     nonce = os.urandom(12)
-    ciphertext = AESGCM(aes_key).encrypt(nonce, payload, None)
+    ciphertext = AESGCM(aes_key).encrypt(nonce, payload, aad or None)
     ephem_pub_bytes = ephemeral_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     return base64.b64encode(ephem_pub_bytes + nonce + ciphertext).decode()
 
 
-def decrypt(ciphertext_b64: str, private_key_bytes: bytes) -> bytes:
-    """Decrypt payload using own private key bytes."""
+def decrypt(ciphertext_b64: str, private_key_bytes: bytes, aad: bytes = b"") -> bytes:
+    """Decrypt payload using own private key bytes. `aad` must match the
+    value passed to encrypt() — typically the query_id."""
     data = base64.b64decode(ciphertext_b64)
     ephem_pub_bytes = data[:32]
     nonce = data[32:44]
@@ -54,7 +79,7 @@ def decrypt(ciphertext_b64: str, private_key_bytes: bytes) -> bytes:
     ephem_pub = X25519PublicKey.from_public_bytes(ephem_pub_bytes)
     shared_secret = private_key.exchange(ephem_pub)
     aes_key = _derive_aes_key(shared_secret)
-    return AESGCM(aes_key).decrypt(nonce, ciphertext, None)
+    return AESGCM(aes_key).decrypt(nonce, ciphertext, aad or None)
 
 
 def pubkey_b64(public_key_bytes: bytes) -> str:

@@ -20,6 +20,7 @@ Security status — alpha. See SECURITY.md at the repo root for full threat mode
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -57,6 +58,11 @@ _RATE_LIMIT_STATE_CAP = 10_000  # hard cap on distinct IPs tracked
 # Caps on in-memory registries to prevent memory exhaustion attacks.
 _NODES_CAP = 5_000
 _PENDING_QUERIES_CAP = 10_000
+
+# WebSocket frame size cap. uvicorn's default (16 MB) is far more than any
+# legitimate Critic payload needs and gives a hostile peer 16 MB × cap of
+# pending state to amplify into the broker's memory.
+_WS_MAX_BYTES = 1 * 1024 * 1024
 
 # node_id → {ws, tier_name, vram_used_mb, public_key, last_seen, last_seen_ts}
 nodes: dict[str, dict] = {}
@@ -205,7 +211,9 @@ async def get_pack_summaries():
 
 @app.get("/packs/{pack}/index.md")
 async def get_index(pack: str):
-    f = PACKS_DIR / pack / "wiki" / "index.md"
+    f = (PACKS_DIR / pack / "wiki" / "index.md").resolve()
+    if not str(f).startswith(str(PACKS_DIR.resolve())):
+        raise HTTPException(403)
     if not f.exists():
         raise HTTPException(404)
     return Response(f.read_text(encoding="utf-8"), media_type="text/markdown")
@@ -558,7 +566,7 @@ async def admin_reindex(
     req: ReindexRequest,
     x_occ_token: str = Header(default=""),
 ):
-    if not _REINDEX_TOKEN or x_occ_token != _REINDEX_TOKEN:
+    if not _REINDEX_TOKEN or not secrets.compare_digest(x_occ_token or "", _REINDEX_TOKEN):
         raise HTTPException(401, "invalid token")
     try:
         result = _reindex_all(only_pack=req.pack_path)
@@ -577,17 +585,43 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
         async for raw in ws.iter_text():
-            msg = json.loads(raw)
+            # Drop oversize frames before they can be parsed or routed. Even
+            # a 16 MB JSON.parse is enough to stall the event loop.
+            if len(raw) > _WS_MAX_BYTES:
+                await ws.send_text(json.dumps({
+                    "type": "error", "error": "frame_too_large",
+                }))
+                continue
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
             mtype = msg.get("type")
 
             if mtype == "register":
-                node_id = msg.get("node_id", "")
-                if not node_id:
+                claimed_id = msg.get("node_id", "")
+                if not claimed_id:
                     await ws.send_text(json.dumps({"type": "error", "error": "missing_node_id"}))
                     continue
-                if node_id not in nodes and not _evict_dead_nodes_if_full():
+                # Reject claims that target a node_id already registered AND
+                # still alive (last_seen within _NODE_TIMEOUT). Without this,
+                # any peer that learns a node_id from /nodes can overwrite
+                # the registration and start receiving Critic queries meant
+                # for the real node. Stale registrations (dead) are still
+                # replaceable so reconnects work after a crash.
+                existing = nodes.get(claimed_id)
+                if existing is not None and _is_alive(existing) and existing.get("ws") is not ws:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "error": "node_id_taken",
+                    }))
+                    continue
+                if claimed_id not in nodes and not _evict_dead_nodes_if_full():
                     await ws.send_text(json.dumps({"type": "error", "error": "broker_at_capacity"}))
                     continue
+                node_id = claimed_id
                 nodes[node_id] = {
                     "ws": ws,
                     "tier_name": msg.get("tier_name", "micro"),
@@ -608,6 +642,24 @@ async def websocket_endpoint(ws: WebSocket):
                 # Orchestrator → broker → Critic peer
                 to_node = msg.get("to")
                 query_id = msg.get("query_id", "")
+                if not query_id:
+                    await ws.send_text(json.dumps({
+                        "type": "error", "error": "missing_query_id",
+                    }))
+                    continue
+                # Reject collisions on query_id. Without this, a peer that
+                # observes traffic could enqueue a duplicate query_id and
+                # hijack the response routing slot (the response is
+                # E2E-encrypted to the original requester's pubkey, so the
+                # plaintext stays protected — but the broker would drop the
+                # real orchestrator's pending entry, causing a stall).
+                if query_id in pending_queries:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "query_id": query_id,
+                        "error": "duplicate_query_id",
+                    }))
+                    continue
                 if len(pending_queries) >= _PENDING_QUERIES_CAP:
                     await ws.send_text(json.dumps({
                         "type": "error",

@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from node.apps.cli.config import Config, save_openrouter_config
 from node.apps.gui import log_bus
-from node.deliberation.classifier import classify
+from node.deliberation.classifier import classify, detect_multi_intent
 from node.deliberation.engine import DeliberationEngine
 from node.deliberation.tools import set_workspace, set_upload, set_packs_root
 from node.expert_runtime.pack import load_all_packs, load_pack, MultiPackRetriever
@@ -35,6 +35,33 @@ from node.expert_runtime.pack import load_all_packs, load_pack, MultiPackRetriev
 app = FastAPI()
 STATIC.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+# ── CSRF / cross-origin guard ─────────────────────────────────────────────────
+# The Node GUI binds to 127.0.0.1 (see __main__ at bottom) and has no auth.
+# A malicious page open in the user's browser could still POST to
+# http://localhost:7891 via fetch(). Block any state-changing request whose
+# Origin header doesn't match a known local origin. GET/HEAD pass through so
+# normal page loads still work; same-origin GUI requests carry Origin
+# http://localhost:7891 / http://127.0.0.1:7891.
+_ALLOWED_ORIGINS = frozenset({
+    "http://localhost:7891",
+    "http://127.0.0.1:7891",
+})
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+@app.middleware("http")
+async def _csrf_origin_guard(request, call_next):
+    if request.method not in _SAFE_METHODS:
+        origin = request.headers.get("origin", "")
+        # No Origin → request didn't come from a browser script that knows
+        # cross-origin rules (curl, internal calls, same-origin form). Allow.
+        # With Origin set, require it to match a known local origin.
+        if origin and origin not in _ALLOWED_ORIGINS:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "cross-origin request blocked"}, status_code=403)
+    return await call_next(request)
 
 # ── Global state ──────────────────────────────────────────────────────────────
 
@@ -918,9 +945,17 @@ def _forge_run_core(body: "ForgeRunBody"):
         raw_sources.extend(loaded)
         # Skip body.files / body.urls / body.text — we are re-using raw only
     else:
+        # Hard cap per uploaded file. base64 inflates by 4/3, so 70 MB of
+        # base64 ≈ 50 MB raw. Above this we refuse to decode rather than load
+        # an arbitrary blob into memory.
+        _FORGE_MAX_FILE_B64 = 70 * 1024 * 1024
         for f in body.files:
             try:
-                data = base64.b64decode(f["data_b64"])
+                b64_str = f.get("data_b64", "")
+                if len(b64_str) > _FORGE_MAX_FILE_B64:
+                    yield f"❌ {f.get('name', 'file')} exceeds the 50 MB upload limit — skipping."
+                    continue
+                data = base64.b64decode(b64_str)
                 suffix = Path(f.get("name", "file.txt")).suffix or ".txt"
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
                 tmp.write(data)
@@ -1611,7 +1646,15 @@ async def forge_reload_packs():
 @app.post("/api/forge/open-folder/{pack_name}")
 async def forge_open_folder(pack_name: str):
     import platform, subprocess
-    pack_dir = ROOT / "expert-packs" / pack_name
+    # Same slug rules as forge_run sanitises with — no slashes, no traversal,
+    # no shell metas. Anything outside that alphabet is rejected outright.
+    pack_name_clean = re.sub(r'[^a-z0-9-]', '-', pack_name.strip().lower()).strip('-')
+    if not pack_name_clean or pack_name_clean != pack_name.strip().lower():
+        raise HTTPException(400, "Invalid pack name")
+    packs_root = (ROOT / "expert-packs").resolve()
+    pack_dir = (packs_root / pack_name_clean).resolve()
+    if not str(pack_dir).startswith(str(packs_root)):
+        raise HTTPException(400, "Invalid pack path")
     if not pack_dir.exists():
         raise HTTPException(404, "Pack not found")
     system = platform.system()
@@ -2227,19 +2270,33 @@ async def chat_query(chat_id: str, body: QueryBody):
     text_suffix = ""
     uploaded_files: list[str] = []
     upload_dir = ROOT / "upload"
+    upload_dir_resolved = upload_dir.resolve()
     BINARY_EXTS = {".pdf", ".docx", ".xlsx", ".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+    # Hard cap per attachment payload (base64 chars). 50 MB raw ≈ 67 MB b64.
+    _MAX_ATTACHMENT_B64 = 70 * 1024 * 1024
     for att in body.attachments:
         mime = att.get("type", "")
-        name = att.get("name", "file")
+        # Strip every path component from the filename — the attachment name
+        # arrives from the browser and could be "../../.occ_keys/private.key".
+        # Path(...).name keeps only the leaf. We also reject anything that
+        # still escapes upload/ after resolution, as a belt-and-braces check.
+        raw_name = att.get("name", "file")
+        name = Path(raw_name).name.strip() or "file"
         data = att.get("data", "")
         raw = data.split(",", 1)[-1] if "," in data else data
+        if len(raw) > _MAX_ATTACHMENT_B64:
+            # Don't decode huge blobs into memory. Silently drop oversize
+            # attachments rather than failing the whole query.
+            continue
         ext = Path(name).suffix.lower()
         if mime.startswith("image/"):
             images_b64.append(raw)
         elif mime.startswith("audio/") or ext in BINARY_EXTS:
             try:
                 upload_dir.mkdir(parents=True, exist_ok=True)
-                target = upload_dir / name
+                target = (upload_dir / name).resolve()
+                if not str(target).startswith(str(upload_dir_resolved)):
+                    continue
                 target.write_bytes(base64.b64decode(raw))
                 uploaded_files.append(name)
             except Exception:
@@ -2311,6 +2368,7 @@ async def chat_query(chat_id: str, body: QueryBody):
         # Hard override: if /ollama bypass is ON, route every message to the
         # raw-Ollama path. Skips classifier, skills, retrieval, tools, system
         # prompt. Toggle off with /ollama.
+        multi_intents: list[dict] | None = None
         if _OLLAMA_MODE:
             mode = "ollama"
             log_bus.write("[router] /ollama bypass ON → raw Ollama call")
@@ -2319,8 +2377,21 @@ async def chat_query(chat_id: str, body: QueryBody):
                 mode = "chat"
             else:
                 skill_reg = _engine._skill_registry if _engine is not None else None
-                mode = await loop.run_in_executor(None, classify, _model, rewritten_query, skill_reg)
-                log_bus.write(f"[router] classified as '{mode}'")
+                # Multi-intent pre-pass: detect 2+ distinct requests in one
+                # message. If yes, take the orchestrated path (each sub-query
+                # gets classified and answered separately, with section headers
+                # between the answers).
+                multi_intents = await loop.run_in_executor(
+                    None, detect_multi_intent, _model, rewritten_query
+                )
+                if multi_intents:
+                    mode = "multi"
+                    log_bus.write(
+                        f"[router] multi-intent: {[x['label'] for x in multi_intents]}"
+                    )
+                else:
+                    mode = await loop.run_in_executor(None, classify, _model, rewritten_query, skill_reg)
+                    log_bus.write(f"[router] classified as '{mode}'")
 
         # Register a fresh stop event for this chat — overwrites any stale one.
         stop_event = threading.Event()
@@ -2328,10 +2399,16 @@ async def chat_query(chat_id: str, body: QueryBody):
 
         def stream_thread():
             try:
-                for kind, value in _engine.route_stream(
-                    full_query, mode, images=images_b64 or None,
-                    rewritten_query=rewritten_query,
-                ):
+                if mode == "multi" and multi_intents:
+                    stream_iter = _engine.route_stream_multi(
+                        multi_intents, images=images_b64 or None,
+                    )
+                else:
+                    stream_iter = _engine.route_stream(
+                        full_query, mode, images=images_b64 or None,
+                        rewritten_query=rewritten_query,
+                    )
+                for kind, value in stream_iter:
                     if stop_event.is_set():
                         asyncio.run_coroutine_threadsafe(
                             q.put(("stopped", True)), loop)
@@ -2658,5 +2735,9 @@ if __name__ == "__main__":
 
     # Browser auto-open is handled by the launcher scripts (launch.bat / launch.sh).
     # When run manually via `python server.py`, open the URL yourself.
+    # Loopback-only: the Node GUI has no authentication and exposes destructive
+    # endpoints (/api/update, /api/command, attachment uploads). Binding to
+    # 0.0.0.0 would put all of that on the LAN. CSRF protection is layered on
+    # top via the Origin-check middleware below.
     print("OCC Node GUI  →  http://localhost:7891")
-    uvicorn.run(app, host="0.0.0.0", port=7891, log_level="warning")
+    uvicorn.run(app, host="127.0.0.1", port=7891, log_level="warning")

@@ -33,13 +33,17 @@ _VRAM_MB = get_vram_used_mb()
 _TIER_NAME = select_tier(detect_vram_gb())["name"]
 
 
-def _handle_query(payload_str: str, requester_pubkey: str) -> str:
+def _handle_query(payload_str: str, requester_pubkey: str, query_id: str) -> str:
     """
     Execute Critic role on received payload.
     Decrypts payload if requester_pubkey provided (E2E), else plain JSON fallback.
+
+    `query_id` is fed as AAD to AES-GCM so replay attacks (feeding an old
+    captured ciphertext into a new exchange) fail the auth tag check.
     """
+    aad = (query_id or "").encode()
     if requester_pubkey:
-        raw = _decrypt(payload_str, _PRIVATE_KEY)
+        raw = _decrypt(payload_str, _PRIVATE_KEY, aad=aad)
         data = json.loads(raw.decode())
     else:
         data = json.loads(payload_str)
@@ -74,7 +78,7 @@ def _handle_query(payload_str: str, requester_pubkey: str) -> str:
     response_payload = json.dumps({"critique": critique}).encode()
 
     if requester_pubkey:
-        return _encrypt(response_payload, requester_pubkey)
+        return _encrypt(response_payload, requester_pubkey, aad=aad)
     return response_payload.decode()
 
 
@@ -118,7 +122,7 @@ async def run():
                         _log(f"[OCC Node] Critic request from {from_node[:8]}...")
                         loop = asyncio.get_event_loop()
                         answer = await loop.run_in_executor(
-                            None, _handle_query, payload, requester_pubkey
+                            None, _handle_query, payload, requester_pubkey, query_id
                         )
                         await ws.send(json.dumps({
                             "type": "response",
