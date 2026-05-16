@@ -26,6 +26,7 @@ Public API:
         ('knowledge' is renamed 'deliberate' on the wire for backwards
         compatibility with the engine's existing path.)
 """
+import json
 import re
 import ollama
 
@@ -196,6 +197,94 @@ def _classify_skill(model: str, query: str, skill_registry) -> str | None:
     name = first[len("skill_"):]
     valid = {s.name for s in skills}
     return name if name in valid else None
+
+
+# ── Multi-intent pre-pass ────────────────────────────────────────────────────
+
+_MULTI_INTENT_SYSTEM = (
+    "Inspect a user query for MULTIPLE DISTINCT requests in one message — "
+    "things the assistant must DO separately, that would each need a different "
+    "kind of response.\n\n"
+    "Multi-intent examples (split):\n"
+    "  - 'Explain closures in Python and write an example counter using one' "
+    "→ 2 (explain + code)\n"
+    "  - 'Tell me about Caesar and write a Python script simulating a battle' "
+    "→ 2 (history + code)\n"
+    "  - 'Who was Pascoli, write a poem in his style, then compare with Leopardi' "
+    "→ 3 (bio + creative + comparison)\n\n"
+    "NOT multi-intent (single request, do NOT split):\n"
+    "  - 'Explain how OAuth works' → single\n"
+    "  - 'Tell me about Caesar and his rise to power' → single (one topic)\n"
+    "  - 'Compare Caesar and Napoleon' → single (one comparison task)\n"
+    "  - 'Debug this error and explain why it happened' → single (one task)\n"
+    "  - 'Write a Flask endpoint that does X and Y' → single (one coding task)\n\n"
+    "Reply ONLY with a single JSON object, no prose, no fences:\n"
+    "  {\"single\": true}  — for a single request\n"
+    "  {\"intents\": [{\"label\": \"...\", \"q\": \"...\"}, ...]}  — for multi "
+    "(MAX 3 items; labels are 1-3 words in the user's language, used as section "
+    "headers in the UI; each q is SELF-CONTAINED — rewrite pronouns and back-"
+    "references so each sub-query stands on its own).\n\n"
+    "When unsure, prefer single. Only split when the parts would clearly need "
+    "DIFFERENT handling (e.g. one is a question, the other is a creative or "
+    "coding task)."
+)
+
+
+def detect_multi_intent(model: str, query: str, max_intents: int = 3) -> list[dict] | None:
+    """Detect whether the query bundles 2+ distinct requests in one message.
+
+    Returns:
+        None if the query is a single request (the common case).
+        A list of {"q": str, "label": str} dicts (length 2..max_intents) when
+        the query should be split, each sub-query self-contained and labeled
+        for the UI section header.
+
+    Cost: one LLM micro-call (~200-500ms on tier 1-3 hardware). Skipped for
+    pure chitchat to avoid waste on greetings.
+    """
+    if _looks_like_pure_chitchat(query):
+        return None
+    try:
+        response = ollama.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": _MULTI_INTENT_SYSTEM},
+                {"role": "user", "content": query[:2000]},
+            ],
+            think=False,
+            keep_alive=-1,
+            options={"temperature": 0.0, "num_predict": 300, "num_ctx": 2048},
+            stream=False,
+        )
+        raw = (response.message.content or "").strip()
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group(0))
+    except Exception:
+        return None
+
+    if data.get("single") is True:
+        return None
+    intents = data.get("intents")
+    if not isinstance(intents, list) or len(intents) < 2:
+        return None
+
+    out: list[dict] = []
+    seen_q: set[str] = set()
+    for item in intents[:max_intents]:
+        if not isinstance(item, dict):
+            continue
+        q = (item.get("q") or "").strip()
+        label = (item.get("label") or "").strip()
+        if not q or not label:
+            continue
+        key = q.lower()
+        if key in seen_q:
+            continue
+        seen_q.add(key)
+        out.append({"q": q, "label": label})
+    return out if len(out) >= 2 else None
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
